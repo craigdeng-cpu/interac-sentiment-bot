@@ -1,15 +1,14 @@
 """
 Interac Sentiment Analysis Bot
-- Scrapes internet for Interac mentions 4x/day
-- Analyzes sentiment via Kimi K2.5
-- Broadcasts 1-min executive report to Telegram
+- Scrapes internet for Interac product/FI/competitive mentions 4x/day
+- Analyzes via Kimi K2.5 with strict signal-only reporting
 - Configurable prompts via prompts.json
 """
 
 import os
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import httpx
@@ -32,118 +31,88 @@ KIMI_API_URL = os.environ.get("KIMI_API_URL", "https://api.moonshot.ai/v1/chat/c
 KIMI_MODEL = os.environ.get("KIMI_MODEL", "kimi-k2.5-preview")
 PORT = int(os.environ.get("PORT", 3978))
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
-SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")  # google search API
+SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
+
+EST = timezone(timedelta(hours=-5))
 
 subscribed_chats: set[int] = set()
-last_report: str = ""  # cache last report for follow-ups
+last_report: str = ""
+last_mentions_raw: str = ""
+
+
+def now_est() -> str:
+    return datetime.now(EST).strftime("%Y-%m-%d %I:%M %p EST")
 
 
 # ─── Prompt Config ────────────────────────────────────────────────────────────
 def load_prompts() -> dict:
-    """Load prompts from prompts.json. Reloads on every call so edits are live."""
     path = Path(__file__).parent / "prompts.json"
     with open(path) as f:
         return json.load(f)
 
 
-# ─── Web Scraping: Gather Interac Mentions ────────────────────────────────────
-async def search_web(query: str, max_results: int = 10) -> list[dict]:
-    """Search via Serper.dev (Google Search API). $0.001/search."""
-    if not SERPER_API_KEY:
-        logger.warning("SERPER_API_KEY not set, using fallback")
-        return []
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            "https://google.serper.dev/search",
-            headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-            json={"q": query, "num": max_results, "tbs": "qdr:d"},  # last 24h
-        )
-        response.raise_for_status()
-        data = response.json()
-
-    results = []
-    for item in data.get("organic", []):
-        results.append({
-            "title": item.get("title", ""),
-            "snippet": item.get("snippet", ""),
-            "link": item.get("link", ""),
-            "source": item.get("source", ""),
-        })
-    return results
-
-
-async def search_reddit(query: str, max_results: int = 10) -> list[dict]:
-    """Search Reddit via Serper for recent mentions."""
+# ─── Web Scraping ─────────────────────────────────────────────────────────────
+async def serper_search(query: str, search_type: str = "search", max_results: int = 5) -> list[dict]:
     if not SERPER_API_KEY:
         return []
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            "https://google.serper.dev/search",
-            headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-            json={"q": f"{query} site:reddit.com", "num": max_results, "tbs": "qdr:d"},
-        )
-        response.raise_for_status()
-        data = response.json()
+    endpoint = {
+        "search": "https://google.serper.dev/search",
+        "news": "https://google.serper.dev/news",
+    }.get(search_type, "https://google.serper.dev/search")
 
-    results = []
-    for item in data.get("organic", []):
-        results.append({
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            response = await client.post(
+                endpoint,
+                headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+                json={"q": query, "num": max_results, "tbs": "qdr:d", "gl": "ca"},
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
+            logger.error(f"Serper error for '{query}': {e}")
+            return []
+
+    key = "news" if search_type == "news" else "organic"
+    return [
+        {
             "title": item.get("title", ""),
             "snippet": item.get("snippet", ""),
             "link": item.get("link", ""),
-            "source": "Reddit",
-        })
-    return results
-
-
-async def search_news(query: str, max_results: int = 10) -> list[dict]:
-    """Search Google News via Serper."""
-    if not SERPER_API_KEY:
-        return []
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            "https://google.serper.dev/news",
-            headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-            json={"q": query, "num": max_results, "tbs": "qdr:d"},
-        )
-        response.raise_for_status()
-        data = response.json()
-
-    results = []
-    for item in data.get("news", []):
-        results.append({
-            "title": item.get("title", ""),
-            "snippet": item.get("snippet", ""),
-            "link": item.get("link", ""),
-            "source": item.get("source", "News"),
-        })
-    return results
+            "source": item.get("source", search_type),
+        }
+        for item in data.get(key, [])
+    ]
 
 
 async def fetch_all_mentions() -> str:
-    """Gather all Interac mentions across sources into a single text block."""
     config = load_prompts()
-    queries = config["data_queries"]
+    queries_config = config["data_queries"]
     sources = config.get("sources", {})
-    max_per_source = config.get("max_mentions_per_source", 10)
+    max_per = config.get("max_mentions_per_source", 5)
 
     all_mentions = []
 
-    for query in queries:
+    # Flatten all query categories
+    all_queries = []
+    for category, queries in queries_config.items():
+        for q in queries:
+            all_queries.append((category, q))
+
+    for category, query in all_queries:
         if sources.get("news", True):
-            mentions = await search_news(query, max_results=max_per_source)
-            all_mentions.extend(mentions)
+            results = await serper_search(query, "news", max_per)
+            for r in results:
+                r["category"] = category
+            all_mentions.extend(results)
 
         if sources.get("reddit", True):
-            mentions = await search_reddit(query, max_results=max_per_source)
-            all_mentions.extend(mentions)
-
-        if sources.get("twitter", False):
-            # Twitter/X API requires separate auth — placeholder
-            pass
+            results = await serper_search(f"{query} site:reddit.com", "search", max_per)
+            for r in results:
+                r["category"] = category
+                r["source"] = "Reddit"
+            all_mentions.extend(results)
 
     # Deduplicate by link
     seen = set()
@@ -154,26 +123,34 @@ async def fetch_all_mentions() -> str:
             unique.append(m)
 
     if not unique:
-        return "No recent mentions found in the last 24 hours."
+        return "No recent mentions found across any sources in the last 24 hours."
 
-    # Format for the LLM
-    lines = [f"=== INTERAC ONLINE MENTIONS ({len(unique)} found) ===\n"]
-    for i, m in enumerate(unique, 1):
-        lines.append(
-            f"[{i}] {m['title']}\n"
-            f"    Source: {m['source']}\n"
-            f"    Snippet: {m['snippet']}\n"
-            f"    URL: {m['link']}\n"
-        )
+    # Group by category for cleaner LLM input
+    by_cat = {}
+    for m in unique:
+        cat = m.get("category", "other")
+        by_cat.setdefault(cat, []).append(m)
+
+    lines = [f"=== INTERAC INTELLIGENCE SCAN — {now_est()} ==="]
+    lines.append(f"Total unique mentions: {len(unique)}\n")
+
+    for cat, mentions in by_cat.items():
+        label = cat.upper().replace("_", " ")
+        lines.append(f"--- {label} ({len(mentions)} mentions) ---")
+        for i, m in enumerate(mentions, 1):
+            lines.append(
+                f"[{i}] {m['title']}\n"
+                f"    Source: {m['source']}\n"
+                f"    Snippet: {m['snippet']}\n"
+                f"    URL: {m['link']}\n"
+            )
+        lines.append("")
 
     return "\n".join(lines)
 
 
 # ─── Kimi K2.5 Analysis ──────────────────────────────────────────────────────
-async def analyze_sentiment(mentions_text: str) -> str:
-    """Send mentions to Kimi K2.5 with the configured analysis prompt."""
-    config = load_prompts()
-
+async def call_kimi(system_prompt: str, user_content: str) -> str:
     async with httpx.AsyncClient(timeout=90) as client:
         response = await client.post(
             KIMI_API_URL,
@@ -184,8 +161,8 @@ async def analyze_sentiment(mentions_text: str) -> str:
             json={
                 "model": KIMI_MODEL,
                 "messages": [
-                    {"role": "system", "content": config["analysis_prompt"]},
-                    {"role": "user", "content": mentions_text},
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
                 ],
                 "temperature": 0.3,
             },
@@ -193,51 +170,38 @@ async def analyze_sentiment(mentions_text: str) -> str:
         response.raise_for_status()
         data = response.json()
         return data["choices"][0]["message"]["content"]
+
+
+async def analyze_sentiment(mentions_text: str) -> str:
+    config = load_prompts()
+    prompt = config["analysis_prompt"].replace("{timestamp}", now_est())
+    return await call_kimi(prompt, mentions_text)
 
 
 async def ask_followup(question: str, report_context: str) -> str:
-    """Handle follow-up questions with context from the last report."""
     config = load_prompts()
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        response = await client.post(
-            KIMI_API_URL,
-            headers={
-                "Authorization": f"Bearer {KIMI_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": KIMI_MODEL,
-                "messages": [
-                    {"role": "system", "content": config["followup_prompt"]},
-                    {"role": "user", "content": f"Latest report:\n{report_context}\n\nQuestion: {question}"},
-                ],
-                "temperature": 0.3,
-            },
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data["choices"][0]["message"]["content"]
+    return await call_kimi(
+        config["followup_prompt"],
+        f"Latest report:\n{report_context}\n\nRaw mentions:\n{last_mentions_raw[:3000]}\n\nQuestion: {question}",
+    )
 
 
 # ─── Scheduled Broadcast ─────────────────────────────────────────────────────
 async def scheduled_sentiment_broadcast(context: ContextTypes.DEFAULT_TYPE):
-    global last_report
-    logger.info(f"[{datetime.utcnow()}] Running scheduled Interac sentiment scan...")
+    global last_report, last_mentions_raw
+    logger.info(f"[{now_est()}] Running scheduled Interac sentiment scan...")
 
     try:
         mentions = await fetch_all_mentions()
+        last_mentions_raw = mentions
         report = await analyze_sentiment(mentions)
         last_report = report
 
-        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-        message = f"📊 *Interac Sentiment Report* — {timestamp}\n\n{report}"
+        message = f"📊 *Interac Intelligence* — {now_est()}\n\n{report}"
 
         for chat_id in subscribed_chats.copy():
             try:
-                await context.bot.send_message(
-                    chat_id=chat_id, text=message, parse_mode="Markdown"
-                )
+                await context.bot.send_message(chat_id=chat_id, text=message, parse_mode="Markdown")
             except Exception as e:
                 logger.error(f"Failed to send to {chat_id}: {e}")
                 subscribed_chats.discard(chat_id)
@@ -249,15 +213,16 @@ async def scheduled_sentiment_broadcast(context: ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     subscribed_chats.add(update.effective_chat.id)
     await update.message.reply_text(
-        "👋 *Interac Sentiment Bot*\n\n"
-        "I scan the internet for Interac mentions 4x/day and deliver a 1-min sentiment report.\n\n"
+        "👋 *Interac Intelligence Bot*\n\n"
+        "Scans internet 4x/day for Interac product signals across all major Canadian FIs.\n\n"
         "*Commands:*\n"
         "• /subscribe — Get scheduled reports\n"
         "• /unsubscribe — Stop reports\n"
-        "• /scan — Run a scan right now\n"
-        "• /prompt — View the current analysis prompt\n"
+        "• /scan — Run a scan now\n"
+        "• /raw — See raw mentions from last scan\n"
+        "• /prompt — View current config\n"
         "• /status — Check schedule\n"
-        "• Any text → Ask a follow-up about the latest report",
+        "• Any text → Follow-up question on latest report",
         parse_mode="Markdown",
     )
 
@@ -274,55 +239,62 @@ async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     has_serper = "✅" if SERPER_API_KEY else "❌"
+    config = load_prompts()
+    q_count = sum(len(v) for v in config["data_queries"].values())
     await update.message.reply_text(
-        f"✅ Bot running\n"
+        f"✅ Bot running — {now_est()}\n"
         f"Serper API: {has_serper}\n"
-        f"Reports at 06:00, 10:00, 14:00, 18:00 UTC\n"
-        f"Subscribed chats: {len(subscribed_chats)}"
+        f"Active queries: {q_count}\n"
+        f"Reports at 06:00, 10:00, 14:00, 18:00 EST\n"
+        f"Subscribed: {len(subscribed_chats)}"
     )
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manual scan — run sentiment analysis on demand."""
-    global last_report
-    await update.message.reply_text("🔍 Scanning internet for Interac mentions...")
+    global last_report, last_mentions_raw
+    await update.message.reply_text("🔍 Scanning...")
 
     try:
         mentions = await fetch_all_mentions()
+        last_mentions_raw = mentions
         report = await analyze_sentiment(mentions)
         last_report = report
 
-        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
         await update.message.reply_text(
-            f"📊 *Interac Sentiment Report* — {timestamp}\n\n{report}",
+            f"📊 *Interac Intelligence* — {now_est()}\n\n{report}",
             parse_mode="Markdown",
         )
     except Exception as e:
-        logger.error(f"Manual scan failed: {e}")
+        logger.error(f"Scan failed: {e}")
         await update.message.reply_text(f"❌ Scan failed: {e}")
 
 
+async def cmd_raw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not last_mentions_raw:
+        await update.message.reply_text("No scan data yet. Run /scan first.")
+        return
+    # Telegram max message is 4096 chars
+    text = last_mentions_raw[:4000]
+    await update.message.reply_text(f"```\n{text}\n```", parse_mode="Markdown")
+
+
 async def cmd_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show current analysis prompt so user can verify/tweak."""
     config = load_prompts()
+    queries = config["data_queries"]
+    summary = "\n".join(f"*{k}:* {len(v)} queries" for k, v in queries.items())
     await update.message.reply_text(
-        f"*Current analysis prompt:*\n\n`{config['analysis_prompt'][:1000]}`\n\n"
-        f"*Search queries:*\n{', '.join(config['data_queries'])}\n\n"
-        f"Edit `prompts.json` and redeploy to change.",
+        f"*Query categories:*\n{summary}\n\n"
+        f"Edit `prompts.json` to change queries or prompts.",
         parse_mode="Markdown",
     )
 
 
-# ─── Follow-up Handler ───────────────────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     if not user_text:
         return
-
     if not last_report:
-        await update.message.reply_text(
-            "No report yet. Run /scan first or wait for the next scheduled report."
-        )
+        await update.message.reply_text("No report yet. Run /scan first.")
         return
 
     await update.message.reply_text("🤔 Thinking...")
@@ -330,7 +302,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await ask_followup(user_text, last_report)
         await update.message.reply_text(response, parse_mode="Markdown")
     except Exception as e:
-        logger.error(f"Follow-up error: {e}")
         await update.message.reply_text(f"❌ Error: {e}")
 
 
@@ -344,15 +315,18 @@ def main():
     app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("scan", cmd_scan))
+    app.add_handler(CommandHandler("raw", cmd_raw))
     app.add_handler(CommandHandler("prompt", cmd_prompt))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    # Schedule 4x/day in EST (convert to UTC for the scheduler)
+    # EST = UTC-5, so 6am/10am/2pm/6pm EST = 11/15/19/23 UTC
     job_queue = app.job_queue
-    for hour in [6, 10, 14, 18]:
+    for utc_hour in [11, 15, 19, 23]:
         job_queue.run_daily(
             scheduled_sentiment_broadcast,
-            time=datetime.strptime(f"{hour:02d}:00", "%H:%M").time(),
-            name=f"sentiment_{hour:02d}",
+            time=datetime.strptime(f"{utc_hour:02d}:00", "%H:%M").time(),
+            name=f"sentiment_{utc_hour:02d}",
         )
 
     if WEBHOOK_URL:
