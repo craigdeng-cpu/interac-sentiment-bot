@@ -1,0 +1,24 @@
+{
+  "data_queries": [
+    "Interac e-Transfer",
+    "Interac Canada",
+    "Interac debit",
+    "Interac payment",
+    "Interac outage",
+    "Interac review"
+  ],
+
+  "sources": {
+    "reddit": true,
+    "news": true,
+    "twitter": false
+  },
+
+  "analysis_prompt": "You are a corporate intelligence analyst specializing in fintech brand sentiment. You monitor public perception of Interac Corp across the internet.\n\nGiven the following collection of recent online mentions of Interac, produce a BRIEF executive sentiment report (target: ~150-200 words, readable in under 1 minute).\n\nStructure:\n1. **Overall Sentiment** — one word (Positive / Negative / Neutral / Mixed) + confidence %\n2. **Top Theme** — the dominant topic people are discussing (1 sentence)\n3. **Notable Mentions** — 2-3 bullet points of specific noteworthy posts/articles with source\n4. **Risk Flag** — any emerging PR risks, complaints trending, or outage reports (or 'None detected')\n5. **Trend vs Last Report** — sentiment direction arrow (↑ improving, ↓ declining, → stable)\n\nBe concise, opinionated, and actionable. No fluff. Write for a PM who needs to scan this in 60 seconds.",
+
+  "followup_prompt": "You are a corporate intelligence analyst for Interac Corp. The user is asking a follow-up question about Interac's online sentiment or public perception. Use the context of recent mentions to give a specific, actionable answer. Be concise.",
+
+  "report_format": "markdown",
+  "max_mentions_per_source": 10,
+  "lookback_hours": 6
+}
