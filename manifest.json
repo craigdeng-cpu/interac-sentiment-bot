@@ -1,0 +1,44 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.17/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.17",
+  "version": "1.0.0",
+  "id": "YOUR_MICROSOFT_APP_ID",
+  "developer": {
+    "name": "Your Name",
+    "websiteUrl": "https://your-railway-app.up.railway.app",
+    "privacyUrl": "https://your-railway-app.up.railway.app/privacy",
+    "termsOfUseUrl": "https://your-railway-app.up.railway.app/terms"
+  },
+  "name": {
+    "short": "Sentiment Bot",
+    "full": "OpenClaw Sentiment Analysis Bot"
+  },
+  "description": {
+    "short": "Sentiment analysis powered by Kimi K2.5",
+    "full": "Runs sentiment analysis 4x daily and allows interactive analysis via chat."
+  },
+  "icons": {
+    "outline": "outline.png",
+    "color": "color.png"
+  },
+  "accentColor": "#4F46E5",
+  "bots": [
+    {
+      "botId": "YOUR_MICROSOFT_APP_ID",
+      "scopes": ["personal", "team", "groupChat"],
+      "supportsFiles": false,
+      "isNotificationOnly": false,
+      "commandLists": [
+        {
+          "scopes": ["personal", "team", "groupChat"],
+          "commands": [
+            { "title": "help", "description": "Show available commands" },
+            { "title": "status", "description": "Check bot and schedule status" }
+          ]
+        }
+      ]
+    }
+  ],
+  "permissions": ["identity", "messageTeamMembers"],
+  "validDomains": ["your-railway-app.up.railway.app"]
+}
