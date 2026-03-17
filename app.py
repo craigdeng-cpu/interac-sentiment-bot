@@ -220,35 +220,26 @@ async def fetch_all_mentions() -> str:
     lines.append(f"Total: {total} unique mentions ({len(people_mentions)} people, {len(press_mentions)} press)\n")
 
     if people_mentions:
-        lines.append("=== PEOPLE (Reddit, X/Twitter, RedFlagDeals, Forums) ===")
-        for i, m in enumerate(people_mentions, 1):
-            date_str = f" | Date: {m['date']}" if m.get("date") else ""
-            lines.append(
-                f"[P{i}] {m['title']}\n"
-                f"    Source: {m['source']}{date_str}\n"
-                f"    Snippet: {m['snippet']}\n"
-                f"    URL: {m['link']}\n"
-            )
+        lines.append("=== PEOPLE (Reddit, X, RFD) ===")
+        for i, m in enumerate(people_mentions[:15], 1):
+            date_str = f" ({m['date']})" if m.get("date") else ""
+            lines.append(f"[P{i}] {m['title']} | {m['source']}{date_str}\n  {m['snippet'][:150]}\n  {m['link']}")
 
     if press_mentions:
-        lines.append("=== PRESS & INDUSTRY ===")
-        for i, m in enumerate(press_mentions, 1):
-            date_str = f" | Date: {m['date']}" if m.get("date") else ""
-            lines.append(
-                f"[N{i}] {m['title']}\n"
-                f"    Source: {m['source']}{date_str}\n"
-                f"    Snippet: {m['snippet']}\n"
-                f"    URL: {m['link']}\n"
-            )
+        lines.append("\n=== PRESS ===")
+        for i, m in enumerate(press_mentions[:10], 1):
+            date_str = f" ({m['date']})" if m.get("date") else ""
+            lines.append(f"[N{i}] {m['title']} | {m['source']}{date_str}\n  {m['snippet'][:150]}\n  {m['link']}")
 
     return "\n".join(lines)
 
 
 # ─── Kimi K2.5 Analysis ──────────────────────────────────────────────────────
 async def call_kimi(system_prompt: str, user_content: str) -> str:
-    # Truncate to ~60k chars to stay within Kimi's token limits
-    if len(user_content) > 60000:
-        user_content = user_content[:60000] + "\n\n[... truncated due to length]"
+    # 8192 token limit total. System prompt ~500 tokens, output ~800 tokens.
+    # Budget ~6000 tokens (~18k chars) for user content. Cap at 15k for safety.
+    if len(user_content) > 15000:
+        user_content = user_content[:15000] + "\n\n[... truncated]"
 
     async with httpx.AsyncClient(timeout=90) as client:
         response = await client.post(
@@ -264,6 +255,7 @@ async def call_kimi(system_prompt: str, user_content: str) -> str:
                     {"role": "user", "content": user_content},
                 ],
                 "temperature": 0.3,
+                "max_tokens": 2000,
             },
         )
         if response.status_code != 200:

@@ -50,7 +50,7 @@
   "followup_prompt": "You are a product intelligence analyst at Interac Corp. The user is a PM asking follow-ups about Interac sentiment, product perception, or competitive position. Reference the latest report and raw mentions. Include exact URLs when citing sources. Be direct and specific.",
 
   "alert_threshold": 35,
-  "max_mentions_per_source": 5,
+  "max_mentions_per_source": 3,
   "lookback_hours": 6,
   "timezone": "US/Eastern"
 }
