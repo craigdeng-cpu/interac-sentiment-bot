@@ -246,6 +246,10 @@ async def fetch_all_mentions() -> str:
 
 # ─── Kimi K2.5 Analysis ──────────────────────────────────────────────────────
 async def call_kimi(system_prompt: str, user_content: str) -> str:
+    # Truncate to ~60k chars to stay within Kimi's token limits
+    if len(user_content) > 60000:
+        user_content = user_content[:60000] + "\n\n[... truncated due to length]"
+
     async with httpx.AsyncClient(timeout=90) as client:
         response = await client.post(
             KIMI_API_URL,
@@ -262,7 +266,10 @@ async def call_kimi(system_prompt: str, user_content: str) -> str:
                 "temperature": 0.3,
             },
         )
-        response.raise_for_status()
+        if response.status_code != 200:
+            body = response.text
+            logger.error(f"Kimi API {response.status_code}: {body}")
+            raise Exception(f"Kimi API {response.status_code}: {body[:300]}")
         data = response.json()
         return data["choices"][0]["message"]["content"]
 
