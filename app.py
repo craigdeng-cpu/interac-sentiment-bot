@@ -32,12 +32,37 @@ KIMI_MODEL = os.environ.get("KIMI_MODEL", "kimi-k2.5-preview")
 PORT = int(os.environ.get("PORT", 3978))
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
+ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x}
+DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "5"))
 
 EST = timezone(timedelta(hours=-5))
 
 subscribed_chats: set[int] = set()
 last_report: str = ""
 last_mentions_raw: str = ""
+
+# Per-user daily rate limiting
+from collections import defaultdict
+user_usage: dict[int, dict] = defaultdict(lambda: {"count": 0, "date": None})
+
+
+def check_rate_limit(user_id: int) -> tuple[bool, int]:
+    """Returns (allowed, remaining). Admins always allowed."""
+    if user_id in ADMIN_IDS:
+        return True, -1
+
+    today = datetime.now(EST).date()
+    usage = user_usage[user_id]
+
+    if usage["date"] != today:
+        usage["count"] = 0
+        usage["date"] = today
+
+    if usage["count"] >= DAILY_LIMIT:
+        return False, 0
+
+    usage["count"] += 1
+    return True, DAILY_LIMIT - usage["count"]
 
 
 def now_est() -> str:
@@ -297,10 +322,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No report yet. Run /scan first.")
         return
 
+    allowed, remaining = check_rate_limit(update.effective_user.id)
+    if not allowed:
+        await update.message.reply_text(
+            f"⚠️ Daily limit reached ({DAILY_LIMIT} questions/day). Resets at midnight EST."
+        )
+        return
+
     await update.message.reply_text("🤔 Thinking...")
     try:
         response = await ask_followup(user_text, last_report)
-        await update.message.reply_text(response, parse_mode="Markdown")
+        suffix = f"\n\n_({remaining} questions remaining today)_" if remaining >= 0 else ""
+        await update.message.reply_text(response + suffix, parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
