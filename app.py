@@ -46,11 +46,14 @@ EMAIL_COOLDOWN_MINUTES = int(os.environ.get("EMAIL_COOLDOWN_MINUTES", "0"))
 EMAIL_WEEKLY_DAY = os.environ.get("EMAIL_WEEKLY_DAY", "monday").strip().lower()
 EMAIL_WEEKLY_HOUR = int(os.environ.get("EMAIL_WEEKLY_HOUR", "9"))
 ALERT_HIGH_THRESHOLD = int(os.environ.get("ALERT_HIGH_THRESHOLD", "85"))
+EMAIL_PROVIDER = os.environ.get("EMAIL_PROVIDER", "smtp").strip().lower()
 
 SMTP_HOST = os.environ.get("SMTP_HOST", "")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USERNAME = os.environ.get("SMTP_USERNAME", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+RESEND_API_URL = os.environ.get("RESEND_API_URL", "https://api.resend.com/emails")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", "")
 EMAIL_TO = [x.strip() for x in os.environ.get("EMAIL_TO", "").split(",") if x.strip()]
 EMAIL_SUBJECT_PREFIX = os.environ.get("EMAIL_SUBJECT_PREFIX", "Interac Intelligence")
@@ -378,6 +381,15 @@ def _smtp_config_summary() -> str:
     )
 
 
+def _resend_config_summary() -> str:
+    key_hint = "(set)" if RESEND_API_KEY else "(empty)"
+    recipient_count = len(EMAIL_TO)
+    return (
+        f"url={RESEND_API_URL} key={key_hint} from={EMAIL_FROM or '(empty)'} "
+        f"recipients={recipient_count}"
+    )
+
+
 def _validate_smtp_config() -> tuple[bool, str]:
     missing = []
     if not EMAIL_ENABLED:
@@ -398,11 +410,53 @@ def _validate_smtp_config() -> tuple[bool, str]:
     return True, "ok"
 
 
-def smtp_health_check() -> tuple[bool, str]:
+def _validate_resend_config() -> tuple[bool, str]:
+    missing = []
+    if not EMAIL_ENABLED:
+        missing.append("EMAIL_ENABLED")
+    if not RESEND_API_KEY:
+        missing.append("RESEND_API_KEY")
+    if not EMAIL_FROM:
+        missing.append("EMAIL_FROM")
+    if not EMAIL_TO:
+        missing.append("EMAIL_TO")
+    if missing:
+        return False, f"Missing/invalid env vars: {', '.join(missing)}"
+    return True, "ok"
+
+
+def _send_email_smtp(subject: str, body: str) -> tuple[bool, str]:
     valid, reason = _validate_smtp_config()
     if not valid:
-        return False, f"{reason}. Current: {_smtp_config_summary()}"
+        logger.warning(f"Email send skipped: {reason}")
+        return False, reason
 
+    try:
+        msg = MIMEText(body, _charset="utf-8")
+        msg["Subject"] = subject
+        msg["From"] = EMAIL_FROM
+        msg["To"] = ", ".join(EMAIL_TO)
+
+        if SMTP_PORT == 465:
+            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30)
+        else:
+            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+        server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+        server.quit()
+        return True, "email accepted by SMTP server"
+    except Exception as e:
+        logger.error(f"Failed to send email via SMTP: {e}")
+        return False, str(e)
+
+
+def _smtp_login_check() -> tuple[bool, str]:
+    valid, reason = _validate_smtp_config()
+    if not valid:
+        return False, reason
     try:
         if SMTP_PORT == 465:
             server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30)
@@ -414,39 +468,71 @@ def smtp_health_check() -> tuple[bool, str]:
         server.login(SMTP_USERNAME, SMTP_PASSWORD)
         server.noop()
         server.quit()
-        return True, f"SMTP connection/login successful. {_smtp_config_summary()}"
+        return True, "ok"
     except Exception as e:
-        return False, f"SMTP health check failed: {e}. {_smtp_config_summary()}"
+        return False, str(e)
 
 
-def send_email(subject: str, body: str) -> tuple[bool, str]:
-    valid, reason = _validate_smtp_config()
+def _send_email_resend(subject: str, body: str) -> tuple[bool, str]:
+    valid, reason = _validate_resend_config()
     if not valid:
         logger.warning(f"Email send skipped: {reason}")
         return False, reason
 
-    msg = MIMEText(body, _charset="utf-8")
-    msg["Subject"] = subject
-    msg["From"] = EMAIL_FROM
-    msg["To"] = ", ".join(EMAIL_TO)
-
     try:
-        if SMTP_PORT == 465:
-            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30)
-        else:
-            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-
-        server.login(SMTP_USERNAME, SMTP_PASSWORD)
-
-        server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
-        server.quit()
-        return True, "email accepted by SMTP server"
+        response = httpx.post(
+            RESEND_API_URL,
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": EMAIL_FROM,
+                "to": EMAIL_TO,
+                "subject": subject,
+                "text": body,
+            },
+            timeout=30,
+        )
+        if response.status_code not in (200, 201, 202):
+            return False, f"Resend API {response.status_code}: {response.text[:300]}"
+        return True, "email accepted by Resend API"
     except Exception as e:
-        logger.error(f"Failed to send email: {e}")
+        logger.error(f"Failed to send email via Resend: {e}")
         return False, str(e)
+
+
+def smtp_health_check() -> tuple[bool, str]:
+    if EMAIL_PROVIDER == "resend":
+        valid, reason = _validate_resend_config()
+        if not valid:
+            return False, f"{reason}. Current: {_resend_config_summary()}"
+        try:
+            # Check API reachability + key validity via a lightweight domains call.
+            response = httpx.get(
+                "https://api.resend.com/domains",
+                headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
+                timeout=30,
+            )
+            if response.status_code != 200:
+                return False, f"Resend health check {response.status_code}: {response.text[:300]}"
+            return True, f"Resend API reachable and key accepted. {_resend_config_summary()}"
+        except Exception as e:
+            return False, f"Resend health check failed: {e}. {_resend_config_summary()}"
+
+    valid, reason = _validate_smtp_config()
+    if not valid:
+        return False, f"{reason}. Current: {_smtp_config_summary()}"
+    ok, send_reason = _smtp_login_check()
+    if ok:
+        return True, f"SMTP connection/login successful. {_smtp_config_summary()}"
+    return False, f"SMTP health check failed: {send_reason}. {_smtp_config_summary()}"
+
+
+def send_email(subject: str, body: str) -> tuple[bool, str]:
+    if EMAIL_PROVIDER == "resend":
+        return _send_email_resend(subject, body)
+    return _send_email_smtp(subject, body)
 
 
 def _record_email_sent(trigger: str, *, alert_kind: str | None = None, now_local: datetime | None = None) -> None:

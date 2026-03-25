@@ -68,15 +68,18 @@ gh repo create teams-sentiment-bot --private --push
 
 ---
 ## Email Notifications (Optional)
-You can also email yourself via SMTP in three ways:
+You can also email yourself in three ways:
 - Weekly digest (`EMAIL_SEND_MODE=weekly`)
 - Alert emails (`EMAIL_SEND_MODE=alert`) for low sentiment or high positive spikes
 - On-demand with Telegram `/email` (admin-only)
 
-### 1. Add SMTP + recipients as Railway environment variables
+### 1. Choose email provider and set Railway variables
 In Railway, go to your service → **Settings** → **Variables**, and add at least:
+
+SMTP provider:
 ```
 EMAIL_ENABLED=1
+EMAIL_PROVIDER=smtp
 EMAIL_SEND_MODE=weekly
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
@@ -90,10 +93,25 @@ EMAIL_WEEKLY_HOUR=9
 ALERT_HIGH_THRESHOLD=85
 ```
 
+Resend provider:
+```
+EMAIL_ENABLED=1
+EMAIL_PROVIDER=resend
+EMAIL_SEND_MODE=weekly
+RESEND_API_KEY=re_xxxxxxxxx
+EMAIL_FROM=onboarding@resend.dev
+EMAIL_TO=you@yourdomain.com
+EMAIL_SUBJECT_PREFIX=Interac Intelligence
+EMAIL_WEEKLY_DAY=monday
+EMAIL_WEEKLY_HOUR=9
+ALERT_HIGH_THRESHOLD=85
+```
+
 Notes:
 - For Gmail, use an **App Password** (not your regular login password).
 - For SMTPS (implicit TLS), set `SMTP_PORT=465`.
 - If your SMTP server does not support `STARTTLS`, keep `SMTP_PORT=465` or adjust accordingly.
+- For Resend production use, verify your domain and replace `EMAIL_FROM` with your verified sender.
 
 ### 2. Control when emails are sent
 Current options:
