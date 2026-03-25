@@ -493,6 +493,10 @@ async def scheduled_sentiment_broadcast(context: ContextTypes.DEFAULT_TYPE):
 async def scheduled_weekly_email_digest(context: ContextTypes.DEFAULT_TYPE):
     global last_report, last_mentions_raw, last_sentiment_score
     now_local = datetime.now(EST)
+    target_weekday = WEEKDAY_TO_INDEX.get(EMAIL_WEEKLY_DAY, 0)
+    if now_local.weekday() != target_weekday or now_local.hour != EMAIL_WEEKLY_HOUR:
+        return
+
     should_send, reason = _should_send_email(trigger="weekly", now_local=now_local)
     if not should_send:
         logger.info(f"Weekly email not sent: {reason}")
@@ -692,11 +696,12 @@ def main():
             name=f"sentiment_{utc_hour:02d}",
         )
 
-    weekly_day_utc, weekly_hour_utc = weekly_est_to_utc(EMAIL_WEEKLY_DAY, EMAIL_WEEKLY_HOUR)
-    job_queue.run_weekly(
+    _, weekly_hour_utc = weekly_est_to_utc(EMAIL_WEEKLY_DAY, EMAIL_WEEKLY_HOUR)
+    # Compatibility fallback: some python-telegram-bot JobQueue builds do not expose run_weekly.
+    # Run daily at the target hour and guard weekday/hour inside the callback.
+    job_queue.run_daily(
         scheduled_weekly_email_digest,
         time=datetime.strptime(f"{weekly_hour_utc:02d}:00", "%H:%M").time(),
-        days=(weekly_day_utc,),
         name="weekly_email_digest",
     )
 
