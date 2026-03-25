@@ -40,9 +40,12 @@ ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x}
 DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "5"))
 
 EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "0") == "1"
-EMAIL_SEND_MODE = os.environ.get("EMAIL_SEND_MODE", "alert").lower()  # "alert" or "always"
+EMAIL_SEND_MODE = os.environ.get("EMAIL_SEND_MODE", "alert").lower()
 EMAIL_ALERT_DEDUP = os.environ.get("EMAIL_ALERT_DEDUP", "1") == "1"
 EMAIL_COOLDOWN_MINUTES = int(os.environ.get("EMAIL_COOLDOWN_MINUTES", "0"))
+EMAIL_WEEKLY_DAY = os.environ.get("EMAIL_WEEKLY_DAY", "monday").strip().lower()
+EMAIL_WEEKLY_HOUR = int(os.environ.get("EMAIL_WEEKLY_HOUR", "9"))
+ALERT_HIGH_THRESHOLD = int(os.environ.get("ALERT_HIGH_THRESHOLD", "85"))
 
 SMTP_HOST = os.environ.get("SMTP_HOST", "")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
@@ -58,8 +61,9 @@ subscribed_chats: set[int] = set()
 last_report: str = ""
 last_mentions_raw: str = ""
 last_sentiment_score: int = 50
-last_alert_state: bool = False
+last_alert_kind: str | None = None
 last_email_sent_at: datetime | None = None
+last_weekly_email_key: str | None = None
 
 # Per-user daily rate limiting
 user_usage: dict[int, dict] = defaultdict(lambda: {"count": 0, "date": None})
@@ -303,7 +307,38 @@ def extract_sentiment_score(report: str) -> int:
     return 50
 
 
-def _should_send_email(is_alert: bool) -> tuple[bool, str]:
+def parse_email_modes() -> set[str]:
+    # Supports: alert, weekly, always, comma-separated combinations.
+    modes = {m.strip().lower() for m in EMAIL_SEND_MODE.split(",") if m.strip()}
+    if not modes:
+        modes = {"alert"}
+    if "always" in modes:
+        modes.update({"alert", "weekly"})
+    return modes
+
+
+WEEKDAY_TO_INDEX = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+
+def weekly_key(now_local: datetime) -> str:
+    year, week_num, _ = now_local.isocalendar()
+    return f"{year}-W{week_num}-{EMAIL_WEEKLY_DAY}-{EMAIL_WEEKLY_HOUR}"
+
+
+def _should_send_email(
+    *,
+    trigger: str,
+    alert_kind: str | None = None,
+    now_local: datetime | None = None,
+) -> tuple[bool, str]:
     """
     Decide whether we should send an email for this scan.
     Returns (should_send, reason).
@@ -311,14 +346,20 @@ def _should_send_email(is_alert: bool) -> tuple[bool, str]:
     if not EMAIL_ENABLED:
         return False, "EMAIL_ENABLED=0"
 
-    if not is_alert and EMAIL_SEND_MODE != "always":
-        return False, f"EMAIL_SEND_MODE={EMAIL_SEND_MODE}"
+    modes = parse_email_modes()
 
-    if EMAIL_SEND_MODE == "alert" and not is_alert:
-        return False, "no alert"
+    if trigger == "alert" and "alert" not in modes:
+        return False, f"mode excludes alert ({EMAIL_SEND_MODE})"
+    if trigger == "weekly" and "weekly" not in modes:
+        return False, f"mode excludes weekly ({EMAIL_SEND_MODE})"
 
-    if EMAIL_SEND_MODE == "alert" and EMAIL_ALERT_DEDUP and is_alert and last_alert_state:
-        return False, "alert dedup"
+    if trigger == "alert" and EMAIL_ALERT_DEDUP and alert_kind is not None and alert_kind == last_alert_kind:
+        return False, f"alert dedup ({alert_kind})"
+
+    if trigger == "weekly" and EMAIL_ALERT_DEDUP and now_local is not None:
+        current_weekly_key = weekly_key(now_local)
+        if current_weekly_key == last_weekly_email_key:
+            return False, "weekly dedup"
 
     if EMAIL_COOLDOWN_MINUTES > 0 and last_email_sent_at is not None:
         minutes_since = (datetime.now(timezone.utc) - last_email_sent_at).total_seconds() / 60.0
@@ -361,6 +402,25 @@ def send_email(subject: str, body: str) -> None:
         logger.error(f"Failed to send email: {e}")
 
 
+def _record_email_sent(trigger: str, *, alert_kind: str | None = None, now_local: datetime | None = None) -> None:
+    global last_email_sent_at, last_alert_kind, last_weekly_email_key
+    last_email_sent_at = datetime.now(timezone.utc)
+    if trigger == "alert":
+        last_alert_kind = alert_kind
+    elif trigger == "weekly" and now_local is not None:
+        last_weekly_email_key = weekly_key(now_local)
+
+
+def weekly_est_to_utc(day_name: str, hour_est: int) -> tuple[int, int]:
+    base_day = WEEKDAY_TO_INDEX.get(day_name, 0)
+    hour_utc = hour_est + 5  # EST -> UTC
+    day_shift = 0
+    if hour_utc >= 24:
+        hour_utc -= 24
+        day_shift = 1
+    return (base_day + day_shift) % 7, hour_utc
+
+
 async def ask_followup(question: str, report_context: str) -> str:
     config = load_prompts()
     return await call_kimi(
@@ -371,7 +431,7 @@ async def ask_followup(question: str, report_context: str) -> str:
 
 # ─── Scheduled Broadcast ─────────────────────────────────────────────────────
 async def scheduled_sentiment_broadcast(context: ContextTypes.DEFAULT_TYPE):
-    global last_report, last_mentions_raw, last_sentiment_score, last_alert_state, last_email_sent_at
+    global last_report, last_mentions_raw, last_sentiment_score, last_alert_kind
     logger.info(f"[{now_est()}] Running scheduled Interac sentiment scan...")
 
     try:
@@ -384,28 +444,41 @@ async def scheduled_sentiment_broadcast(context: ContextTypes.DEFAULT_TYPE):
         config = load_prompts()
         threshold = config.get("alert_threshold", 35)
 
-        # Check for alert
+        # Check for low/high alert conditions.
         alert_prefix = ""
-        is_alert = score < threshold
-        if is_alert:
+        is_low_alert = score < threshold
+        is_high_alert = score > ALERT_HIGH_THRESHOLD
+        alert_kind = None
+        if is_low_alert:
+            alert_kind = "low"
             alert_prefix = f"🚨 *ALERT: Sentiment dropped to {score}/100* 🚨\n\n"
+        elif is_high_alert:
+            alert_kind = "high"
+            alert_prefix = f"🔥 *SPIKE: Sentiment jumped to {score}/100* 🔥\n\n"
 
         last_sentiment_score = score
         message = f"{alert_prefix}📊 *Interac Intelligence* — {now_est()}\n\n{report}"
 
-        should_send, reason = _should_send_email(is_alert=is_alert)
+        if alert_kind is not None:
+            should_send, reason = _should_send_email(trigger="alert", alert_kind=alert_kind)
+        else:
+            should_send, reason = (False, "no alert condition")
+
         if should_send:
-            subject = f"{EMAIL_SUBJECT_PREFIX} — {'ALERT' if is_alert else 'REPORT'} ({score}/100)"
+            label = "ALERT" if alert_kind == "low" else "SPIKE"
+            subject = f"{EMAIL_SUBJECT_PREFIX} — {label} ({score}/100)"
             body_lines = [f"Interac Intelligence — {now_est()}", ""]
-            if is_alert:
+            if alert_kind == "low":
                 body_lines += [f"ALERT: Sentiment dropped to {score}/100 (threshold {threshold})", ""]
+            elif alert_kind == "high":
+                body_lines += [f"SPIKE: Sentiment rose to {score}/100 (high threshold {ALERT_HIGH_THRESHOLD})", ""]
             body_lines.append(report)
             send_email(subject=subject, body="\n".join(body_lines))
-            last_email_sent_at = datetime.now(timezone.utc)
+            _record_email_sent("alert", alert_kind=alert_kind)
         else:
             logger.info(f"Email not sent: {reason}")
 
-        last_alert_state = is_alert
+        last_alert_kind = alert_kind
 
         for chat_id in subscribed_chats.copy():
             try:
@@ -415,6 +488,31 @@ async def scheduled_sentiment_broadcast(context: ContextTypes.DEFAULT_TYPE):
                 subscribed_chats.discard(chat_id)
     except Exception as e:
         logger.error(f"Scheduled job failed: {e}")
+
+
+async def scheduled_weekly_email_digest(context: ContextTypes.DEFAULT_TYPE):
+    global last_report, last_mentions_raw, last_sentiment_score
+    now_local = datetime.now(EST)
+    should_send, reason = _should_send_email(trigger="weekly", now_local=now_local)
+    if not should_send:
+        logger.info(f"Weekly email not sent: {reason}")
+        return
+
+    logger.info(f"[{now_est()}] Running weekly email digest scan...")
+    try:
+        mentions = await fetch_all_mentions()
+        last_mentions_raw = mentions
+        report = await analyze_sentiment(mentions)
+        last_report = report
+        score = extract_sentiment_score(report)
+        last_sentiment_score = score
+
+        subject = f"{EMAIL_SUBJECT_PREFIX} — WEEKLY DIGEST ({score}/100)"
+        body = f"Interac Intelligence Weekly Digest — {now_est()}\n\n{report}"
+        send_email(subject, body)
+        _record_email_sent("weekly", now_local=now_local)
+    except Exception as e:
+        logger.error(f"Weekly email digest failed: {e}")
 
 
 # ─── Command Handlers ────────────────────────────────────────────────────────
@@ -430,6 +528,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /raw — See raw mentions from last scan\n"
         "• /prompt — View current config\n"
         "• /status — Check schedule\n"
+        "• /email — Admin: run scan + send email now\n"
         "• Any text → Follow-up on latest report",
         parse_mode="Markdown",
     )
@@ -511,6 +610,40 @@ async def cmd_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global last_report, last_mentions_raw, last_sentiment_score
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    await update.message.reply_text("📧 Running fresh scan and sending email...")
+    try:
+        mentions = await fetch_all_mentions()
+        last_mentions_raw = mentions
+        report = await analyze_sentiment(mentions)
+        last_report = report
+
+        score = extract_sentiment_score(report)
+        last_sentiment_score = score
+        config = load_prompts()
+        low_threshold = config.get("alert_threshold", 35)
+
+        subject = f"{EMAIL_SUBJECT_PREFIX} — MANUAL REPORT ({score}/100)"
+        body = (
+            f"Interac Intelligence — {now_est()}\n\n"
+            f"Manual /email trigger\n"
+            f"Low alert threshold: {low_threshold}\n"
+            f"High alert threshold: {ALERT_HIGH_THRESHOLD}\n\n"
+            f"{report}"
+        )
+        send_email(subject, body)
+        _record_email_sent("on_demand")
+        await update.message.reply_text("✅ Email sent (if SMTP is configured).")
+    except Exception as e:
+        logger.error(f"/email failed: {e}")
+        await update.message.reply_text(f"❌ /email failed: {e}")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     if not user_text:
@@ -547,6 +680,7 @@ def main():
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("raw", cmd_raw))
     app.add_handler(CommandHandler("prompt", cmd_prompt))
+    app.add_handler(CommandHandler("email", cmd_email))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # 6am, 10am, 2pm, 6pm EST = 11, 15, 19, 23 UTC
@@ -557,6 +691,14 @@ def main():
             time=datetime.strptime(f"{utc_hour:02d}:00", "%H:%M").time(),
             name=f"sentiment_{utc_hour:02d}",
         )
+
+    weekly_day_utc, weekly_hour_utc = weekly_est_to_utc(EMAIL_WEEKLY_DAY, EMAIL_WEEKLY_HOUR)
+    job_queue.run_weekly(
+        scheduled_weekly_email_digest,
+        time=datetime.strptime(f"{weekly_hour_utc:02d}:00", "%H:%M").time(),
+        days=(weekly_day_utc,),
+        name="weekly_email_digest",
+    )
 
     if WEBHOOK_URL:
         app.run_webhook(

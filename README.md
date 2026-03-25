@@ -68,35 +68,47 @@ gh repo create teams-sentiment-bot --private --push
 
 ---
 ## Email Notifications (Optional)
-You can also email yourself occasionally when the bot finds a sentiment drop.
+You can also email yourself via SMTP in three ways:
+- Weekly digest (`EMAIL_SEND_MODE=weekly`)
+- Alert emails (`EMAIL_SEND_MODE=alert`) for low sentiment or high positive spikes
+- On-demand with Telegram `/email` (admin-only)
 
 ### 1. Add SMTP + recipients as Railway environment variables
 In Railway, go to your service → **Settings** → **Variables**, and add at least:
 ```
 EMAIL_ENABLED=1
-EMAIL_SEND_MODE=alert
-SMTP_HOST=your.smtp.host
+EMAIL_SEND_MODE=weekly
+SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
-SMTP_USERNAME=your_smtp_username
-SMTP_PASSWORD=your_smtp_password
-EMAIL_FROM=you@yourdomain.com
+SMTP_USERNAME=you@gmail.com
+SMTP_PASSWORD=your_gmail_app_password
+EMAIL_FROM=you@gmail.com
 EMAIL_TO=you@yourdomain.com
 EMAIL_SUBJECT_PREFIX=Interac Intelligence
+EMAIL_WEEKLY_DAY=monday
+EMAIL_WEEKLY_HOUR=9
+ALERT_HIGH_THRESHOLD=85
 ```
 
 Notes:
+- For Gmail, use an **App Password** (not your regular login password).
 - For SMTPS (implicit TLS), set `SMTP_PORT=465`.
 - If your SMTP server does not support `STARTTLS`, keep `SMTP_PORT=465` or adjust accordingly.
 
 ### 2. Control when emails are sent
 Current options:
-- `EMAIL_SEND_MODE=alert` (default): email when sentiment score drops below `alert_threshold` and only once per “alert run”.
-- `EMAIL_SEND_MODE=always`: email on every scheduled scan.
-- `EMAIL_ALERT_DEDUP=0`: allow repeated emails while still in alert state.
+- `EMAIL_SEND_MODE=weekly`: send only the weekly digest at `EMAIL_WEEKLY_DAY` + `EMAIL_WEEKLY_HOUR` (EST).
+- `EMAIL_SEND_MODE=alert`: send only alert emails when score is low (`< alert_threshold`) or high (`> ALERT_HIGH_THRESHOLD`).
+- `EMAIL_SEND_MODE=always`: shorthand to enable both `weekly` and `alert`.
+- `EMAIL_SEND_MODE=weekly,alert`: explicit combined mode (same as `always`).
+- `EMAIL_ALERT_DEDUP=1` (default): deduplicate repeated alert type (low/high) and weekly sends in-memory.
 - `EMAIL_COOLDOWN_MINUTES=240`: add a time-based cooldown between emails (0 disables).
 
 ### 3. What triggers an email?
-The bot already computes `alert_threshold` in `prompts.json`. When the scan result sentiment score is below that threshold, an email is sent.
+- **Weekly digest:** weekly scheduler runs at your configured EST day/hour and emails a fresh report.
+- **Low alert:** score below `alert_threshold` from `prompts.json`.
+- **High spike alert:** score above `ALERT_HIGH_THRESHOLD`.
+- **On-demand:** `/email` in Telegram (admin IDs only) runs a fresh scan and sends immediately.
 
 ---
 
