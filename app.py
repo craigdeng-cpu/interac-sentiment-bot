@@ -369,12 +369,61 @@ def _should_send_email(
     return True, "ok"
 
 
-def send_email(subject: str, body: str) -> None:
+def _smtp_config_summary() -> str:
+    recipient_count = len(EMAIL_TO)
+    user_hint = SMTP_USERNAME if SMTP_USERNAME else "(empty)"
+    return (
+        f"host={SMTP_HOST or '(empty)'} port={SMTP_PORT} "
+        f"user={user_hint} from={EMAIL_FROM or '(empty)'} recipients={recipient_count}"
+    )
+
+
+def _validate_smtp_config() -> tuple[bool, str]:
+    missing = []
     if not EMAIL_ENABLED:
-        return
-    if not SMTP_HOST or not EMAIL_FROM or not EMAIL_TO:
-        logger.warning("Email is enabled but SMTP/From/To env vars are missing")
-        return
+        missing.append("EMAIL_ENABLED")
+    if not SMTP_HOST:
+        missing.append("SMTP_HOST")
+    if not EMAIL_FROM:
+        missing.append("EMAIL_FROM")
+    if not EMAIL_TO:
+        missing.append("EMAIL_TO")
+    if not SMTP_USERNAME:
+        missing.append("SMTP_USERNAME")
+    if not SMTP_PASSWORD:
+        missing.append("SMTP_PASSWORD")
+
+    if missing:
+        return False, f"Missing/invalid env vars: {', '.join(missing)}"
+    return True, "ok"
+
+
+def smtp_health_check() -> tuple[bool, str]:
+    valid, reason = _validate_smtp_config()
+    if not valid:
+        return False, f"{reason}. Current: {_smtp_config_summary()}"
+
+    try:
+        if SMTP_PORT == 465:
+            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30)
+        else:
+            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+        server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        server.noop()
+        server.quit()
+        return True, f"SMTP connection/login successful. {_smtp_config_summary()}"
+    except Exception as e:
+        return False, f"SMTP health check failed: {e}. {_smtp_config_summary()}"
+
+
+def send_email(subject: str, body: str) -> tuple[bool, str]:
+    valid, reason = _validate_smtp_config()
+    if not valid:
+        logger.warning(f"Email send skipped: {reason}")
+        return False, reason
 
     msg = MIMEText(body, _charset="utf-8")
     msg["Subject"] = subject
@@ -386,20 +435,18 @@ def send_email(subject: str, body: str) -> None:
             server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30)
         else:
             server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
-            # Most common setup (587).
-            try:
-                server.starttls()
-            except Exception:
-                # Some providers disable STARTTLS or require direct TLS.
-                pass
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
 
-        if SMTP_USERNAME and SMTP_PASSWORD:
-            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        server.login(SMTP_USERNAME, SMTP_PASSWORD)
 
         server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
         server.quit()
+        return True, "email accepted by SMTP server"
     except Exception as e:
         logger.error(f"Failed to send email: {e}")
+        return False, str(e)
 
 
 def _record_email_sent(trigger: str, *, alert_kind: str | None = None, now_local: datetime | None = None) -> None:
@@ -473,8 +520,11 @@ async def scheduled_sentiment_broadcast(context: ContextTypes.DEFAULT_TYPE):
             elif alert_kind == "high":
                 body_lines += [f"SPIKE: Sentiment rose to {score}/100 (high threshold {ALERT_HIGH_THRESHOLD})", ""]
             body_lines.append(report)
-            send_email(subject=subject, body="\n".join(body_lines))
-            _record_email_sent("alert", alert_kind=alert_kind)
+            ok, send_reason = send_email(subject=subject, body="\n".join(body_lines))
+            if ok:
+                _record_email_sent("alert", alert_kind=alert_kind)
+            else:
+                logger.error(f"Alert email failed: {send_reason}")
         else:
             logger.info(f"Email not sent: {reason}")
 
@@ -513,8 +563,11 @@ async def scheduled_weekly_email_digest(context: ContextTypes.DEFAULT_TYPE):
 
         subject = f"{EMAIL_SUBJECT_PREFIX} — WEEKLY DIGEST ({score}/100)"
         body = f"Interac Intelligence Weekly Digest — {now_est()}\n\n{report}"
-        send_email(subject, body)
-        _record_email_sent("weekly", now_local=now_local)
+        ok, send_reason = send_email(subject, body)
+        if ok:
+            _record_email_sent("weekly", now_local=now_local)
+        else:
+            logger.error(f"Weekly email failed: {send_reason}")
     except Exception as e:
         logger.error(f"Weekly email digest failed: {e}")
 
@@ -533,6 +586,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /prompt — View current config\n"
         "• /status — Check schedule\n"
         "• /email — Admin: run scan + send email now\n"
+        "• /smtpcheck — Admin: check SMTP config/login\n"
         "• Any text → Follow-up on latest report",
         parse_mode="Markdown",
     )
@@ -640,12 +694,27 @@ async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"High alert threshold: {ALERT_HIGH_THRESHOLD}\n\n"
             f"{report}"
         )
-        send_email(subject, body)
-        _record_email_sent("on_demand")
-        await update.message.reply_text("✅ Email sent (if SMTP is configured).")
+        ok, send_reason = send_email(subject, body)
+        if ok:
+            _record_email_sent("on_demand")
+            await update.message.reply_text("✅ Email sent successfully.")
+        else:
+            await update.message.reply_text(f"❌ Email failed: {send_reason}")
     except Exception as e:
         logger.error(f"/email failed: {e}")
         await update.message.reply_text(f"❌ /email failed: {e}")
+
+
+async def cmd_smtpcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    ok, reason = smtp_health_check()
+    if ok:
+        await update.message.reply_text(f"✅ {reason}")
+    else:
+        await update.message.reply_text(f"❌ {reason}")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -685,6 +754,7 @@ def main():
     app.add_handler(CommandHandler("raw", cmd_raw))
     app.add_handler(CommandHandler("prompt", cmd_prompt))
     app.add_handler(CommandHandler("email", cmd_email))
+    app.add_handler(CommandHandler("smtpcheck", cmd_smtpcheck))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # 6am, 10am, 2pm, 6pm EST = 11, 15, 19, 23 UTC
