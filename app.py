@@ -102,7 +102,21 @@ def load_prompts() -> dict:
 
 
 # ─── Web Scraping ─────────────────────────────────────────────────────────────
-async def serper_search(query: str, search_type: str = "search", max_results: int = 5) -> list[dict]:
+def lookback_hours_to_tbs(lookback_hours: int) -> str:
+    # Serper/Google time filters: qdr:d (day), qdr:w (week), qdr:m (month).
+    if lookback_hours <= 24:
+        return "qdr:d"
+    if lookback_hours <= 24 * 7:
+        return "qdr:w"
+    return "qdr:m"
+
+
+async def serper_search(
+    query: str,
+    search_type: str = "search",
+    max_results: int = 5,
+    tbs: str = "qdr:w",
+) -> list[dict]:
     if not SERPER_API_KEY:
         return []
 
@@ -116,7 +130,7 @@ async def serper_search(query: str, search_type: str = "search", max_results: in
             response = await client.post(
                 endpoint,
                 headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-                json={"q": query, "num": max_results, "tbs": "qdr:d", "gl": "ca"},
+                json={"q": query, "num": max_results, "tbs": tbs, "gl": "ca"},
             )
             response.raise_for_status()
             data = response.json()
@@ -137,7 +151,7 @@ async def serper_search(query: str, search_type: str = "search", max_results: in
     return results
 
 
-async def search_twitter(query: str, max_results: int = 5) -> list[dict]:
+async def search_twitter(query: str, max_results: int = 5, tbs: str = "qdr:w") -> list[dict]:
     """Search X/Twitter via Serper."""
     if not SERPER_API_KEY:
         return []
@@ -150,7 +164,7 @@ async def search_twitter(query: str, max_results: int = 5) -> list[dict]:
                 json={
                     "q": f"{query} site:x.com OR site:twitter.com",
                     "num": max_results,
-                    "tbs": "qdr:d",
+                    "tbs": tbs,
                     "gl": "ca",
                 },
             )
@@ -177,6 +191,8 @@ async def fetch_all_mentions() -> str:
     queries_config = config["data_queries"]
     sources = config.get("sources", {})
     max_per = config.get("max_mentions_per_source", 5)
+    lookback_hours = int(config.get("lookback_hours", 72))
+    tbs = lookback_hours_to_tbs(lookback_hours)
 
     people_mentions = []  # Reddit, X, RFD, forums
     press_mentions = []   # News articles
@@ -191,7 +207,7 @@ async def fetch_all_mentions() -> str:
 
         # News (press)
         if sources.get("news", True) and not is_people_category:
-            results = await serper_search(query, "news", max_per)
+            results = await serper_search(query, "news", max_per, tbs=tbs)
             for r in results:
                 r["category"] = category
                 r["channel"] = "press"
@@ -199,7 +215,7 @@ async def fetch_all_mentions() -> str:
 
         # Reddit / forums (people)
         if sources.get("reddit", True) or sources.get("forums", True):
-            results = await serper_search(query, "search", max_per)
+            results = await serper_search(query, "search", max_per, tbs=tbs)
             for r in results:
                 r["category"] = category
                 # Classify by domain
@@ -217,7 +233,7 @@ async def fetch_all_mentions() -> str:
 
         # X/Twitter (people)
         if sources.get("twitter", True) and not is_people_category:
-            results = await search_twitter(query, max_per)
+            results = await search_twitter(query, max_per, tbs=tbs)
             for r in results:
                 r["category"] = category
                 r["channel"] = "people"
@@ -238,7 +254,7 @@ async def fetch_all_mentions() -> str:
     total = len(people_mentions) + len(press_mentions)
 
     if total == 0:
-        return "No recent mentions found across any sources in the last 24 hours."
+        return f"No recent mentions found across any sources in the last {lookback_hours} hours."
 
     lines = [f"=== INTERAC INTELLIGENCE SCAN — {now_est()} ==="]
     lines.append(f"Total: {total} unique mentions ({len(people_mentions)} people, {len(press_mentions)} press)\n")
