@@ -67,6 +67,38 @@ gh repo create teams-sentiment-bot --private --push
 - Reports will auto-broadcast at 06:00, 10:00, 14:00, 18:00 UTC
 
 ---
+## Email Notifications (Optional)
+You can also email yourself occasionally when the bot finds a sentiment drop.
+
+### 1. Add SMTP + recipients as Railway environment variables
+In Railway, go to your service → **Settings** → **Variables**, and add at least:
+```
+EMAIL_ENABLED=1
+EMAIL_SEND_MODE=alert
+SMTP_HOST=your.smtp.host
+SMTP_PORT=587
+SMTP_USERNAME=your_smtp_username
+SMTP_PASSWORD=your_smtp_password
+EMAIL_FROM=you@yourdomain.com
+EMAIL_TO=you@yourdomain.com
+EMAIL_SUBJECT_PREFIX=Interac Intelligence
+```
+
+Notes:
+- For SMTPS (implicit TLS), set `SMTP_PORT=465`.
+- If your SMTP server does not support `STARTTLS`, keep `SMTP_PORT=465` or adjust accordingly.
+
+### 2. Control when emails are sent
+Current options:
+- `EMAIL_SEND_MODE=alert` (default): email when sentiment score drops below `alert_threshold` and only once per “alert run”.
+- `EMAIL_SEND_MODE=always`: email on every scheduled scan.
+- `EMAIL_ALERT_DEDUP=0`: allow repeated emails while still in alert state.
+- `EMAIL_COOLDOWN_MINUTES=240`: add a time-based cooldown between emails (0 disables).
+
+### 3. What triggers an email?
+The bot already computes `alert_threshold` in `prompts.json`. When the scan result sentiment score is below that threshold, an email is sent.
+
+---
 
 ## Cost Breakdown
 | Service | Cost |

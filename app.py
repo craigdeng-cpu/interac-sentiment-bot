@@ -9,6 +9,8 @@ Interac Sentiment Analysis Bot
 import os
 import json
 import logging
+import smtplib
+from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from collections import defaultdict
@@ -37,12 +39,27 @@ SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x}
 DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "5"))
 
+EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "0") == "1"
+EMAIL_SEND_MODE = os.environ.get("EMAIL_SEND_MODE", "alert").lower()  # "alert" or "always"
+EMAIL_ALERT_DEDUP = os.environ.get("EMAIL_ALERT_DEDUP", "1") == "1"
+EMAIL_COOLDOWN_MINUTES = int(os.environ.get("EMAIL_COOLDOWN_MINUTES", "0"))
+
+SMTP_HOST = os.environ.get("SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USERNAME = os.environ.get("SMTP_USERNAME", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+EMAIL_FROM = os.environ.get("EMAIL_FROM", "")
+EMAIL_TO = [x.strip() for x in os.environ.get("EMAIL_TO", "").split(",") if x.strip()]
+EMAIL_SUBJECT_PREFIX = os.environ.get("EMAIL_SUBJECT_PREFIX", "Interac Intelligence")
+
 EST = timezone(timedelta(hours=-5))
 
 subscribed_chats: set[int] = set()
 last_report: str = ""
 last_mentions_raw: str = ""
 last_sentiment_score: int = 50
+last_alert_state: bool = False
+last_email_sent_at: datetime | None = None
 
 # Per-user daily rate limiting
 user_usage: dict[int, dict] = defaultdict(lambda: {"count": 0, "date": None})
@@ -286,6 +303,64 @@ def extract_sentiment_score(report: str) -> int:
     return 50
 
 
+def _should_send_email(is_alert: bool) -> tuple[bool, str]:
+    """
+    Decide whether we should send an email for this scan.
+    Returns (should_send, reason).
+    """
+    if not EMAIL_ENABLED:
+        return False, "EMAIL_ENABLED=0"
+
+    if not is_alert and EMAIL_SEND_MODE != "always":
+        return False, f"EMAIL_SEND_MODE={EMAIL_SEND_MODE}"
+
+    if EMAIL_SEND_MODE == "alert" and not is_alert:
+        return False, "no alert"
+
+    if EMAIL_SEND_MODE == "alert" and EMAIL_ALERT_DEDUP and is_alert and last_alert_state:
+        return False, "alert dedup"
+
+    if EMAIL_COOLDOWN_MINUTES > 0 and last_email_sent_at is not None:
+        minutes_since = (datetime.now(timezone.utc) - last_email_sent_at).total_seconds() / 60.0
+        if minutes_since < EMAIL_COOLDOWN_MINUTES:
+            return False, f"cooldown {minutes_since:.1f}m/{EMAIL_COOLDOWN_MINUTES}m"
+
+    return True, "ok"
+
+
+def send_email(subject: str, body: str) -> None:
+    if not EMAIL_ENABLED:
+        return
+    if not SMTP_HOST or not EMAIL_FROM or not EMAIL_TO:
+        logger.warning("Email is enabled but SMTP/From/To env vars are missing")
+        return
+
+    msg = MIMEText(body, _charset="utf-8")
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_FROM
+    msg["To"] = ", ".join(EMAIL_TO)
+
+    try:
+        if SMTP_PORT == 465:
+            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30)
+        else:
+            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
+            # Most common setup (587).
+            try:
+                server.starttls()
+            except Exception:
+                # Some providers disable STARTTLS or require direct TLS.
+                pass
+
+        if SMTP_USERNAME and SMTP_PASSWORD:
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+
+        server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+        server.quit()
+    except Exception as e:
+        logger.error(f"Failed to send email: {e}")
+
+
 async def ask_followup(question: str, report_context: str) -> str:
     config = load_prompts()
     return await call_kimi(
@@ -296,7 +371,7 @@ async def ask_followup(question: str, report_context: str) -> str:
 
 # ─── Scheduled Broadcast ─────────────────────────────────────────────────────
 async def scheduled_sentiment_broadcast(context: ContextTypes.DEFAULT_TYPE):
-    global last_report, last_mentions_raw, last_sentiment_score
+    global last_report, last_mentions_raw, last_sentiment_score, last_alert_state, last_email_sent_at
     logger.info(f"[{now_est()}] Running scheduled Interac sentiment scan...")
 
     try:
@@ -311,11 +386,26 @@ async def scheduled_sentiment_broadcast(context: ContextTypes.DEFAULT_TYPE):
 
         # Check for alert
         alert_prefix = ""
-        if score < threshold:
+        is_alert = score < threshold
+        if is_alert:
             alert_prefix = f"🚨 *ALERT: Sentiment dropped to {score}/100* 🚨\n\n"
 
         last_sentiment_score = score
         message = f"{alert_prefix}📊 *Interac Intelligence* — {now_est()}\n\n{report}"
+
+        should_send, reason = _should_send_email(is_alert=is_alert)
+        if should_send:
+            subject = f"{EMAIL_SUBJECT_PREFIX} — {'ALERT' if is_alert else 'REPORT'} ({score}/100)"
+            body_lines = [f"Interac Intelligence — {now_est()}", ""]
+            if is_alert:
+                body_lines += [f"ALERT: Sentiment dropped to {score}/100 (threshold {threshold})", ""]
+            body_lines.append(report)
+            send_email(subject=subject, body="\n".join(body_lines))
+            last_email_sent_at = datetime.now(timezone.utc)
+        else:
+            logger.info(f"Email not sent: {reason}")
+
+        last_alert_state = is_alert
 
         for chat_id in subscribed_chats.copy():
             try:
