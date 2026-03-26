@@ -1,172 +1,192 @@
-# Teams Sentiment Analysis Bot — Deployment Guide
+# Interac Intelligence Bot
 
-## Prerequisites
-- GitHub account
-- Railway account (https://railway.app — sign in with GitHub)
-- Microsoft 365 admin access (or ask your admin)
-- Kimi K2.5 API key from Moonshot (https://platform.moonshot.cn)
+Telegram bot for monitoring public sentiment and product signals related to Interac (e-Transfer, debit, competitors, customer complaints), with optional scheduled email digests and alerts.
 
----
+## Project goal
 
-## Step-by-Step
+This project is designed to give product/ops stakeholders a lightweight "market pulse":
 
-### 1. Push this repo to GitHub
+- Pull fresh public mentions from web/news/social-style sources.
+- Summarize sentiment and key findings with Kimi.
+- Push updates automatically to subscribed Telegram chats.
+- Send email digests/alerts when configured.
+- Run historical deep dives across multiple time windows (`/deepscan`) for trend discovery.
+
+## Current architecture
+
+- Runtime: Python 3.12 (`app.py`)
+- Chat interface: Telegram (`python-telegram-bot`)
+- Search provider: DuckDuckGo via `ddgs` (no Serper dependency)
+- LLM analysis: Moonshot Kimi API (`KIMI_API_KEY`)
+- Optional email delivery: SMTP or Resend
+- Deployment target: Railway (or any container host)
+
+## Repository map
+
+- `app.py` - main application, handlers, schedulers, search, analysis, email rendering/sending.
+- `prompts.json` - runtime config for queries, thresholds, lookback, and prompt file paths.
+- `prompts/analysis_prompt.md` - daily scan analysis prompt.
+- `prompts/followup_prompt.md` - follow-up Q&A prompt (chat replies to plain text messages).
+- `prompts/historical_prompt.md` - historical deep scan prompt.
+- `requirements.txt` - Python dependencies.
+- `Dockerfile` / `Procfile` - deployment entrypoints.
+- `manifest.json` - legacy Teams manifest artifact (not used by current Telegram runtime).
+
+## Commands
+
+User commands:
+
+- `/start` or `/help` - command overview and auto-subscribe current chat.
+- `/subscribe` - subscribe this chat to scheduled broadcasts.
+- `/unsubscribe` - stop scheduled broadcasts for this chat.
+- `/status` - runtime/schedule/status snapshot.
+- `/scan` - run immediate daily scan.
+- `/raw` - show raw mention payload from last scan.
+- `/prompt` - show query/source config summary.
+- any plain text message - follow-up question over latest report context.
+
+Admin-only commands (`ADMIN_IDS`):
+
+- `/email` - run fresh daily scan and send email immediately (60s timeout).
+- `/deepscan` - run historical scan + analysis + email (with diagnostics).
+- `/smtpcheck` - validate current email provider config/connectivity.
+
+## Scheduled behavior
+
+Defined in `app.py` job queue:
+
+- Daily sentiment scans at 6am, 10am, 2pm, 6pm EST.
+- Weekly email digest at `EMAIL_WEEKLY_DAY` + `EMAIL_WEEKLY_HOUR` (EST).
+  - Implemented via daily trigger + in-function guard for compatibility.
+
+## Configuration
+
+### Required environment variables
+
 ```bash
-cd teams-sentiment-bot
-git init
-git add .
-git commit -m "initial commit"
-gh repo create teams-sentiment-bot --private --push
+TELEGRAM_TOKEN=<telegram bot token>
+KIMI_API_KEY=<moonshot kimi api key>
 ```
 
-### 2. Register a Bot in Azure
-1. Go to https://portal.azure.com → search **"Bot Services"** → **Create**
-2. Choose **Azure Bot** → **Multi Tenant**
-3. Pick **"Create new Microsoft App ID"**
-4. Once created, go to the bot resource → **Configuration**:
-   - **Messaging endpoint**: leave blank for now (you'll fill this after Railway deploy)
-5. Go to **Channels** → **Microsoft Teams** → Enable it
-6. Go to the linked **App Registration** → **Certificates & Secrets** → **New client secret** → copy the value
-7. Note your **Microsoft App ID** (from the bot overview) and the **secret** you just created
+### Common optional environment variables
 
-### 3. Deploy to Railway
-1. Go to https://railway.app → **New Project** → **Deploy from GitHub Repo**
-2. Select your `teams-sentiment-bot` repo
-3. Railway auto-detects the Dockerfile. Go to **Settings** → set:
-   - **Port**: `3978`
-4. Go to **Variables** tab → add:
-   ```
-   MICROSOFT_APP_ID=<from step 2>
-   MICROSOFT_APP_PASSWORD=<client secret from step 2>
-   KIMI_API_KEY=<your moonshot api key>
-   PORT=3978
-   ```
-5. Deploy. Railway gives you a URL like `https://teams-sentiment-bot-production-xxxx.up.railway.app`
+```bash
+KIMI_API_URL=https://api.moonshot.ai/v1/chat/completions
+KIMI_MODEL=kimi-k2.5-preview
+PORT=3978
+WEBHOOK_URL=
+ADMIN_IDS=123456789,987654321
+DAILY_LIMIT=5
+```
 
-### 4. Connect Azure Bot to Railway
-1. Back in Azure Portal → your Bot → **Configuration**
-2. Set **Messaging endpoint** to:
-   ```
-   https://YOUR-RAILWAY-URL.up.railway.app/api/messages
-   ```
-3. Save
+### Email configuration (optional)
 
-### 5. Install Bot in Teams
-1. Edit `manifest/manifest.json`:
-   - Replace `YOUR_MICROSOFT_APP_ID` with your actual App ID (2 places)
-   - Replace `your-railway-app.up.railway.app` with your Railway URL (3 places)
-2. Add two 32x32 PNG icons as `manifest/color.png` and `manifest/outline.png` (any icons work)
-3. Zip the manifest folder contents: `cd manifest && zip ../sentiment-bot.zip *`
-4. In Teams → **Apps** → **Manage your apps** → **Upload a custom app** → upload the zip
-5. Add the bot to any team/group chat
+Core toggles:
 
-### 6. Verify
-- Send `help` to the bot in Teams → should get command list
-- Send any text → should get sentiment analysis back
-- Check `/health` endpoint on your Railway URL
-- Reports will auto-broadcast at 06:00, 10:00, 14:00, 18:00 UTC
-
----
-## Email Notifications (Optional)
-You can also email yourself in three ways:
-- Weekly digest (`EMAIL_SEND_MODE=weekly`)
-- Alert emails (`EMAIL_SEND_MODE=alert`) for low sentiment or high positive spikes
-- On-demand with Telegram `/email` (admin-only)
-- Historical deep scan email with Telegram `/deepscan` (admin-only)
-
-### 1. Choose email provider and set Railway variables
-In Railway, go to your service → **Settings** → **Variables**, and add at least:
+```bash
+EMAIL_ENABLED=1
+EMAIL_PROVIDER=smtp            # smtp | resend
+EMAIL_SEND_MODE=alert          # alert | weekly | always | weekly,alert
+EMAIL_ALERT_DEDUP=1
+EMAIL_COOLDOWN_MINUTES=0
+EMAIL_WEEKLY_DAY=monday
+EMAIL_WEEKLY_HOUR=9
+ALERT_HIGH_THRESHOLD=85
+EMAIL_FROM=you@example.com
+EMAIL_TO=you@example.com,team@example.com
+EMAIL_SUBJECT_PREFIX=Interac Intelligence
+```
 
 SMTP provider:
-```
-EMAIL_ENABLED=1
-EMAIL_PROVIDER=smtp
-EMAIL_SEND_MODE=weekly
+
+```bash
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
 SMTP_USERNAME=you@gmail.com
-SMTP_PASSWORD=your_gmail_app_password
-EMAIL_FROM=you@gmail.com
-EMAIL_TO=you@yourdomain.com
-EMAIL_SUBJECT_PREFIX=Interac Intelligence
-EMAIL_WEEKLY_DAY=monday
-EMAIL_WEEKLY_HOUR=9
-ALERT_HIGH_THRESHOLD=85
+SMTP_PASSWORD=<app-password>
 ```
 
 Resend provider:
-```
-EMAIL_ENABLED=1
-EMAIL_PROVIDER=resend
-EMAIL_SEND_MODE=weekly
+
+```bash
 RESEND_API_KEY=re_xxxxxxxxx
-EMAIL_FROM=onboarding@resend.dev
-EMAIL_TO=you@yourdomain.com
-EMAIL_SUBJECT_PREFIX=Interac Intelligence
-EMAIL_WEEKLY_DAY=monday
-EMAIL_WEEKLY_HOUR=9
-ALERT_HIGH_THRESHOLD=85
+RESEND_API_URL=https://api.resend.com/emails
 ```
 
 Notes:
-- For Gmail, use an **App Password** (not your regular login password).
-- For SMTPS (implicit TLS), set `SMTP_PORT=465`.
-- If your SMTP server does not support `STARTTLS`, keep `SMTP_PORT=465` or adjust accordingly.
-- For Resend production use, verify your domain and replace `EMAIL_FROM` with your verified sender.
 
-### 2. Control when emails are sent
-Current options:
-- `EMAIL_SEND_MODE=weekly`: send only the weekly digest at `EMAIL_WEEKLY_DAY` + `EMAIL_WEEKLY_HOUR` (EST).
-- `EMAIL_SEND_MODE=alert`: send only alert emails when score is low (`< alert_threshold`) or high (`> ALERT_HIGH_THRESHOLD`).
-- `EMAIL_SEND_MODE=always`: shorthand to enable both `weekly` and `alert`.
-- `EMAIL_SEND_MODE=weekly,alert`: explicit combined mode (same as `always`).
-- `EMAIL_ALERT_DEDUP=1` (default): deduplicate repeated alert type (low/high) and weekly sends in-memory.
-- `EMAIL_COOLDOWN_MINUTES=240`: add a time-based cooldown between emails (0 disables).
+- Gmail requires an App Password (not normal account password).
+- Port `587` uses STARTTLS, port `465` uses implicit SSL.
+- Email dedup/cooldown state is in-memory (resets on restart/redeploy).
 
-### 3. What triggers an email?
-- **Weekly digest:** weekly scheduler runs at your configured EST day/hour and emails a fresh report.
-- **Low alert:** score below `alert_threshold` from `prompts.json`.
-- **High spike alert:** score above `ALERT_HIGH_THRESHOLD`.
-- **On-demand:** `/email` in Telegram (admin IDs only) runs a fresh scan and sends immediately.
-- **Historical deep scan:** `/deepscan` in Telegram (admin IDs only) runs multi-timeframe historical analysis and sends email.
+## Prompt + query configuration
 
----
+Prompt text lives in markdown files:
 
-## Cost Breakdown
-| Service | Cost |
-|---------|------|
-| Railway (Starter) | ~$5/mo (trial gives $5 free credit) |
-| Azure Bot Service | Free tier |
-| Kimi K2.5 API | Pay-per-token (very cheap at 4 calls/day) |
-| **Total** | **~$5/mo + pennies for Kimi** |
+- `prompts/analysis_prompt.md`
+- `prompts/followup_prompt.md`
+- `prompts/historical_prompt.md`
 
----
+Operational config lives in `prompts.json`:
 
-## Customization
+- `data_queries` - daily scan query groups
+- `historical_queries` - `/deepscan` query groups/time windows
+- `sources` - source toggles (`reddit`, `news`, `forums`, `twitter`)
+- `alert_threshold` - low sentiment threshold
+- `lookback_hours` - daily scan recency
+- result caps (`max_mentions_per_source`, `historical_max_mentions_per_source`)
 
-### Change schedule times
-In `app.py`, edit the cron expression:
-```python
-scheduler.add_job(scheduled_sentiment_broadcast, "cron", hour="6,10,14,18", minute=0)
+## Daily vs historical reports
+
+- Daily scan (`/scan` + scheduled job):
+  - fast monitoring view
+  - sentiment score extraction (`SENTIMENT SCORE`)
+  - alert/spike logic tied to thresholds
+- Historical scan (`/deepscan`):
+  - grouped into RECENT, MEDIUM, OLDER windows
+  - designed for recurring-theme and longer-horizon insight
+  - includes pre-analysis search diagnostic and raw mention counts
+
+Email rendering is mode-aware:
+
+- Daily reports -> daily template
+- Historical reports -> historical template
+- If parsing markers are missing -> styled raw-report fallback
+
+## Local run
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+export TELEGRAM_TOKEN=...
+export KIMI_API_KEY=...
+python app.py
 ```
 
-### Prompt files and config locations
-- Prompt text now lives in markdown files:
-  - `prompts/analysis_prompt.md` (daily lightweight scan)
-  - `prompts/followup_prompt.md` (chat follow-ups)
-  - `prompts/historical_prompt.md` (historical deep scan)
-- Query/config values stay in `prompts.json`:
-  - `data_queries` for daily scan
-  - `historical_queries` for `/deepscan` timeframes
-  - thresholds/lookback/source toggles
+By default, bot runs in polling mode. Set `WEBHOOK_URL` to use webhook mode (`/webhook` path).
 
-### Daily vs historical mode
-- Daily monitor (`/scan`, scheduled 4x/day): fast, forward-looking, lightweight.
-- Historical deep scan (`/deepscan`): heavier, grouped by RECENT (1mo), MEDIUM (6mo), OLDER (1yr+) and intended for pattern discovery.
-- Email rendering is mode-aware: daily reports use the daily template, while `/deepscan` uses a historical layout. If expected sections are missing, emails gracefully fall back to a styled raw report view.
+## Railway deploy
 
-### Plug in your data source
-Replace `fetch_data_for_analysis()` in `app.py` with your actual OpenClaw pipeline — Reddit scraping, RSS feeds, database queries, etc.
+1. Push repo to GitHub.
+2. In Railway: New Project -> Deploy from GitHub.
+3. Add env vars (at minimum `TELEGRAM_TOKEN`, `KIMI_API_KEY`).
+4. Ensure service port is `3978` (default already handled by app env).
+5. Deploy and verify with Telegram `/status`.
 
-### Persist conversation references
-Currently conversation refs are in-memory (lost on redeploy). For production, swap the `conversation_references` dict with Railway's built-in Redis or Postgres add-on.
+## Known limitations
+
+- Subscription state, latest report context, rate-limit counters, and email dedup state are in-memory only.
+- No persistence layer yet (Redis/Postgres recommended for production durability).
+- `manifest.json` is legacy metadata; current runtime is Telegram-first.
+
+## Troubleshooting
+
+- `/deepscan` says search provider failed:
+  - run again and inspect diagnostic line in Telegram response.
+- Emails not sending:
+  - run `/smtpcheck` and verify provider-specific env vars.
+- No useful findings:
+  - tune `prompts/historical_prompt.md` and `historical_queries` in `prompts.json`.
+- Bot responds but no scheduled pushes:
+  - ensure the chat used `/subscribe`.
