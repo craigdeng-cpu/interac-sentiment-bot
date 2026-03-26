@@ -10,6 +10,7 @@ import os
 import json
 import logging
 import smtplib
+import asyncio
 from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -778,9 +779,10 @@ async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("📧 Running fresh scan and sending email...")
     try:
-        mentions = await fetch_all_mentions()
+        # Hard timeout so manual email runs never hang indefinitely.
+        mentions = await asyncio.wait_for(fetch_all_mentions(), timeout=60)
         last_mentions_raw = mentions
-        report = await analyze_sentiment(mentions)
+        report = await asyncio.wait_for(analyze_sentiment(mentions), timeout=60)
         last_report = report
 
         score = extract_sentiment_score(report)
@@ -802,6 +804,8 @@ async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("✅ Email sent successfully.")
         else:
             await update.message.reply_text(f"❌ Email failed: {send_reason}")
+    except asyncio.TimeoutError:
+        await update.message.reply_text("⏱️ /email timed out after 60 seconds.")
     except Exception as e:
         logger.error(f"/email failed: {e}")
         await update.message.reply_text(f"❌ /email failed: {e}")
