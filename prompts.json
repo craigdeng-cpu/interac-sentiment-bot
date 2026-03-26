@@ -54,39 +54,39 @@
       "label": "RECENT (1 month)",
       "tbs": "qdr:m",
       "queries": [
-        "Interac e-Transfer complaint OR issue OR slow",
-        "Interac e-Transfer review OR feedback Canada",
-        "e-Transfer issue site:reddit.com",
-        "Interac site:forums.redflagdeals.com",
-        "Interac Debit issue Canada"
+        "Interac e-Transfer",
+        "Interac e-Transfer complaint OR issue OR outage",
+        "Interac Debit tap contactless",
+        "Interac e-Transfer reddit",
+        "Interac redflagdeals"
       ]
     },
     "medium_6mo": {
       "label": "MEDIUM (6 months)",
       "tbs": "qdr:y",
       "queries": [
-        "Interac e-Transfer feedback OR experience Canada",
-        "Interac debit problem site:reddit.com",
-        "Interac complaint site:forums.redflagdeals.com",
-        "Interac outage OR disruption Canada",
-        "Interac limit OR fraud complaint"
+        "Interac e-Transfer review OR experience",
+        "Interac e-Transfer problem OR fraud OR limit",
+        "Interac Debit Canada",
+        "Interac outage OR disruption",
+        "Interac open banking Canada"
       ]
     },
     "older_1yr": {
       "label": "OLDER (1 year+)",
-      "tbs": "qdr:y",
+      "tbs": "all",
       "queries": [
-        "Interac e-Transfer experience Canada",
-        "Interac competitor Canada Apple Pay Wise PayPal",
-        "e-Transfer vs PayPal vs Wise site:reddit.com",
-        "Interac debit acceptance issue Canada",
-        "Interac customer complaint Canada"
+        "Interac e-Transfer Canada",
+        "Interac vs Apple Pay vs PayPal Canada",
+        "Interac e-Transfer complaint",
+        "Interac debit acceptance Canada",
+        "Interac competitor fintech Canada"
       ]
     }
   },
 
   "alert_threshold": 35,
-  "historical_max_mentions_per_source": 6,
+  "historical_max_mentions_per_source": 10,
   "max_mentions_per_source": 3,
   "lookback_hours": 24,
   "timezone": "US/Eastern"

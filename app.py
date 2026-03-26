@@ -144,8 +144,15 @@ def lookback_hours_to_tbs(lookback_hours: int) -> str:
 
 
 def normalize_tbs(tbs: str) -> str:
+    """Normalize tbs value. Empty string means 'all time' (no time filter)."""
+    if tbs in ("", "all"):
+        return ""
     supported = {"qdr:d", "qdr:w", "qdr:m", "qdr:y"}
     return tbs if tbs in supported else "qdr:m"
+
+
+def _has_site_restriction(query: str) -> bool:
+    return "site:" in query.lower()
 
 
 async def serper_search(
@@ -162,12 +169,16 @@ async def serper_search(
         "news": "https://google.serper.dev/news",
     }.get(search_type, "https://google.serper.dev/search")
 
+    payload: dict = {"q": query, "num": max_results, "gl": "ca"}
+    if tbs:
+        payload["tbs"] = tbs
+
     async with httpx.AsyncClient(timeout=30) as client:
         try:
             response = await client.post(
                 endpoint,
                 headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-                json={"q": query, "num": max_results, "tbs": tbs, "gl": "ca"},
+                json=payload,
             )
             response.raise_for_status()
             data = response.json()
@@ -185,25 +196,31 @@ async def serper_search(
             "source": item.get("source", search_type),
             "date": item.get("date", ""),
         })
+    logger.info(f"Serper [{search_type}] '{query}' tbs={tbs!r} → {len(results)} results")
     return results
 
 
 async def search_twitter(query: str, max_results: int = 5, tbs: str = "qdr:w") -> list[dict]:
-    """Search X/Twitter via Serper."""
+    """Search X/Twitter via Serper. Skips if query already has a site: restriction."""
     if not SERPER_API_KEY:
         return []
+    if _has_site_restriction(query):
+        return []
+
+    payload: dict = {
+        "q": f"{query} site:x.com OR site:twitter.com",
+        "num": max_results,
+        "gl": "ca",
+    }
+    if tbs:
+        payload["tbs"] = tbs
 
     async with httpx.AsyncClient(timeout=30) as client:
         try:
             response = await client.post(
                 "https://google.serper.dev/search",
                 headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-                json={
-                    "q": f"{query} site:x.com OR site:twitter.com",
-                    "num": max_results,
-                    "tbs": tbs,
-                    "gl": "ca",
-                },
+                json=payload,
             )
             response.raise_for_status()
             data = response.json()
@@ -220,6 +237,7 @@ async def search_twitter(query: str, max_results: int = 5, tbs: str = "qdr:w") -
             "source": "X/Twitter",
             "date": item.get("date", ""),
         })
+    logger.info(f"Serper [twitter] '{query}' tbs={tbs!r} → {len(results)} results")
     return results
 
 
@@ -314,13 +332,14 @@ async def fetch_all_mentions() -> str:
 async def fetch_historical_mentions() -> str:
     config = load_prompts()
     historical_queries = config.get("historical_queries", {})
-    max_per = int(config.get("historical_max_mentions_per_source", config.get("max_mentions_per_source", 5)))
+    max_per = int(config.get("historical_max_mentions_per_source", 10))
 
     if not historical_queries:
         return "No historical query config found."
 
     lines = [f"=== INTERAC HISTORICAL SCAN — {now_est()} ==="]
     timeframe_counts: dict[str, int] = {}
+    debug_lines: list[str] = []
 
     for timeframe_key, block in historical_queries.items():
         label = block.get("label", timeframe_key)
@@ -329,13 +348,9 @@ async def fetch_historical_mentions() -> str:
         mentions = []
 
         for query in queries:
-            news_results = await serper_search(query, "news", max_per, tbs=tbs)
-            search_results = await serper_search(query, "search", max_per, tbs=tbs)
-            x_results = await search_twitter(query, max_per, tbs=tbs)
+            has_site = _has_site_restriction(query)
 
-            for r in news_results:
-                r["source"] = r.get("source", "News")
-                mentions.append(r)
+            search_results = await serper_search(query, "search", max_per, tbs=tbs)
             for r in search_results:
                 link = r.get("link", "")
                 if "reddit.com" in link:
@@ -343,7 +358,22 @@ async def fetch_historical_mentions() -> str:
                 elif "redflagdeals.com" in link:
                     r["source"] = "RedFlagDeals"
                 mentions.append(r)
-            mentions.extend(x_results)
+
+            if not has_site:
+                news_results = await serper_search(query, "news", max_per, tbs=tbs)
+                for r in news_results:
+                    r["source"] = r.get("source", "News")
+                    mentions.append(r)
+
+                x_results = await search_twitter(query, max_per, tbs=tbs)
+                mentions.extend(x_results)
+                debug_lines.append(
+                    f"  {query[:50]}... → search={len(search_results)} news={len(news_results)} x={len(x_results)}"
+                )
+            else:
+                debug_lines.append(
+                    f"  {query[:50]}... → search={len(search_results)} (site-restricted, skipped news/x)"
+                )
 
         seen = set()
         unique = []
@@ -355,19 +385,26 @@ async def fetch_historical_mentions() -> str:
             unique.append(m)
 
         timeframe_counts[label] = len(unique)
-        lines.append(f"\n=== {label} | tbs={tbs} | mentions={len(unique)} ===")
-        for i, m in enumerate(unique[:12], 1):
+        lines.append(f"\n=== {label} | tbs={tbs or 'ALL TIME'} | mentions={len(unique)} ===")
+        for i, m in enumerate(unique[:15], 1):
             date_str = f" ({m.get('date')})" if m.get("date") else ""
             lines.append(
                 f"[H{i}] {m.get('title', '')} | {m.get('source', 'unknown')}{date_str}\n"
-                f"  {m.get('snippet', '')[:150]}\n"
+                f"  {m.get('snippet', '')[:200]}\n"
                 f"  {m.get('link', '')}"
             )
 
     total_mentions = sum(timeframe_counts.values())
     lines.insert(1, f"TOTAL HISTORICAL MENTIONS: {total_mentions}")
+    idx = 2
     for label, count in timeframe_counts.items():
-        lines.insert(2, f"- {label}: {count}")
+        lines.insert(idx, f"- {label}: {count}")
+        idx += 1
+
+    logger.info(f"Historical scan totals: {timeframe_counts} = {total_mentions}")
+    for dl in debug_lines:
+        logger.info(dl)
+
     return "\n".join(lines)
 
 
@@ -1203,9 +1240,30 @@ async def cmd_deepscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Admin only.")
         return
 
-    await update.message.reply_text("🧠 Running historical deep scan...")
+    await update.message.reply_text("🧠 Running historical deep scan — fetching data...")
     try:
         historical_mentions = await asyncio.wait_for(fetch_historical_mentions(), timeout=120)
+
+        mention_count = 0
+        for line in historical_mentions.split("\n"):
+            if line.startswith("TOTAL HISTORICAL MENTIONS:"):
+                try:
+                    mention_count = int(line.split(":")[1].strip())
+                except ValueError:
+                    pass
+                break
+
+        await update.message.reply_text(
+            f"📊 Fetched {mention_count} raw mentions. Analyzing with Kimi..."
+        )
+
+        if mention_count == 0:
+            await update.message.reply_text(
+                "⚠️ Zero mentions found. Raw output:\n\n"
+                + historical_mentions[:1500]
+            )
+            return
+
         report = await asyncio.wait_for(analyze_historical(historical_mentions), timeout=120)
 
         telegram_message = f"📚 *Interac Historical Deep Scan* — {now_est()}\n\n{report}"
