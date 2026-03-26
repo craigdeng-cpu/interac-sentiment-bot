@@ -314,12 +314,13 @@ async def fetch_all_mentions() -> str:
 async def fetch_historical_mentions() -> str:
     config = load_prompts()
     historical_queries = config.get("historical_queries", {})
-    max_per = config.get("max_mentions_per_source", 5)
+    max_per = int(config.get("historical_max_mentions_per_source", config.get("max_mentions_per_source", 5)))
 
     if not historical_queries:
         return "No historical query config found."
 
     lines = [f"=== INTERAC HISTORICAL SCAN — {now_est()} ==="]
+    timeframe_counts: dict[str, int] = {}
 
     for timeframe_key, block in historical_queries.items():
         label = block.get("label", timeframe_key)
@@ -353,6 +354,7 @@ async def fetch_historical_mentions() -> str:
             seen.add(link)
             unique.append(m)
 
+        timeframe_counts[label] = len(unique)
         lines.append(f"\n=== {label} | tbs={tbs} | mentions={len(unique)} ===")
         for i, m in enumerate(unique[:12], 1):
             date_str = f" ({m.get('date')})" if m.get("date") else ""
@@ -362,6 +364,10 @@ async def fetch_historical_mentions() -> str:
                 f"  {m.get('link', '')}"
             )
 
+    total_mentions = sum(timeframe_counts.values())
+    lines.insert(1, f"TOTAL HISTORICAL MENTIONS: {total_mentions}")
+    for label, count in timeframe_counts.items():
+        lines.insert(2, f"- {label}: {count}")
     return "\n".join(lines)
 
 
