@@ -155,6 +155,9 @@ def _has_site_restriction(query: str) -> bool:
     return "site:" in query.lower()
 
 
+_serper_errors: list[str] = []
+
+
 async def serper_search(
     query: str,
     search_type: str = "search",
@@ -162,6 +165,7 @@ async def serper_search(
     tbs: str = "qdr:w",
 ) -> list[dict]:
     if not SERPER_API_KEY:
+        _serper_errors.append("SERPER_API_KEY is empty/unset")
         return []
 
     endpoint = {
@@ -180,10 +184,17 @@ async def serper_search(
                 headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
                 json=payload,
             )
-            response.raise_for_status()
+            if response.status_code != 200:
+                body_preview = response.text[:200]
+                err = f"Serper HTTP {response.status_code} for [{search_type}] '{query[:40]}': {body_preview}"
+                logger.error(err)
+                _serper_errors.append(err)
+                return []
             data = response.json()
         except Exception as e:
-            logger.error(f"Serper error for '{query}': {e}")
+            err = f"Serper exception for [{search_type}] '{query[:40]}': {type(e).__name__}: {e}"
+            logger.error(err)
+            _serper_errors.append(err)
             return []
 
     key = "news" if search_type == "news" else "organic"
@@ -222,10 +233,17 @@ async def search_twitter(query: str, max_results: int = 5, tbs: str = "qdr:w") -
                 headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
                 json=payload,
             )
-            response.raise_for_status()
+            if response.status_code != 200:
+                body_preview = response.text[:200]
+                err = f"Serper HTTP {response.status_code} for [twitter] '{query[:40]}': {body_preview}"
+                logger.error(err)
+                _serper_errors.append(err)
+                return []
             data = response.json()
         except Exception as e:
-            logger.error(f"Serper X search error for '{query}': {e}")
+            err = f"Serper exception for [twitter] '{query[:40]}': {type(e).__name__}: {e}"
+            logger.error(err)
+            _serper_errors.append(err)
             return []
 
     results = []
@@ -239,6 +257,31 @@ async def search_twitter(query: str, max_results: int = 5, tbs: str = "qdr:w") -
         })
     logger.info(f"Serper [twitter] '{query}' tbs={tbs!r} → {len(results)} results")
     return results
+
+
+async def _serper_diagnostic() -> str:
+    """Single test query to diagnose Serper API health."""
+    if not SERPER_API_KEY:
+        return "FAIL: SERPER_API_KEY is empty/not set"
+
+    payload = {"q": "Interac e-Transfer", "num": 3}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                "https://google.serper.dev/search",
+                headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+                json=payload,
+            )
+        status = resp.status_code
+        body = resp.text[:500]
+        if status == 200:
+            data = resp.json()
+            n = len(data.get("organic", []))
+            first_title = data.get("organic", [{}])[0].get("title", "?") if n else "none"
+            return f"OK: HTTP {status}, {n} organic results, first='{first_title}'"
+        return f"FAIL: HTTP {status} — {body}"
+    except Exception as e:
+        return f"FAIL: {type(e).__name__}: {e}"
 
 
 async def fetch_all_mentions() -> str:
@@ -1240,9 +1283,18 @@ async def cmd_deepscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Admin only.")
         return
 
+    # Run a diagnostic probe first
+    diag = await _serper_diagnostic()
+    await update.message.reply_text(f"🔬 Serper diagnostic: {diag}")
+
+    if diag.startswith("FAIL"):
+        await update.message.reply_text("❌ Serper API is not working. Fix the issue above before scanning.")
+        return
+
     await update.message.reply_text("🧠 Running historical deep scan — fetching data...")
+    _serper_errors.clear()
     try:
-        historical_mentions = await asyncio.wait_for(fetch_historical_mentions(), timeout=120)
+        historical_mentions = await asyncio.wait_for(fetch_historical_mentions(), timeout=180)
 
         mention_count = 0
         for line in historical_mentions.split("\n"):
@@ -1256,6 +1308,11 @@ async def cmd_deepscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"📊 Fetched {mention_count} raw mentions. Analyzing with Kimi..."
         )
+
+        if _serper_errors:
+            unique_errors = list(dict.fromkeys(_serper_errors[:5]))
+            err_text = "\n".join(f"• {e[:120]}" for e in unique_errors)
+            await update.message.reply_text(f"⚠️ Serper errors encountered:\n{err_text}")
 
         if mention_count == 0:
             await update.message.reply_text(
@@ -1278,7 +1335,7 @@ async def cmd_deepscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(f"❌ Deep scan email failed: {send_reason}")
     except asyncio.TimeoutError:
-        await update.message.reply_text("⏱️ /deepscan timed out after 120 seconds.")
+        await update.message.reply_text("⏱️ /deepscan timed out after 180 seconds.")
     except Exception as e:
         logger.error(f"/deepscan failed: {e}")
         await update.message.reply_text(f"❌ /deepscan failed: {e}")
