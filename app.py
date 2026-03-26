@@ -20,6 +20,7 @@ from pathlib import Path
 from collections import defaultdict
 
 import httpx
+from ddgs import DDGS
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -39,7 +40,6 @@ KIMI_API_URL = os.environ.get("KIMI_API_URL", "https://api.moonshot.ai/v1/chat/c
 KIMI_MODEL = os.environ.get("KIMI_MODEL", "kimi-k2.5-preview")
 PORT = int(os.environ.get("PORT", 3978))
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
-SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x}
 DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "5"))
 
@@ -135,7 +135,7 @@ def load_prompts() -> dict:
 
 # ─── Web Scraping ─────────────────────────────────────────────────────────────
 def lookback_hours_to_tbs(lookback_hours: int) -> str:
-    # Serper/Google time filters: qdr:d (day), qdr:w (week), qdr:m (month).
+    # Google-style time filters used by query config.
     if lookback_hours <= 24:
         return "qdr:d"
     if lookback_hours <= 24 * 7:
@@ -155,133 +155,75 @@ def _has_site_restriction(query: str) -> bool:
     return "site:" in query.lower()
 
 
-_serper_errors: list[str] = []
+_search_errors: list[str] = []
 
 
-async def serper_search(
+def _tbs_to_timelimit(tbs: str) -> str | None:
+    mapping = {"qdr:d": "d", "qdr:w": "w", "qdr:m": "m", "qdr:y": "y"}
+    return mapping.get(tbs) if tbs else None
+
+
+async def web_search(
     query: str,
     search_type: str = "search",
     max_results: int = 5,
     tbs: str = "qdr:w",
 ) -> list[dict]:
-    if not SERPER_API_KEY:
-        _serper_errors.append("SERPER_API_KEY is empty/unset")
+    timelimit = _tbs_to_timelimit(tbs)
+
+    def _run_search() -> list[dict]:
+        with DDGS() as ddgs:
+            if search_type == "news":
+                raw = list(ddgs.news(query, max_results=max_results, timelimit=timelimit))
+            else:
+                raw = list(ddgs.text(query, max_results=max_results, timelimit=timelimit))
+        normalized = []
+        for item in raw:
+            normalized.append({
+                "title": item.get("title", ""),
+                "snippet": item.get("body", "") or item.get("snippet", ""),
+                "link": item.get("href", "") or item.get("url", ""),
+                "source": item.get("source", search_type),
+                "date": item.get("date", ""),
+            })
+        return normalized
+
+    try:
+        results = await asyncio.to_thread(_run_search)
+    except Exception as e:
+        err = f"DDG exception for [{search_type}] '{query[:40]}': {type(e).__name__}: {e}"
+        logger.error(err)
+        _search_errors.append(err)
         return []
 
-    endpoint = {
-        "search": "https://google.serper.dev/search",
-        "news": "https://google.serper.dev/news",
-    }.get(search_type, "https://google.serper.dev/search")
-
-    payload: dict = {"q": query, "num": max_results, "gl": "ca"}
-    if tbs:
-        payload["tbs"] = tbs
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        try:
-            response = await client.post(
-                endpoint,
-                headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-                json=payload,
-            )
-            if response.status_code != 200:
-                body_preview = response.text[:200]
-                err = f"Serper HTTP {response.status_code} for [{search_type}] '{query[:40]}': {body_preview}"
-                logger.error(err)
-                _serper_errors.append(err)
-                return []
-            data = response.json()
-        except Exception as e:
-            err = f"Serper exception for [{search_type}] '{query[:40]}': {type(e).__name__}: {e}"
-            logger.error(err)
-            _serper_errors.append(err)
-            return []
-
-    key = "news" if search_type == "news" else "organic"
-    results = []
-    for item in data.get(key, []):
-        results.append({
-            "title": item.get("title", ""),
-            "snippet": item.get("snippet", ""),
-            "link": item.get("link", ""),
-            "source": item.get("source", search_type),
-            "date": item.get("date", ""),
-        })
-    logger.info(f"Serper [{search_type}] '{query}' tbs={tbs!r} → {len(results)} results")
+    logger.info(f"DDG [{search_type}] '{query}' tbs={tbs!r} -> {len(results)} results")
     return results
 
 
 async def search_twitter(query: str, max_results: int = 5, tbs: str = "qdr:w") -> list[dict]:
-    """Search X/Twitter via Serper. Skips if query already has a site: restriction."""
-    if not SERPER_API_KEY:
-        return []
+    """Search X/Twitter via DDG. Skips if query already has a site: restriction."""
     if _has_site_restriction(query):
         return []
-
-    payload: dict = {
-        "q": f"{query} site:x.com OR site:twitter.com",
-        "num": max_results,
-        "gl": "ca",
-    }
-    if tbs:
-        payload["tbs"] = tbs
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        try:
-            response = await client.post(
-                "https://google.serper.dev/search",
-                headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-                json=payload,
-            )
-            if response.status_code != 200:
-                body_preview = response.text[:200]
-                err = f"Serper HTTP {response.status_code} for [twitter] '{query[:40]}': {body_preview}"
-                logger.error(err)
-                _serper_errors.append(err)
-                return []
-            data = response.json()
-        except Exception as e:
-            err = f"Serper exception for [twitter] '{query[:40]}': {type(e).__name__}: {e}"
-            logger.error(err)
-            _serper_errors.append(err)
-            return []
-
-    results = []
-    for item in data.get("organic", []):
-        results.append({
-            "title": item.get("title", ""),
-            "snippet": item.get("snippet", ""),
-            "link": item.get("link", ""),
-            "source": "X/Twitter",
-            "date": item.get("date", ""),
-        })
-    logger.info(f"Serper [twitter] '{query}' tbs={tbs!r} → {len(results)} results")
-    return results
+    base_results = await web_search(
+        f"{query} site:x.com OR site:twitter.com",
+        "search",
+        max_results=max_results,
+        tbs=tbs,
+    )
+    for r in base_results:
+        r["source"] = "X/Twitter"
+    return base_results
 
 
-async def _serper_diagnostic() -> str:
-    """Single test query to diagnose Serper API health."""
-    if not SERPER_API_KEY:
-        return "FAIL: SERPER_API_KEY is empty/not set"
-
-    payload = {"q": "Interac e-Transfer", "num": 3}
+async def _search_diagnostic() -> str:
+    """Single test query to diagnose DDG search health."""
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                "https://google.serper.dev/search",
-                headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-                json=payload,
-            )
-        status = resp.status_code
-        body = resp.text[:500]
-        if status == 200:
-            data = resp.json()
-            n = len(data.get("organic", []))
-            first_title = data.get("organic", [{}])[0].get("title", "?") if n else "none"
-            return f"OK: HTTP {status}, {n} organic results, first='{first_title}'"
-        return f"FAIL: HTTP {status} — {body}"
+        results = await web_search("Interac e-Transfer", "search", max_results=3, tbs="")
     except Exception as e:
         return f"FAIL: {type(e).__name__}: {e}"
+    if not results:
+        return "FAIL: no search results returned"
+    return f"OK: {len(results)} results, first='{results[0].get('title', 'n/a')[:80]}'"
 
 
 async def fetch_all_mentions() -> str:
@@ -305,7 +247,7 @@ async def fetch_all_mentions() -> str:
 
         # News (press)
         if sources.get("news", True) and not is_people_category:
-            results = await serper_search(query, "news", max_per, tbs=tbs)
+            results = await web_search(query, "news", max_per, tbs=tbs)
             for r in results:
                 r["category"] = category
                 r["channel"] = "press"
@@ -313,7 +255,7 @@ async def fetch_all_mentions() -> str:
 
         # Reddit / forums (people)
         if sources.get("reddit", True) or sources.get("forums", True):
-            results = await serper_search(query, "search", max_per, tbs=tbs)
+            results = await web_search(query, "search", max_per, tbs=tbs)
             for r in results:
                 r["category"] = category
                 # Classify by domain
@@ -393,7 +335,7 @@ async def fetch_historical_mentions() -> str:
         for query in queries:
             has_site = _has_site_restriction(query)
 
-            search_results = await serper_search(query, "search", max_per, tbs=tbs)
+            search_results = await web_search(query, "search", max_per, tbs=tbs)
             for r in search_results:
                 link = r.get("link", "")
                 if "reddit.com" in link:
@@ -403,7 +345,7 @@ async def fetch_historical_mentions() -> str:
                 mentions.append(r)
 
             if not has_site:
-                news_results = await serper_search(query, "news", max_per, tbs=tbs)
+                news_results = await web_search(query, "news", max_per, tbs=tbs)
                 for r in news_results:
                     r["source"] = r.get("source", "News")
                     mentions.append(r)
@@ -1173,13 +1115,12 @@ async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    has_serper = "✅" if SERPER_API_KEY else "❌"
     config = load_prompts()
     q_count = sum(len(v) for v in config["data_queries"].values())
     is_admin = "✅" if update.effective_user.id in ADMIN_IDS else "❌"
     await update.message.reply_text(
         f"✅ Bot running — {now_est()}\n"
-        f"Serper API: {has_serper}\n"
+        f"Search provider: DuckDuckGo (ddgs)\n"
         f"Active queries: {q_count}\n"
         f"Last sentiment score: {last_sentiment_score}/100\n"
         f"Reports at 6am, 10am, 2pm, 6pm EST\n"
@@ -1284,15 +1225,15 @@ async def cmd_deepscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Run a diagnostic probe first
-    diag = await _serper_diagnostic()
-    await update.message.reply_text(f"🔬 Serper diagnostic: {diag}")
+    diag = await _search_diagnostic()
+    await update.message.reply_text(f"🔬 Search diagnostic: {diag}")
 
     if diag.startswith("FAIL"):
-        await update.message.reply_text("❌ Serper API is not working. Fix the issue above before scanning.")
+        await update.message.reply_text("❌ Search provider is not working. Fix the issue above before scanning.")
         return
 
     await update.message.reply_text("🧠 Running historical deep scan — fetching data...")
-    _serper_errors.clear()
+    _search_errors.clear()
     try:
         historical_mentions = await asyncio.wait_for(fetch_historical_mentions(), timeout=180)
 
@@ -1309,10 +1250,10 @@ async def cmd_deepscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 Fetched {mention_count} raw mentions. Analyzing with Kimi..."
         )
 
-        if _serper_errors:
-            unique_errors = list(dict.fromkeys(_serper_errors[:5]))
+        if _search_errors:
+            unique_errors = list(dict.fromkeys(_search_errors[:5]))
             err_text = "\n".join(f"• {e[:120]}" for e in unique_errors)
-            await update.message.reply_text(f"⚠️ Serper errors encountered:\n{err_text}")
+            await update.message.reply_text(f"⚠️ Search errors encountered:\n{err_text}")
 
         if mention_count == 0:
             await update.message.reply_text(
