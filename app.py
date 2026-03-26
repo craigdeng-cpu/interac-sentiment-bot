@@ -97,9 +97,26 @@ def check_rate_limit(user_id: int) -> tuple[bool, int]:
 
 # ─── Prompt Config ────────────────────────────────────────────────────────────
 def load_prompts() -> dict:
-    path = Path(__file__).parent / "prompts.json"
-    with open(path) as f:
-        return json.load(f)
+    base_dir = Path(__file__).parent
+    config_path = base_dir / "prompts.json"
+    with open(config_path) as f:
+        config = json.load(f)
+
+    prompt_files = config.get("prompt_files", {})
+    analysis_path = base_dir / prompt_files.get("analysis_prompt", "prompts/analysis_prompt.md")
+    followup_path = base_dir / prompt_files.get("followup_prompt", "prompts/followup_prompt.md")
+
+    if analysis_path.exists():
+        config["analysis_prompt"] = analysis_path.read_text().strip()
+    elif "analysis_prompt" not in config:
+        raise FileNotFoundError(f"Missing analysis prompt file: {analysis_path}")
+
+    if followup_path.exists():
+        config["followup_prompt"] = followup_path.read_text().strip()
+    elif "followup_prompt" not in config:
+        raise FileNotFoundError(f"Missing followup prompt file: {followup_path}")
+
+    return config
 
 
 # ─── Web Scraping ─────────────────────────────────────────────────────────────
@@ -766,7 +783,7 @@ async def cmd_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"*Query categories:*\n{summary}\n\n"
         f"*Active sources:* {active}\n"
         f"*Alert threshold:* <{config.get('alert_threshold', 35)}/100\n\n"
-        f"Edit `prompts.json` to change.",
+        f"Edit `prompts.json` for config and `prompts/*.md` for prompts.",
         parse_mode="Markdown",
     )
 
