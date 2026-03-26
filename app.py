@@ -18,6 +18,7 @@ from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from collections import defaultdict
+from urllib.parse import urlparse
 
 import httpx
 from ddgs import DDGS
@@ -701,6 +702,76 @@ def _extract_section(report: str, start_marker: str, end_markers: list[str]) -> 
     return report[start_idx:end_idx].strip()
 
 
+def _short_link_label(label: str, url: str) -> str:
+    label = (label or "").strip()
+    generic = {"source", "source url", "url", "link", "sourceurl"}
+    if not label or label.lower().replace(" ", "") in generic:
+        host = urlparse(url).netloc.replace("www.", "")
+        label = host or "source"
+    return label[:28] + "..." if len(label) > 31 else label
+
+
+def _compact_email_line(raw_line: str) -> str:
+    line = raw_line.strip()
+    if not line:
+        return ""
+
+    line = re.sub(r"^\d+\.\s*", "", line)
+    line = line.lstrip("- ").strip()
+    line = line.replace("**", "").replace("`", "")
+
+    links: list[str] = []
+
+    def _store_link(label: str, url: str) -> str:
+        safe_url = html.escape(url, quote=True)
+        safe_label = html.escape(_short_link_label(label, url))
+        links.append(
+            f"<a href=\"{safe_url}\" style=\"font-size:12px;color:#175CD3;text-decoration:none;\">{safe_label}</a>"
+        )
+        return ""
+
+    # Convert markdown links and remove them from body text.
+    line = re.sub(
+        r"\[([^\]]+)\]\((https?://[^\s)]+)\)",
+        lambda m: _store_link(m.group(1), m.group(2)),
+        line,
+    )
+    # Convert bare URLs into short domain links and remove from body text.
+    line = re.sub(
+        r"https?://[^\s)]+",
+        lambda m: _store_link("", m.group(0)),
+        line,
+    )
+
+    # If historical fields exist, collapse into a concise sentence.
+    date_match = re.search(r"\bDate\s*:\s*([0-9]{4}-[0-9]{2}-[0-9]{2})", line, flags=re.IGNORECASE)
+    product_match = re.search(r"\bProduct\s*:\s*([^:]+?)(?=\s+[A-Za-z ]+:\s|$)", line, flags=re.IGNORECASE)
+    sentiment_match = re.search(r"\bSentiment Summary\s*:\s*(.+)$", line, flags=re.IGNORECASE)
+    if sentiment_match:
+        main_text = sentiment_match.group(1).strip()
+        meta = []
+        if product_match:
+            meta.append(product_match.group(1).strip())
+        if date_match:
+            meta.append(date_match.group(1).strip())
+        if meta:
+            main_text = f"{main_text} ({', '.join(meta)})"
+    else:
+        line = re.sub(r"\b(Source URL|Date|Product|Sentiment Summary)\s*:\s*", "", line, flags=re.IGNORECASE)
+        main_text = " ".join(line.split())
+
+    main_text = " ".join(main_text.split())
+    if len(main_text) > 190:
+        main_text = main_text[:187].rstrip() + "..."
+
+    links_html = ""
+    if links:
+        links_html = " <span style=\"white-space:nowrap;\">" + " · ".join(links[:2]) + "</span>"
+    if not main_text:
+        return links_html
+    return f"{html.escape(main_text)}{links_html}"
+
+
 def _score_status(score: int) -> str:
     if score < 35:
         return "ALERT"
@@ -775,15 +846,20 @@ def _build_historical_html(subject: str, body: str) -> str:
 
     def as_html_block(raw: str) -> str:
         if not raw:
-            return "<div style='color:#667085;'>No notable findings in this timeframe.</div>"
+            return "<div style='color:#667085;font-size:13px;'>No notable findings in this timeframe.</div>"
         lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-        items = []
-        for ln in lines[:8]:
-            if ln.startswith("-"):
-                items.append(f"<li>{html.escape(ln[1:].strip())}</li>")
-            else:
-                items.append(f"<li>{html.escape(ln)}</li>")
-        return f"<ul style='margin:8px 0 0 20px;padding:0;color:#101828;'>{''.join(items)}</ul>"
+        cards = []
+        for ln in lines[:4]:
+            compact = _compact_email_line(ln)
+            if compact:
+                cards.append(
+                    "<div style='border:1px solid #eaecf0;border-radius:8px;padding:10px 12px;"
+                    "margin-top:8px;font-size:13px;line-height:1.45;color:#101828;'>"
+                    f"{compact}</div>"
+                )
+        if not cards:
+            return "<div style='color:#667085;font-size:13px;'>No notable findings in this timeframe.</div>"
+        return "".join(cards)
 
     return f"""
 <html>
@@ -807,10 +883,10 @@ def _build_historical_html(subject: str, body: str) -> str:
             </td>
           </tr>
           <tr><td style="padding:0 24px 20px 24px;"><hr style="border:none;border-top:1px solid #eaecf0;"></td></tr>
-          <tr><td style="padding:0 24px 18px 24px;"><div style="font-size:15px;font-weight:700;">Recent (1 month)</div>{as_html_block(recent)}</td></tr>
-          <tr><td style="padding:0 24px 18px 24px;"><div style="font-size:15px;font-weight:700;">Medium (6 months)</div>{as_html_block(medium)}</td></tr>
-          <tr><td style="padding:0 24px 18px 24px;"><div style="font-size:15px;font-weight:700;">Older (1 year+)</div>{as_html_block(older)}</td></tr>
-          <tr><td style="padding:0 24px 18px 24px;"><div style="font-size:15px;font-weight:700;">Recurring Themes</div>{as_html_block(themes)}</td></tr>
+          <tr><td style="padding:0 24px 16px 24px;"><div style="font-size:15px;font-weight:700;">Recent (1 month)</div>{as_html_block(recent)}</td></tr>
+          <tr><td style="padding:0 24px 16px 24px;"><div style="font-size:15px;font-weight:700;">Medium (6 months)</div>{as_html_block(medium)}</td></tr>
+          <tr><td style="padding:0 24px 16px 24px;"><div style="font-size:15px;font-weight:700;">Older (1 year+)</div>{as_html_block(older)}</td></tr>
+          <tr><td style="padding:0 24px 16px 24px;"><div style="font-size:15px;font-weight:700;">Recurring Themes</div>{as_html_block(themes)}</td></tr>
           <tr><td style="padding:0 24px 24px 24px;"><div style="font-size:15px;font-weight:700;">Actionable Insight</div>{as_html_block(insight)}</td></tr>
         </table>
       </td></tr>
@@ -865,10 +941,9 @@ def build_email_bodies(subject: str, body: str, report_mode: str = "auto") -> tu
         lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
         bullets = []
         for ln in lines[:5]:
-            if ln.startswith("-"):
-                bullets.append(f"<li>{html.escape(ln[1:].strip())}</li>")
-            else:
-                bullets.append(f"<li>{html.escape(ln)}</li>")
+            compact = _compact_email_line(ln)
+            if compact:
+                bullets.append(f"<li>{compact}</li>")
         return f"<ul style='margin:8px 0 0 20px;padding:0;color:#101828;'>{''.join(bullets)}</ul>"
 
     if not any(s.strip() for s in [people_section, press_section, health_section, comp_section]):
