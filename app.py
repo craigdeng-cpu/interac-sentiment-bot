@@ -538,14 +538,14 @@ def _validate_resend_config() -> tuple[bool, str]:
     return True, "ok"
 
 
-def _send_email_smtp(subject: str, body: str) -> tuple[bool, str]:
+def _send_email_smtp(subject: str, body: str, report_mode: str = "auto") -> tuple[bool, str]:
     valid, reason = _validate_smtp_config()
     if not valid:
         logger.warning(f"Email send skipped: {reason}")
         return False, reason
 
     try:
-        text_body, html_body = build_email_bodies(subject, body)
+        text_body, html_body = build_email_bodies(subject, body, report_mode=report_mode)
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = EMAIL_FROM
@@ -589,14 +589,14 @@ def _smtp_login_check() -> tuple[bool, str]:
         return False, str(e)
 
 
-def _send_email_resend(subject: str, body: str) -> tuple[bool, str]:
+def _send_email_resend(subject: str, body: str, report_mode: str = "auto") -> tuple[bool, str]:
     valid, reason = _validate_resend_config()
     if not valid:
         logger.warning(f"Email send skipped: {reason}")
         return False, reason
 
     try:
-        text_body, html_body = build_email_bodies(subject, body)
+        text_body, html_body = build_email_bodies(subject, body, report_mode=report_mode)
         response = httpx.post(
             RESEND_API_URL,
             headers={
@@ -647,10 +647,10 @@ def smtp_health_check() -> tuple[bool, str]:
     return False, f"SMTP health check failed: {send_reason}. {_smtp_config_summary()}"
 
 
-def send_email(subject: str, body: str) -> tuple[bool, str]:
+def send_email(subject: str, body: str, report_mode: str = "auto") -> tuple[bool, str]:
     if EMAIL_PROVIDER == "resend":
-        return _send_email_resend(subject, body)
-    return _send_email_smtp(subject, body)
+        return _send_email_resend(subject, body, report_mode=report_mode)
+    return _send_email_smtp(subject, body, report_mode=report_mode)
 
 
 def _extract_report_field(report: str, field_name: str) -> str:
@@ -693,7 +693,112 @@ def _status_color(status: str) -> str:
     return "#344054"
 
 
-def build_email_bodies(subject: str, body: str) -> tuple[str, str]:
+def _styled_raw_report_html(subject: str, body: str) -> str:
+    escaped = html.escape(body)
+    return f"""
+<html>
+  <body style="margin:0;padding:0;background:#f2f4f7;font-family:Arial,sans-serif;color:#101828;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 0;">
+      <tr><td align="center">
+        <table role="presentation" width="640" cellspacing="0" cellpadding="0" style="background:#ffffff;border-radius:10px;overflow:hidden;border:1px solid #eaecf0;">
+          <tr>
+            <td style="background:#111827;color:#ffffff;padding:18px 24px;">
+              <div style="font-size:22px;font-weight:700;">Interac Intelligence</div>
+              <div style="font-size:13px;color:#d0d5dd;margin-top:4px;">{html.escape(subject)}</div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:20px 24px;">
+              <div style="font-size:15px;font-weight:700;margin-bottom:10px;">Report</div>
+              <pre style="white-space:pre-wrap;background:#f8fafc;border:1px solid #eaecf0;border-radius:8px;padding:14px;font-size:13px;line-height:1.5;color:#101828;">{escaped}</pre>
+            </td>
+          </tr>
+        </table>
+      </td></tr>
+    </table>
+  </body>
+</html>
+""".strip()
+
+
+def _build_historical_html(subject: str, body: str) -> str:
+    trend = _extract_report_field(body, "OVERALL TREND")
+    recent = _extract_section(
+        body,
+        "--- RECENT (1 month) ---",
+        ["--- MEDIUM (6 months) ---", "--- OLDER (1 year+) ---", "RECURRING THEMES:", "ACTIONABLE INSIGHT:"],
+    )
+    medium = _extract_section(
+        body,
+        "--- MEDIUM (6 months) ---",
+        ["--- OLDER (1 year+) ---", "RECURRING THEMES:", "ACTIONABLE INSIGHT:"],
+    )
+    older = _extract_section(
+        body,
+        "--- OLDER (1 year+) ---",
+        ["RECURRING THEMES:", "ACTIONABLE INSIGHT:"],
+    )
+    themes = _extract_section(body, "RECURRING THEMES:", ["ACTIONABLE INSIGHT:"])
+    insight = _extract_section(body, "ACTIONABLE INSIGHT:", [])
+
+    sections = [recent, medium, older, themes, insight]
+    if not any(s.strip() for s in sections):
+        return _styled_raw_report_html(subject, body)
+
+    def as_html_block(raw: str) -> str:
+        if not raw:
+            return "<div style='color:#667085;'>No notable findings in this timeframe.</div>"
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        items = []
+        for ln in lines[:8]:
+            if ln.startswith("-"):
+                items.append(f"<li>{html.escape(ln[1:].strip())}</li>")
+            else:
+                items.append(f"<li>{html.escape(ln)}</li>")
+        return f"<ul style='margin:8px 0 0 20px;padding:0;color:#101828;'>{''.join(items)}</ul>"
+
+    return f"""
+<html>
+  <body style="margin:0;padding:0;background:#f2f4f7;font-family:Arial,sans-serif;color:#101828;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 0;">
+      <tr><td align="center">
+        <table role="presentation" width="640" cellspacing="0" cellpadding="0" style="background:#ffffff;border-radius:10px;overflow:hidden;border:1px solid #eaecf0;">
+          <tr>
+            <td style="background:#111827;color:#ffffff;padding:18px 24px;">
+              <div style="font-size:22px;font-weight:700;">Interac Intelligence</div>
+              <div style="font-size:13px;color:#d0d5dd;margin-top:4px;">{html.escape(subject)}</div>
+              <div style="font-size:12px;color:#98a2b3;margin-top:6px;">Historical deep scan</div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:20px 24px;">
+              <div style="border:1px solid #eaecf0;border-radius:8px;padding:12px;">
+                <div style="font-size:12px;color:#667085;">Overall Trend</div>
+                <div style="font-size:16px;font-weight:700;line-height:1.4;">{html.escape(trend)}</div>
+              </div>
+            </td>
+          </tr>
+          <tr><td style="padding:0 24px 20px 24px;"><hr style="border:none;border-top:1px solid #eaecf0;"></td></tr>
+          <tr><td style="padding:0 24px 18px 24px;"><div style="font-size:15px;font-weight:700;">Recent (1 month)</div>{as_html_block(recent)}</td></tr>
+          <tr><td style="padding:0 24px 18px 24px;"><div style="font-size:15px;font-weight:700;">Medium (6 months)</div>{as_html_block(medium)}</td></tr>
+          <tr><td style="padding:0 24px 18px 24px;"><div style="font-size:15px;font-weight:700;">Older (1 year+)</div>{as_html_block(older)}</td></tr>
+          <tr><td style="padding:0 24px 18px 24px;"><div style="font-size:15px;font-weight:700;">Recurring Themes</div>{as_html_block(themes)}</td></tr>
+          <tr><td style="padding:0 24px 24px 24px;"><div style="font-size:15px;font-weight:700;">Actionable Insight</div>{as_html_block(insight)}</td></tr>
+        </table>
+      </td></tr>
+    </table>
+  </body>
+</html>
+""".strip()
+
+
+def build_email_bodies(subject: str, body: str, report_mode: str = "auto") -> tuple[str, str]:
+    resolved_mode = report_mode
+    if resolved_mode == "auto":
+        resolved_mode = "historical" if "OVERALL TREND:" in body else "daily"
+    if resolved_mode == "historical":
+        return body, _build_historical_html(subject, body)
+
     score_text = _extract_report_field(body, "SENTIMENT SCORE")
     volume_text = _extract_report_field(body, "MENTION VOLUME")
     ts_text = _extract_report_field(body, "TIMESTAMP")
@@ -737,6 +842,9 @@ def build_email_bodies(subject: str, body: str) -> tuple[str, str]:
             else:
                 bullets.append(f"<li>{html.escape(ln)}</li>")
         return f"<ul style='margin:8px 0 0 20px;padding:0;color:#101828;'>{''.join(bullets)}</ul>"
+
+    if not any(s.strip() for s in [people_section, press_section, health_section, comp_section]):
+        return body, _styled_raw_report_html(subject, body)
 
     html_body = f"""
 <html>
@@ -895,7 +1003,7 @@ async def scheduled_sentiment_broadcast(context: ContextTypes.DEFAULT_TYPE):
             elif alert_kind == "high":
                 body_lines += [f"SPIKE: Sentiment rose to {score}/100 (high threshold {ALERT_HIGH_THRESHOLD})", ""]
             body_lines.append(report)
-            ok, send_reason = send_email(subject=subject, body="\n".join(body_lines))
+            ok, send_reason = send_email(subject=subject, body="\n".join(body_lines), report_mode="daily")
             if ok:
                 _record_email_sent("alert", alert_kind=alert_kind)
             else:
@@ -938,7 +1046,7 @@ async def scheduled_weekly_email_digest(context: ContextTypes.DEFAULT_TYPE):
 
         subject = f"{EMAIL_SUBJECT_PREFIX} — WEEKLY DIGEST ({score}/100)"
         body = f"Interac Intelligence Weekly Digest — {now_est()}\n\n{report}"
-        ok, send_reason = send_email(subject, body)
+        ok, send_reason = send_email(subject, body, report_mode="daily")
         if ok:
             _record_email_sent("weekly", now_local=now_local)
         else:
@@ -1071,7 +1179,7 @@ async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"High alert threshold: {ALERT_HIGH_THRESHOLD}\n\n"
             f"{report}"
         )
-        ok, send_reason = send_email(subject, body)
+        ok, send_reason = send_email(subject, body, report_mode="daily")
         if ok:
             _record_email_sent("on_demand")
             await update.message.reply_text("✅ Email sent successfully.")
@@ -1099,7 +1207,7 @@ async def cmd_deepscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         subject = f"{EMAIL_SUBJECT_PREFIX} — HISTORICAL DEEP SCAN"
         email_body = f"Interac Historical Deep Scan — {now_est()}\n\n{report}"
-        ok, send_reason = send_email(subject, email_body)
+        ok, send_reason = send_email(subject, email_body, report_mode="historical")
         if ok:
             _record_email_sent("on_demand")
             await update.message.reply_text("✅ Deep scan email sent successfully.")

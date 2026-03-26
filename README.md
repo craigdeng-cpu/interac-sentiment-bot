@@ -163,6 +163,7 @@ scheduler.add_job(scheduled_sentiment_broadcast, "cron", hour="6,10,14,18", minu
 ### Daily vs historical mode
 - Daily monitor (`/scan`, scheduled 4x/day): fast, forward-looking, lightweight.
 - Historical deep scan (`/deepscan`): heavier, grouped by RECENT (1mo), MEDIUM (6mo), OLDER (1yr+) and intended for pattern discovery.
+- Email rendering is mode-aware: daily reports use the daily template, while `/deepscan` uses a historical layout. If expected sections are missing, emails gracefully fall back to a styled raw report view.
 
 ### Plug in your data source
 Replace `fetch_data_for_analysis()` in `app.py` with your actual OpenClaw pipeline — Reddit scraping, RSS feeds, database queries, etc.
