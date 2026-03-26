@@ -46,7 +46,37 @@
   },
   "prompt_files": {
     "analysis_prompt": "prompts/analysis_prompt.md",
-    "followup_prompt": "prompts/followup_prompt.md"
+    "followup_prompt": "prompts/followup_prompt.md",
+    "historical_prompt": "prompts/historical_prompt.md"
+  },
+  "historical_queries": {
+    "recent_1mo": {
+      "label": "RECENT (1 month)",
+      "tbs": "qdr:m",
+      "queries": [
+        "Interac e-Transfer complaint",
+        "Interac e-Transfer review",
+        "e-Transfer issue site:reddit.com"
+      ]
+    },
+    "medium_6mo": {
+      "label": "MEDIUM (6 months)",
+      "tbs": "qdr:y",
+      "queries": [
+        "Interac e-Transfer feedback",
+        "Interac debit problem site:reddit.com",
+        "Interac complaint site:forums.redflagdeals.com"
+      ]
+    },
+    "older_1yr": {
+      "label": "OLDER (1 year+)",
+      "tbs": "qdr:y",
+      "queries": [
+        "Interac e-Transfer experience",
+        "Interac competitor Canada",
+        "e-Transfer vs PayPal vs Wise site:reddit.com"
+      ]
+    }
   },
 
   "alert_threshold": 35,

@@ -72,6 +72,7 @@ You can also email yourself in three ways:
 - Weekly digest (`EMAIL_SEND_MODE=weekly`)
 - Alert emails (`EMAIL_SEND_MODE=alert`) for low sentiment or high positive spikes
 - On-demand with Telegram `/email` (admin-only)
+- Historical deep scan email with Telegram `/deepscan` (admin-only)
 
 ### 1. Choose email provider and set Railway variables
 In Railway, go to your service → **Settings** → **Variables**, and add at least:
@@ -127,6 +128,7 @@ Current options:
 - **Low alert:** score below `alert_threshold` from `prompts.json`.
 - **High spike alert:** score above `ALERT_HIGH_THRESHOLD`.
 - **On-demand:** `/email` in Telegram (admin IDs only) runs a fresh scan and sends immediately.
+- **Historical deep scan:** `/deepscan` in Telegram (admin IDs only) runs multi-timeframe historical analysis and sends email.
 
 ---
 
@@ -147,6 +149,20 @@ In `app.py`, edit the cron expression:
 ```python
 scheduler.add_job(scheduled_sentiment_broadcast, "cron", hour="6,10,14,18", minute=0)
 ```
+
+### Prompt files and config locations
+- Prompt text now lives in markdown files:
+  - `prompts/analysis_prompt.md` (daily lightweight scan)
+  - `prompts/followup_prompt.md` (chat follow-ups)
+  - `prompts/historical_prompt.md` (historical deep scan)
+- Query/config values stay in `prompts.json`:
+  - `data_queries` for daily scan
+  - `historical_queries` for `/deepscan` timeframes
+  - thresholds/lookback/source toggles
+
+### Daily vs historical mode
+- Daily monitor (`/scan`, scheduled 4x/day): fast, forward-looking, lightweight.
+- Historical deep scan (`/deepscan`): heavier, grouped by RECENT (1mo), MEDIUM (6mo), OLDER (1yr+) and intended for pattern discovery.
 
 ### Plug in your data source
 Replace `fetch_data_for_analysis()` in `app.py` with your actual OpenClaw pipeline — Reddit scraping, RSS feeds, database queries, etc.

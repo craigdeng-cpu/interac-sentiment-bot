@@ -11,6 +11,9 @@ import json
 import logging
 import smtplib
 import asyncio
+import re
+import html
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -103,18 +106,29 @@ def load_prompts() -> dict:
         config = json.load(f)
 
     prompt_files = config.get("prompt_files", {})
-    analysis_path = base_dir / prompt_files.get("analysis_prompt", "prompts/analysis_prompt.md")
-    followup_path = base_dir / prompt_files.get("followup_prompt", "prompts/followup_prompt.md")
+    default_prompt_files = {
+        "analysis_prompt": "prompts/analysis_prompt.md",
+        "followup_prompt": "prompts/followup_prompt.md",
+    }
+    for prompt_key, default_path in default_prompt_files.items():
+        rel_path = prompt_files.get(prompt_key, default_path)
+        prompt_path = base_dir / rel_path
+        if prompt_path.exists():
+            config[prompt_key] = prompt_path.read_text().strip()
+        elif prompt_key not in config:
+            raise FileNotFoundError(f"Missing prompt file for {prompt_key}: {prompt_path}")
 
-    if analysis_path.exists():
-        config["analysis_prompt"] = analysis_path.read_text().strip()
-    elif "analysis_prompt" not in config:
-        raise FileNotFoundError(f"Missing analysis prompt file: {analysis_path}")
-
-    if followup_path.exists():
-        config["followup_prompt"] = followup_path.read_text().strip()
-    elif "followup_prompt" not in config:
-        raise FileNotFoundError(f"Missing followup prompt file: {followup_path}")
+    # Optional extra prompts (e.g. historical_prompt).
+    for prompt_key, rel_path in prompt_files.items():
+        if prompt_key in config:
+            continue
+        if not prompt_key.endswith("_prompt"):
+            continue
+        prompt_path = base_dir / rel_path
+        if prompt_path.exists():
+            config[prompt_key] = prompt_path.read_text().strip()
+        else:
+            raise FileNotFoundError(f"Missing prompt file for {prompt_key}: {prompt_path}")
 
     return config
 
@@ -127,6 +141,11 @@ def lookback_hours_to_tbs(lookback_hours: int) -> str:
     if lookback_hours <= 24 * 7:
         return "qdr:w"
     return "qdr:m"
+
+
+def normalize_tbs(tbs: str) -> str:
+    supported = {"qdr:d", "qdr:w", "qdr:m", "qdr:y"}
+    return tbs if tbs in supported else "qdr:m"
 
 
 async def serper_search(
@@ -292,6 +311,60 @@ async def fetch_all_mentions() -> str:
     return "\n".join(lines)
 
 
+async def fetch_historical_mentions() -> str:
+    config = load_prompts()
+    historical_queries = config.get("historical_queries", {})
+    max_per = config.get("max_mentions_per_source", 5)
+
+    if not historical_queries:
+        return "No historical query config found."
+
+    lines = [f"=== INTERAC HISTORICAL SCAN — {now_est()} ==="]
+
+    for timeframe_key, block in historical_queries.items():
+        label = block.get("label", timeframe_key)
+        tbs = normalize_tbs(block.get("tbs", "qdr:m"))
+        queries = block.get("queries", [])
+        mentions = []
+
+        for query in queries:
+            news_results = await serper_search(query, "news", max_per, tbs=tbs)
+            search_results = await serper_search(query, "search", max_per, tbs=tbs)
+            x_results = await search_twitter(query, max_per, tbs=tbs)
+
+            for r in news_results:
+                r["source"] = r.get("source", "News")
+                mentions.append(r)
+            for r in search_results:
+                link = r.get("link", "")
+                if "reddit.com" in link:
+                    r["source"] = "Reddit"
+                elif "redflagdeals.com" in link:
+                    r["source"] = "RedFlagDeals"
+                mentions.append(r)
+            mentions.extend(x_results)
+
+        seen = set()
+        unique = []
+        for m in mentions:
+            link = m.get("link", "")
+            if not link or link in seen:
+                continue
+            seen.add(link)
+            unique.append(m)
+
+        lines.append(f"\n=== {label} | tbs={tbs} | mentions={len(unique)} ===")
+        for i, m in enumerate(unique[:12], 1):
+            date_str = f" ({m.get('date')})" if m.get("date") else ""
+            lines.append(
+                f"[H{i}] {m.get('title', '')} | {m.get('source', 'unknown')}{date_str}\n"
+                f"  {m.get('snippet', '')[:150]}\n"
+                f"  {m.get('link', '')}"
+            )
+
+    return "\n".join(lines)
+
+
 # ─── Kimi K2.5 Analysis ──────────────────────────────────────────────────────
 async def call_kimi(system_prompt: str, user_content: str) -> str:
     # 8192 token limit total. System prompt ~500 tokens, output ~800 tokens.
@@ -327,6 +400,12 @@ async def call_kimi(system_prompt: str, user_content: str) -> str:
 async def analyze_sentiment(mentions_text: str) -> str:
     config = load_prompts()
     prompt = config["analysis_prompt"].replace("{timestamp}", now_est())
+    return await call_kimi(prompt, mentions_text)
+
+
+async def analyze_historical(mentions_text: str) -> str:
+    config = load_prompts()
+    prompt = config["historical_prompt"].replace("{timestamp}", now_est())
     return await call_kimi(prompt, mentions_text)
 
 
@@ -466,10 +545,13 @@ def _send_email_smtp(subject: str, body: str) -> tuple[bool, str]:
         return False, reason
 
     try:
-        msg = MIMEText(body, _charset="utf-8")
+        text_body, html_body = build_email_bodies(subject, body)
+        msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = EMAIL_FROM
         msg["To"] = ", ".join(EMAIL_TO)
+        msg.attach(MIMEText(text_body, "plain", _charset="utf-8"))
+        msg.attach(MIMEText(html_body, "html", _charset="utf-8"))
 
         if SMTP_PORT == 465:
             server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30)
@@ -514,6 +596,7 @@ def _send_email_resend(subject: str, body: str) -> tuple[bool, str]:
         return False, reason
 
     try:
+        text_body, html_body = build_email_bodies(subject, body)
         response = httpx.post(
             RESEND_API_URL,
             headers={
@@ -524,7 +607,8 @@ def _send_email_resend(subject: str, body: str) -> tuple[bool, str]:
                 "from": EMAIL_FROM,
                 "to": EMAIL_TO,
                 "subject": subject,
-                "text": body,
+                "text": text_body,
+                "html": html_body,
             },
             timeout=30,
         )
@@ -567,6 +651,177 @@ def send_email(subject: str, body: str) -> tuple[bool, str]:
     if EMAIL_PROVIDER == "resend":
         return _send_email_resend(subject, body)
     return _send_email_smtp(subject, body)
+
+
+def _extract_report_field(report: str, field_name: str) -> str:
+    pattern = rf"^{re.escape(field_name)}\s*:\s*(.+)$"
+    m = re.search(pattern, report, flags=re.IGNORECASE | re.MULTILINE)
+    return m.group(1).strip() if m else "N/A"
+
+
+def _extract_section(report: str, start_marker: str, end_markers: list[str]) -> str:
+    start_idx = report.find(start_marker)
+    if start_idx == -1:
+        return ""
+    start_idx += len(start_marker)
+
+    end_idx = len(report)
+    for marker in end_markers:
+        idx = report.find(marker, start_idx)
+        if idx != -1:
+            end_idx = min(end_idx, idx)
+    return report[start_idx:end_idx].strip()
+
+
+def _score_status(score: int) -> str:
+    if score < 35:
+        return "ALERT"
+    if score > 70:
+        return "POSITIVE"
+    if score < 50:
+        return "WATCH"
+    return "STABLE"
+
+
+def _status_color(status: str) -> str:
+    if status == "ALERT":
+        return "#B42318"
+    if status == "POSITIVE":
+        return "#027A48"
+    if status == "WATCH":
+        return "#B54708"
+    return "#344054"
+
+
+def build_email_bodies(subject: str, body: str) -> tuple[str, str]:
+    score_text = _extract_report_field(body, "SENTIMENT SCORE")
+    volume_text = _extract_report_field(body, "MENTION VOLUME")
+    ts_text = _extract_report_field(body, "TIMESTAMP")
+
+    score_num = 50
+    m = re.search(r"\b(\d{1,3})\b", score_text)
+    if m:
+        try:
+            score_num = int(m.group(1))
+        except ValueError:
+            pass
+
+    status = _score_status(score_num)
+    color = _status_color(status)
+
+    people_section = _extract_section(
+        body,
+        "--- WHAT PEOPLE ARE SAYING",
+        ["--- PRESS & INDUSTRY ---", "PRODUCT HEALTH:", "COMPETITIVE WATCH:"],
+    )
+    press_section = _extract_section(
+        body,
+        "--- PRESS & INDUSTRY ---",
+        ["PRODUCT HEALTH:", "COMPETITIVE WATCH:"],
+    )
+    health_section = _extract_section(
+        body,
+        "PRODUCT HEALTH:",
+        ["COMPETITIVE WATCH:"],
+    )
+    comp_section = _extract_section(body, "COMPETITIVE WATCH:", [])
+
+    def as_html_block(raw: str) -> str:
+        if not raw:
+            return "<div style='color:#667085;'>No material updates in this section.</div>"
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        bullets = []
+        for ln in lines[:5]:
+            if ln.startswith("-"):
+                bullets.append(f"<li>{html.escape(ln[1:].strip())}</li>")
+            else:
+                bullets.append(f"<li>{html.escape(ln)}</li>")
+        return f"<ul style='margin:8px 0 0 20px;padding:0;color:#101828;'>{''.join(bullets)}</ul>"
+
+    html_body = f"""
+<html>
+  <body style="margin:0;padding:0;background:#f2f4f7;font-family:Arial,sans-serif;color:#101828;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 0;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="640" cellspacing="0" cellpadding="0" style="background:#ffffff;border-radius:10px;overflow:hidden;border:1px solid #eaecf0;">
+            <tr>
+              <td style="background:#111827;color:#ffffff;padding:18px 24px;">
+                <div style="font-size:22px;font-weight:700;">Interac Intelligence</div>
+                <div style="font-size:13px;color:#d0d5dd;margin-top:4px;">{html.escape(subject)}</div>
+                <div style="font-size:12px;color:#98a2b3;margin-top:6px;">{html.escape(ts_text)}</div>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:20px 24px;">
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+                  <tr>
+                    <td style="width:33%;padding-right:8px;">
+                      <div style="border:1px solid #eaecf0;border-radius:8px;padding:12px;">
+                        <div style="font-size:12px;color:#667085;">Sentiment Score</div>
+                        <div style="font-size:28px;font-weight:700;line-height:1.2;">{score_num}</div>
+                      </div>
+                    </td>
+                    <td style="width:33%;padding:0 8px;">
+                      <div style="border:1px solid #eaecf0;border-radius:8px;padding:12px;">
+                        <div style="font-size:12px;color:#667085;">Mention Volume</div>
+                        <div style="font-size:18px;font-weight:600;line-height:1.3;">{html.escape(volume_text)}</div>
+                      </div>
+                    </td>
+                    <td style="width:33%;padding-left:8px;">
+                      <div style="border:1px solid #eaecf0;border-radius:8px;padding:12px;">
+                        <div style="font-size:12px;color:#667085;">Status</div>
+                        <div style="display:inline-block;margin-top:6px;background:{color};color:#fff;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700;">{status}</div>
+                      </div>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:0 24px 20px 24px;">
+                <div style="font-size:16px;font-weight:700;margin-bottom:8px;">Executive Summary</div>
+                <ul style="margin:0 0 0 20px;padding:0;color:#101828;">
+                  <li>Current sentiment status is <b>{status}</b> with score <b>{score_num}</b>.</li>
+                  <li>Mention volume appears <b>{html.escape(volume_text)}</b> for this cycle.</li>
+                  <li>Use sections below to review user signals, press updates, and product health.</li>
+                </ul>
+              </td>
+            </tr>
+            <tr><td style="padding:0 24px 20px 24px;"><hr style="border:none;border-top:1px solid #eaecf0;"></td></tr>
+            <tr>
+              <td style="padding:0 24px 20px 24px;">
+                <div style="font-size:15px;font-weight:700;">What People Are Saying</div>
+                {as_html_block(people_section)}
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:0 24px 20px 24px;">
+                <div style="font-size:15px;font-weight:700;">Press & Industry</div>
+                {as_html_block(press_section)}
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:0 24px 20px 24px;">
+                <div style="font-size:15px;font-weight:700;">Product Health</div>
+                {as_html_block(health_section)}
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:0 24px 24px 24px;">
+                <div style="font-size:15px;font-weight:700;">Competitive Watch</div>
+                {as_html_block(comp_section)}
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>
+""".strip()
+
+    return body, html_body
 
 
 def _record_email_sent(trigger: str, *, alert_kind: str | None = None, now_local: datetime | None = None) -> None:
@@ -706,6 +961,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /prompt — View current config\n"
         "• /status — Check schedule\n"
         "• /email — Admin: run scan + send email now\n"
+        "• /deepscan — Admin: historical scan + email\n"
         "• /smtpcheck — Admin: check SMTP config/login\n"
         "• Any text → Follow-up on latest report",
         parse_mode="Markdown",
@@ -828,6 +1084,34 @@ async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ /email failed: {e}")
 
 
+async def cmd_deepscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    await update.message.reply_text("🧠 Running historical deep scan...")
+    try:
+        historical_mentions = await asyncio.wait_for(fetch_historical_mentions(), timeout=120)
+        report = await asyncio.wait_for(analyze_historical(historical_mentions), timeout=120)
+
+        telegram_message = f"📚 *Interac Historical Deep Scan* — {now_est()}\n\n{report}"
+        await update.message.reply_text(telegram_message, parse_mode="Markdown")
+
+        subject = f"{EMAIL_SUBJECT_PREFIX} — HISTORICAL DEEP SCAN"
+        email_body = f"Interac Historical Deep Scan — {now_est()}\n\n{report}"
+        ok, send_reason = send_email(subject, email_body)
+        if ok:
+            _record_email_sent("on_demand")
+            await update.message.reply_text("✅ Deep scan email sent successfully.")
+        else:
+            await update.message.reply_text(f"❌ Deep scan email failed: {send_reason}")
+    except asyncio.TimeoutError:
+        await update.message.reply_text("⏱️ /deepscan timed out after 120 seconds.")
+    except Exception as e:
+        logger.error(f"/deepscan failed: {e}")
+        await update.message.reply_text(f"❌ /deepscan failed: {e}")
+
+
 async def cmd_smtpcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Admin only.")
@@ -877,6 +1161,7 @@ def main():
     app.add_handler(CommandHandler("raw", cmd_raw))
     app.add_handler(CommandHandler("prompt", cmd_prompt))
     app.add_handler(CommandHandler("email", cmd_email))
+    app.add_handler(CommandHandler("deepscan", cmd_deepscan))
     app.add_handler(CommandHandler("smtpcheck", cmd_smtpcheck))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
