@@ -160,6 +160,19 @@ def _has_site_restriction(query: str) -> bool:
 _search_errors: list[str] = []
 
 
+def _classify_channel_and_source(link: str) -> tuple[str, str]:
+    url = (link or "").lower()
+    if "reddit.com" in url:
+        return "people", "Reddit"
+    if "x.com" in url or "twitter.com" in url:
+        return "people", "X/Twitter"
+    if "redflagdeals.com" in url:
+        return "people", "RedFlagDeals"
+    if "forum" in url or "community" in url:
+        return "people", "Forum"
+    return "press", "News/Other"
+
+
 def _tbs_to_timelimit(tbs: str) -> str | None:
     mapping = {"qdr:d": "d", "qdr:w": "w", "qdr:m": "m", "qdr:y": "y"}
     return mapping.get(tbs) if tbs else None
@@ -340,19 +353,22 @@ async def fetch_historical_mentions() -> str:
             search_results = await web_search(query, "search", max_per, tbs=tbs)
             for r in search_results:
                 link = r.get("link", "")
-                if "reddit.com" in link:
-                    r["source"] = "Reddit"
-                elif "redflagdeals.com" in link:
-                    r["source"] = "RedFlagDeals"
+                channel, source = _classify_channel_and_source(link)
+                r["channel"] = channel
+                r["source"] = source if source != "News/Other" else r.get("source", "search")
                 mentions.append(r)
 
             if not has_site:
                 news_results = await web_search(query, "news", max_per, tbs=tbs)
                 for r in news_results:
+                    r["channel"] = "press"
                     r["source"] = r.get("source", "News")
                     mentions.append(r)
 
                 x_results = await search_twitter(query, max_per, tbs=tbs)
+                for r in x_results:
+                    r["channel"] = "people"
+                    r["source"] = "X/Twitter"
                 mentions.extend(x_results)
                 debug_lines.append(
                     f"  {query[:50]}... → search={len(search_results)} news={len(news_results)} x={len(x_results)}"
@@ -371,14 +387,21 @@ async def fetch_historical_mentions() -> str:
             seen.add(link)
             unique.append(m)
 
-        timeframe_counts[label] = len(unique)
-        lines.append(f"\n=== {label} | tbs={tbs or 'ALL TIME'} | mentions={len(unique)} ===")
-        for i, m in enumerate(unique[:15], 1):
-            date_str = f" ({m.get('date')})" if m.get("date") else ""
+        social_unique = [m for m in unique if m.get("channel") == "people"]
+        selected = social_unique if social_unique else unique
+
+        timeframe_counts[label] = len(selected)
+        lines.append(
+            f"\n=== {label} | tbs={tbs or 'ALL TIME'} | mentions={len(selected)} "
+            f"(social={len(social_unique)}, total={len(unique)}) ==="
+        )
+        for i, m in enumerate(selected[:15], 1):
+            platform = m.get("source", "unknown")
+            date_value = m.get("date") or "unknown"
+            url_value = m.get("link", "")
+            snippet = " ".join((m.get("snippet", "") or "").split())[:260]
             lines.append(
-                f"[H{i}] {m.get('title', '')} | {m.get('source', 'unknown')}{date_str}\n"
-                f"  {m.get('snippet', '')[:200]}\n"
-                f"  {m.get('link', '')}"
+                f"[H{i}] Platform: {platform} | Date: {date_value} | URL: {url_value} | Snippet: {snippet}"
             )
 
     total_mentions = sum(timeframe_counts.values())

@@ -16,9 +16,9 @@ EXCLUDED SOURCES: news outlets, blogs/media analysis, official announcements/pre
 
 1. Only reference sources, URLs, and mentions present in the raw data provided. Do not invent URLs.
 2. Use only social media/community-post evidence in findings and themes. Do not use press/blog/corporate content as evidence.
-3. Every finding MUST include at least one verbatim user quote. Do not paraphrase a quote.
-4. Every quote must include provenance: platform, date, and source URL.
-5. If a timeframe has mentions but no usable verbatim user quote, output exactly: 'Insufficient user evidence.'
+3. Every finding should include a verbatim user quote when available. If not available, use a short direct snippet from the post text.
+4. Every quote or snippet must include provenance: platform, date, and source URL.
+5. If a timeframe has only low-signal mentions without usable quote/snippet evidence, output exactly: 'Insufficient user evidence.'
 6. Only write 'No notable findings.' when the raw data for that timeframe is genuinely empty.
 7. Avoid generic language (for example: "users are frustrated", "poor UX") unless immediately supported by quote evidence plus a specific impact detail.
 
@@ -27,7 +27,7 @@ EXCLUDED SOURCES: news outlets, blogs/media analysis, official announcements/pre
 ## WHAT MAKES A GOOD FINDING
 
 A finding is not just "people complained about X." A good finding includes:
-- What the user said, as a verbatim quote in quotes
+- What the user said, as a verbatim quote in quotes when available, otherwise a direct snippet from post text
 - Where it came from: platform, date, and source URL
 - Which product and FI it touched (if stated in the post)
 - What happened to the user (impact), in concrete terms
@@ -52,7 +52,7 @@ One sentence. Must name a specific product, complaint type, or user segment, and
 OVERALL TREND: [improving / stable / declining] — [One sentence explaining the trajectory based on what you observed across timeframes.]
 
 --- RECENT (1 month) ---
-[Findings from allowed social sources only. Each finding: Product | Platform | Source URL | Date | "Verbatim user quote" | One-line impact summary. If mentions exist but no usable quote, write 'Insufficient user evidence.' If truly empty, write 'No notable findings.']
+[Findings from allowed social sources only. Each finding: Product | Platform | Source URL | Date | "Verbatim user quote" (or direct snippet) | One-line impact summary. If mentions exist but no usable quote/snippet, write 'Insufficient user evidence.' If truly empty, write 'No notable findings.']
 
 --- MEDIUM (6 months) ---
 [Same format.]
