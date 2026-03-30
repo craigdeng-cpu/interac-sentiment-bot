@@ -1062,6 +1062,38 @@ async def ask_followup(question: str, report_context: str) -> str:
     )
 
 
+# Telegram hard-limits message length (4096 chars). Chunk long reports safely.
+async def send_chunked_message(
+    update: Update,
+    text: str,
+    *,
+    parse_mode: str | None = None,
+    chunk_size: int = 3900,
+) -> None:
+    if len(text) <= chunk_size:
+        await update.message.reply_text(text, parse_mode=parse_mode)
+        return
+
+    chunks = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= chunk_size:
+            chunks.append(remaining)
+            break
+        split_at = remaining.rfind("\n\n", 0, chunk_size)
+        if split_at < 0:
+            split_at = remaining.rfind("\n", 0, chunk_size)
+        if split_at < 0:
+            split_at = chunk_size
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+
+    total = len(chunks)
+    for idx, chunk in enumerate(chunks, 1):
+        prefix = f"({idx}/{total})\n" if total > 1 else ""
+        await update.message.reply_text(prefix + chunk, parse_mode=parse_mode)
+
+
 # ─── Scheduled Broadcast ─────────────────────────────────────────────────────
 async def scheduled_sentiment_broadcast(context: ContextTypes.DEFAULT_TYPE):
     global last_report, last_mentions_raw, last_sentiment_score, last_alert_kind
@@ -1263,9 +1295,9 @@ async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📧 Running fresh scan and sending email...")
     try:
         # Hard timeout so manual email runs never hang indefinitely.
-        mentions = await asyncio.wait_for(fetch_all_mentions(), timeout=60)
+        mentions = await asyncio.wait_for(fetch_all_mentions(), timeout=120)
         last_mentions_raw = mentions
-        report = await asyncio.wait_for(analyze_sentiment(mentions), timeout=60)
+        report = await asyncio.wait_for(analyze_sentiment(mentions), timeout=120)
         last_report = report
 
         score = extract_sentiment_score(report)
@@ -1340,7 +1372,7 @@ async def cmd_deepscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report = await asyncio.wait_for(analyze_historical(historical_mentions), timeout=120)
 
         telegram_message = f"📚 *Interac Historical Deep Scan* — {now_est()}\n\n{report}"
-        await update.message.reply_text(telegram_message, parse_mode="Markdown")
+        await send_chunked_message(update, telegram_message, parse_mode="Markdown")
 
         subject = f"{EMAIL_SUBJECT_PREFIX} — HISTORICAL DEEP SCAN"
         email_body = f"Interac Historical Deep Scan — {now_est()}\n\n{report}"
