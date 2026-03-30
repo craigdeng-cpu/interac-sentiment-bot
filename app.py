@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 import httpx
 from ddgs import DDGS
 from telegram import Update
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -1070,8 +1071,22 @@ async def send_chunked_message(
     parse_mode: str | None = None,
     chunk_size: int = 3900,
 ) -> None:
+    async def _reply_with_fallback(message_text: str) -> None:
+        if not parse_mode:
+            await update.message.reply_text(message_text)
+            return
+        try:
+            await update.message.reply_text(message_text, parse_mode=parse_mode)
+        except BadRequest as e:
+            # Model-generated text can contain invalid markdown entities.
+            # Retry as plain text so delivery succeeds instead of failing the command.
+            if "Can't parse entities" in str(e):
+                await update.message.reply_text(message_text)
+                return
+            raise
+
     if len(text) <= chunk_size:
-        await update.message.reply_text(text, parse_mode=parse_mode)
+        await _reply_with_fallback(text)
         return
 
     chunks = []
@@ -1091,7 +1106,7 @@ async def send_chunked_message(
     total = len(chunks)
     for idx, chunk in enumerate(chunks, 1):
         prefix = f"({idx}/{total})\n" if total > 1 else ""
-        await update.message.reply_text(prefix + chunk, parse_mode=parse_mode)
+        await _reply_with_fallback(prefix + chunk)
 
 
 # ─── Scheduled Broadcast ─────────────────────────────────────────────────────
