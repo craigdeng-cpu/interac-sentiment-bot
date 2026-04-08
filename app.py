@@ -225,6 +225,134 @@ def _detect_use_case(text: str) -> str:
     return "general_payments"
 
 
+_CLUSTER_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "that",
+    "this",
+    "from",
+    "into",
+    "their",
+    "about",
+    "your",
+    "have",
+    "has",
+    "had",
+    "are",
+    "was",
+    "were",
+    "will",
+    "would",
+    "should",
+    "could",
+    "can",
+    "but",
+    "not",
+    "you",
+    "they",
+    "its",
+    "it's",
+    "canada",
+    "payment",
+    "payments",
+}
+
+
+def _normalize_date_value(raw_date: str) -> str:
+    value = (raw_date or "").strip()
+    if not value:
+        return "unknown"
+    iso_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", value)
+    if iso_match:
+        return iso_match.group(1)
+    return value[:24]
+
+
+def _extract_keywords(text: str, max_keywords: int = 6) -> list[str]:
+    tokens = re.findall(r"[a-z0-9]+", (text or "").lower())
+    keywords: list[str] = []
+    for token in tokens:
+        if len(token) < 3 or token in _CLUSTER_STOPWORDS:
+            continue
+        if token not in keywords:
+            keywords.append(token)
+        if len(keywords) >= max_keywords:
+            break
+    return keywords
+
+
+def _cluster_key_from_components(brands: str, use_case: str, keywords: list[str]) -> str:
+    keyword_key = ",".join(sorted(keywords[:4])) if keywords else "nokeywords"
+    return f"{brands}|{use_case}|{keyword_key}"
+
+
+def _token_overlap_ratio(tokens_a: set[str], tokens_b: set[str]) -> float:
+    if not tokens_a or not tokens_b:
+        return 0.0
+    overlap = len(tokens_a.intersection(tokens_b))
+    return overlap / float(min(len(tokens_a), len(tokens_b)))
+
+
+def _cluster_mentions(mentions: list[dict]) -> list[dict]:
+    clusters: list[dict] = []
+    for mention in mentions:
+        mention_tokens = set(mention.get("keywords", []))
+        chosen_cluster = None
+
+        for cluster in clusters:
+            rep = cluster["representative"]
+            rep_tokens = set(rep.get("keywords", []))
+            overlap = _token_overlap_ratio(mention_tokens, rep_tokens)
+
+            same_brand = mention.get("brands", "Unknown") == rep.get("brands", "Unknown")
+            same_use_case = mention.get("use_case", "general_payments") == rep.get("use_case", "general_payments")
+
+            # Anti-fragmentation guard:
+            # - strong overlap always merges
+            # - fallback merge for same brand + use-case with moderate overlap
+            if overlap >= 0.6 or (same_brand and same_use_case and overlap >= 0.35):
+                chosen_cluster = cluster
+                break
+
+        if chosen_cluster is None:
+            chosen_cluster = {
+                "cluster_key": mention["cluster_key"],
+                "mentions": [],
+                "representative": mention,
+            }
+            clusters.append(chosen_cluster)
+
+        chosen_cluster["mentions"].append(mention)
+        if len(mention.get("snippet", "")) > len(chosen_cluster["representative"].get("snippet", "")):
+            chosen_cluster["representative"] = mention
+
+    summarized = []
+    for idx, cluster in enumerate(clusters, 1):
+        cluster_mentions = cluster["mentions"]
+        rep = cluster["representative"]
+        domains = sorted({urlparse(m.get("url", "")).netloc.replace("www.", "") for m in cluster_mentions if m.get("url")})
+        timeframes = sorted({m.get("timeframe", "unknown") for m in cluster_mentions})
+        dated_count = sum(1 for m in cluster_mentions if m.get("date", "unknown") != "unknown")
+        summarized.append(
+            {
+                "story_id": f"S{idx}",
+                "archetype_hint": rep.get("use_case", "general_payments"),
+                "brands": rep.get("brands", "Unknown"),
+                "article_count": len(cluster_mentions),
+                "unique_domains": len(domains),
+                "timeframes_present": ", ".join(timeframes) if timeframes else "unknown",
+                "dated_count": dated_count,
+                "sample_urls": [m.get("url", "") for m in cluster_mentions[:3] if m.get("url")],
+                "sample_snippet": rep.get("snippet", "")[:220],
+            }
+        )
+
+    summarized.sort(key=lambda c: (c["article_count"], c["unique_domains"], c["dated_count"]), reverse=True)
+    return summarized
+
+
 def _extract_platform_context(link: str) -> dict[str, str]:
     """Extract persona-relevant metadata from mention URLs."""
     url = (link or "").lower()
@@ -557,6 +685,7 @@ async def fetch_brand_archetype_mentions(fetch_budget_seconds: int = 200) -> str
     lines = [f"=== BRAND ARCHETYPE HISTORICAL SCAN — {now_est()} ==="]
     timeframe_counts: dict[str, int] = {}
     debug_lines: list[str] = []
+    all_unique_mentions: list[dict] = []
 
     for timeframe_key, block in brand_queries.items():
         label = block.get("label", timeframe_key)
@@ -622,14 +751,30 @@ async def fetch_brand_archetype_mentions(fetch_budget_seconds: int = 200) -> str
         )
         for i, m in enumerate(unique[:20], 1):
             platform = m.get("source", "unknown")
-            date_value = m.get("date") or "unknown"
+            date_value = _normalize_date_value(m.get("date", ""))
             url_value = m.get("link", "")
             snippet = " ".join((m.get("snippet", "") or "").split())[:260]
             title_value = " ".join((m.get("title", "") or "").split())[:120]
             text_blob = f"{title_value} {snippet}".strip()
             brands = _detect_brands(text_blob)
             use_case = _detect_use_case(text_blob)
+            keywords = _extract_keywords(text_blob, max_keywords=8)
+            cluster_key = _cluster_key_from_components(brands, use_case, keywords)
             quality_tier = _source_quality_tier(url_value, m.get("channel", "press"))
+            all_unique_mentions.append(
+                {
+                    "timeframe": label,
+                    "platform": platform,
+                    "date": date_value,
+                    "url": url_value,
+                    "snippet": snippet,
+                    "brands": brands,
+                    "use_case": use_case,
+                    "quality_tier": quality_tier,
+                    "keywords": keywords,
+                    "cluster_key": cluster_key,
+                }
+            )
             lines.append(
                 f"[B{i}] Timeframe: {label} | Platform: {platform} | Date: {date_value} "
                 f"| SourceTier: {quality_tier} | Brands: {brands} | UseCase: {use_case} "
@@ -646,6 +791,24 @@ async def fetch_brand_archetype_mentions(fetch_budget_seconds: int = 200) -> str
     for label, count in timeframe_counts.items():
         lines.insert(idx, f"- {label}: {count}")
         idx += 1
+
+    story_clusters = _cluster_mentions(all_unique_mentions)
+    cluster_header_idx = idx
+    lines.insert(cluster_header_idx, "")
+    lines.insert(cluster_header_idx + 1, "=== STORY CLUSTERS ===")
+    if not story_clusters:
+        lines.insert(cluster_header_idx + 2, "- No clusterable stories identified.")
+    else:
+        insert_at = cluster_header_idx + 2
+        for cluster in story_clusters[:12]:
+            sample_url = cluster["sample_urls"][0] if cluster["sample_urls"] else "no-url"
+            lines.insert(
+                insert_at,
+                f"[{cluster['story_id']}] ArchetypeHint={cluster['archetype_hint']} | Brands={cluster['brands']} "
+                f"| Articles={cluster['article_count']} | Domains={cluster['unique_domains']} "
+                f"| Timeframes={cluster['timeframes_present']} | Dated={cluster['dated_count']} | URL={sample_url}",
+            )
+            insert_at += 1
 
     logger.info(f"Brand historical scan totals: {timeframe_counts} = {total_mentions}")
     for dl in debug_lines:
@@ -1114,24 +1277,34 @@ def _status_color(status: str) -> str:
     return "#344054"
 
 
+EMAIL_FONT_STACK = "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif"
+EMAIL_PAGE_BG = "#eef2f8"
+EMAIL_CARD_BG = "#ffffff"
+EMAIL_BORDER = "#d9e2f2"
+EMAIL_NAVY = "#0f1f47"
+EMAIL_TEXT = "#101828"
+EMAIL_MUTED = "#667085"
+EMAIL_ACCENT = "#175CD3"
+
+
 def _styled_raw_report_html(subject: str, body: str) -> str:
     escaped = html.escape(body)
     return f"""
 <html>
-  <body style="margin:0;padding:0;background:#f2f4f7;font-family:Arial,sans-serif;color:#101828;">
+  <body style="margin:0;padding:0;background:{EMAIL_PAGE_BG};font-family:{EMAIL_FONT_STACK};color:{EMAIL_TEXT};">
     <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 0;">
       <tr><td align="center">
-        <table role="presentation" width="640" cellspacing="0" cellpadding="0" style="background:#ffffff;border-radius:10px;overflow:hidden;border:1px solid #eaecf0;">
+        <table role="presentation" width="760" cellspacing="0" cellpadding="0" style="background:{EMAIL_CARD_BG};border-radius:14px;overflow:hidden;border:1px solid {EMAIL_BORDER};">
           <tr>
-            <td style="background:#111827;color:#ffffff;padding:18px 24px;">
-              <div style="font-size:22px;font-weight:700;">Interac Intelligence</div>
-              <div style="font-size:13px;color:#d0d5dd;margin-top:4px;">{html.escape(subject)}</div>
+            <td style="background:{EMAIL_NAVY};color:#ffffff;padding:18px 24px;border-bottom:4px solid #fdb913;">
+              <div style="font-size:24px;font-weight:700;letter-spacing:0.2px;">Interac Intelligence</div>
+              <div style="font-size:13px;color:#d8def0;margin-top:6px;">{html.escape(subject)}</div>
             </td>
           </tr>
           <tr>
             <td style="padding:20px 24px;">
               <div style="font-size:15px;font-weight:700;margin-bottom:10px;">Report</div>
-              <pre style="white-space:pre-wrap;background:#f8fafc;border:1px solid #eaecf0;border-radius:8px;padding:14px;font-size:13px;line-height:1.5;color:#101828;">{escaped}</pre>
+              <pre style="white-space:pre-wrap;background:#f9fbff;border:1px solid {EMAIL_BORDER};border-radius:10px;padding:14px;font-size:13px;line-height:1.5;color:{EMAIL_TEXT};">{escaped}</pre>
             </td>
           </tr>
         </table>
@@ -1168,47 +1341,59 @@ def _build_historical_html(subject: str, body: str) -> str:
 
     def as_html_block(raw: str) -> str:
         if not raw:
-            return "<div style='color:#667085;font-size:13px;'>No notable findings in this timeframe.</div>"
+            return f"<div style='color:{EMAIL_MUTED};font-size:13px;'>No notable findings in this timeframe.</div>"
         lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
         cards = []
         for ln in lines[:4]:
             compact = _compact_email_line(ln)
             if compact:
                 cards.append(
-                    "<div style='border:1px solid #eaecf0;border-radius:8px;padding:10px 12px;"
-                    "margin-top:8px;font-size:13px;line-height:1.45;color:#101828;'>"
+                    f"<div style='border:1px solid {EMAIL_BORDER};border-radius:10px;padding:9px 11px;"
+                    f"margin-top:7px;font-size:13px;line-height:1.45;color:{EMAIL_TEXT};background:#fcfdff;'>"
                     f"{compact}</div>"
                 )
         if not cards:
-            return "<div style='color:#667085;font-size:13px;'>No notable findings in this timeframe.</div>"
+            return f"<div style='color:{EMAIL_MUTED};font-size:13px;'>No notable findings in this timeframe.</div>"
         return "".join(cards)
 
     return f"""
 <html>
-  <body style="margin:0;padding:0;background:#f2f4f7;font-family:Arial,sans-serif;color:#101828;">
+  <body style="margin:0;padding:0;background:{EMAIL_PAGE_BG};font-family:{EMAIL_FONT_STACK};color:{EMAIL_TEXT};">
     <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 0;">
       <tr><td align="center">
-        <table role="presentation" width="640" cellspacing="0" cellpadding="0" style="background:#ffffff;border-radius:10px;overflow:hidden;border:1px solid #eaecf0;">
+        <table role="presentation" width="760" cellspacing="0" cellpadding="0" style="background:{EMAIL_CARD_BG};border-radius:14px;overflow:hidden;border:1px solid {EMAIL_BORDER};">
           <tr>
-            <td style="background:#111827;color:#ffffff;padding:18px 24px;">
-              <div style="font-size:22px;font-weight:700;">Interac Intelligence</div>
-              <div style="font-size:13px;color:#d0d5dd;margin-top:4px;">{html.escape(subject)}</div>
-              <div style="font-size:12px;color:#98a2b3;margin-top:6px;">Historical deep scan</div>
+            <td style="background:{EMAIL_NAVY};color:#ffffff;padding:18px 24px;border-bottom:4px solid #fdb913;">
+              <div style="font-size:24px;font-weight:700;letter-spacing:0.2px;">Interac Intelligence</div>
+              <div style="font-size:13px;color:#d8def0;margin-top:6px;">{html.escape(subject)}</div>
+              <div style="font-size:12px;color:#aebce2;margin-top:6px;">Historical deep scan</div>
             </td>
           </tr>
           <tr>
             <td style="padding:20px 24px;">
-              <div style="border:1px solid #eaecf0;border-radius:8px;padding:12px;">
-                <div style="font-size:12px;color:#667085;">Overall Trend</div>
+              <div style="border:1px solid {EMAIL_BORDER};background:#f7faff;border-radius:10px;padding:12px;">
+                <div style="font-size:12px;color:{EMAIL_MUTED};">Overall Trend</div>
                 <div style="font-size:16px;font-weight:700;line-height:1.4;">{html.escape(trend)}</div>
               </div>
             </td>
           </tr>
-          <tr><td style="padding:0 24px 20px 24px;"><hr style="border:none;border-top:1px solid #eaecf0;"></td></tr>
-          <tr><td style="padding:0 24px 16px 24px;"><div style="font-size:15px;font-weight:700;">Recent (1 month)</div>{as_html_block(recent)}</td></tr>
-          <tr><td style="padding:0 24px 16px 24px;"><div style="font-size:15px;font-weight:700;">Medium (6 months)</div>{as_html_block(medium)}</td></tr>
-          <tr><td style="padding:0 24px 16px 24px;"><div style="font-size:15px;font-weight:700;">Older (1 year+)</div>{as_html_block(older)}</td></tr>
-          <tr><td style="padding:0 24px 16px 24px;"><div style="font-size:15px;font-weight:700;">Recurring Themes</div>{as_html_block(themes)}</td></tr>
+          <tr><td style="padding:0 24px 20px 24px;"><hr style="border:none;border-top:1px solid {EMAIL_BORDER};"></td></tr>
+          <tr><td style="padding:0 24px 16px 24px;">
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+              <tr>
+                <td width="50%" valign="top" style="padding-right:8px;"><div style="font-size:15px;font-weight:700;">Recent (1 month)</div>{as_html_block(recent)}</td>
+                <td width="50%" valign="top" style="padding-left:8px;"><div style="font-size:15px;font-weight:700;">Medium (6 months)</div>{as_html_block(medium)}</td>
+              </tr>
+            </table>
+          </td></tr>
+          <tr><td style="padding:0 24px 16px 24px;">
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+              <tr>
+                <td width="50%" valign="top" style="padding-right:8px;"><div style="font-size:15px;font-weight:700;">Older (1 year+)</div>{as_html_block(older)}</td>
+                <td width="50%" valign="top" style="padding-left:8px;"><div style="font-size:15px;font-weight:700;">Recurring Themes</div>{as_html_block(themes)}</td>
+              </tr>
+            </table>
+          </td></tr>
           <tr><td style="padding:0 24px 24px 24px;"><div style="font-size:15px;font-weight:700;">Actionable Insight</div>{as_html_block(insight)}</td></tr>
         </table>
       </td></tr>
@@ -1244,7 +1429,7 @@ def _build_persona_html(subject: str, body: str) -> str:
 
     def as_html_cards(raw: str, empty_msg: str) -> str:
         if not raw:
-            return f"<div style='color:#667085;font-size:13px;'>{empty_msg}</div>"
+            return f"<div style='color:{EMAIL_MUTED};font-size:13px;'>{empty_msg}</div>"
         lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
         cards = []
         for ln in lines[:6]:
@@ -1252,40 +1437,52 @@ def _build_persona_html(subject: str, body: str) -> str:
             if not compact:
                 continue
             cards.append(
-                "<div style='border:1px solid #eaecf0;border-radius:8px;padding:10px 12px;"
-                "margin-top:8px;font-size:13px;line-height:1.45;color:#101828;'>"
+                f"<div style='border:1px solid {EMAIL_BORDER};border-radius:10px;padding:9px 11px;"
+                f"margin-top:7px;font-size:13px;line-height:1.45;color:{EMAIL_TEXT};background:#fcfdff;'>"
                 f"{compact}</div>"
             )
         if not cards:
-            return f"<div style='color:#667085;font-size:13px;'>{empty_msg}</div>"
+            return f"<div style='color:{EMAIL_MUTED};font-size:13px;'>{empty_msg}</div>"
         return "".join(cards)
 
     return f"""
 <html>
-  <body style="margin:0;padding:0;background:#f2f4f7;font-family:Arial,sans-serif;color:#101828;">
+  <body style="margin:0;padding:0;background:{EMAIL_PAGE_BG};font-family:{EMAIL_FONT_STACK};color:{EMAIL_TEXT};">
     <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 0;">
       <tr><td align="center">
-        <table role="presentation" width="720" cellspacing="0" cellpadding="0" style="background:#ffffff;border-radius:10px;overflow:hidden;border:1px solid #eaecf0;">
+        <table role="presentation" width="760" cellspacing="0" cellpadding="0" style="background:{EMAIL_CARD_BG};border-radius:14px;overflow:hidden;border:1px solid {EMAIL_BORDER};">
           <tr>
-            <td style="background:#111827;color:#ffffff;padding:18px 24px;">
-              <div style="font-size:22px;font-weight:700;">Interac Intelligence</div>
-              <div style="font-size:13px;color:#d0d5dd;margin-top:4px;">{html.escape(subject)}</div>
-              <div style="font-size:12px;color:#98a2b3;margin-top:6px;">{html.escape(timestamp)}</div>
+            <td style="background:{EMAIL_NAVY};color:#ffffff;padding:18px 24px;border-bottom:4px solid #fdb913;">
+              <div style="font-size:24px;font-weight:700;letter-spacing:0.2px;">Interac Intelligence</div>
+              <div style="font-size:13px;color:#d8def0;margin-top:6px;">{html.escape(subject)}</div>
+              <div style="font-size:12px;color:#aebce2;margin-top:6px;">{html.escape(timestamp)}</div>
             </td>
           </tr>
           <tr>
             <td style="padding:18px 24px;">
-              <div style="border:1px solid #dbe7ff;background:#f5f8ff;border-radius:8px;padding:12px 14px;">
+              <div style="border:1px solid #cdddfa;background:#f5f8ff;border-radius:10px;padding:12px 14px;">
                 <div style="font-size:12px;color:#475467;">Data Quality</div>
                 <div style="font-size:14px;font-weight:600;line-height:1.45;">{html.escape(data_quality)}</div>
               </div>
             </td>
           </tr>
-          <tr><td style="padding:0 24px 20px 24px;"><hr style="border:none;border-top:1px solid #eaecf0;"></td></tr>
-          <tr><td style="padding:0 24px 16px 24px;"><div style="font-size:15px;font-weight:700;">Primary Archetypes</div>{as_html_cards(archetypes, "No clear archetypes identified.")}</td></tr>
-          <tr><td style="padding:0 24px 16px 24px;"><div style="font-size:15px;font-weight:700;">Top Pain Themes</div>{as_html_cards(pain_themes, "No repeated pain themes identified.")}</td></tr>
-          <tr><td style="padding:0 24px 16px 24px;"><div style="font-size:15px;font-weight:700;">FI / Segment Signals</div>{as_html_cards(fi_signals, "No FI-specific segment signal identified.")}</td></tr>
-          <tr><td style="padding:0 24px 24px 24px;"><div style="font-size:15px;font-weight:700;">Focus Recommendation</div>{as_html_cards(recommendation, "No recommendation provided.")}</td></tr>
+          <tr><td style="padding:0 24px 20px 24px;"><hr style="border:none;border-top:1px solid {EMAIL_BORDER};"></td></tr>
+          <tr><td style="padding:0 24px 16px 24px;">
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+              <tr>
+                <td width="50%" valign="top" style="padding-right:8px;"><div style="font-size:15px;font-weight:700;">Primary Archetypes</div>{as_html_cards(archetypes, "No clear archetypes identified.")}</td>
+                <td width="50%" valign="top" style="padding-left:8px;"><div style="font-size:15px;font-weight:700;">Top Pain Themes</div>{as_html_cards(pain_themes, "No repeated pain themes identified.")}</td>
+              </tr>
+            </table>
+          </td></tr>
+          <tr><td style="padding:0 24px 24px 24px;">
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+              <tr>
+                <td width="50%" valign="top" style="padding-right:8px;"><div style="font-size:15px;font-weight:700;">FI / Segment Signals</div>{as_html_cards(fi_signals, "No FI-specific segment signal identified.")}</td>
+                <td width="50%" valign="top" style="padding-left:8px;"><div style="font-size:15px;font-weight:700;">Focus Recommendation</div>{as_html_cards(recommendation, "No recommendation provided.")}</td>
+              </tr>
+            </table>
+          </td></tr>
         </table>
       </td></tr>
     </table>
@@ -1324,7 +1521,7 @@ def _build_brand_archetype_html(subject: str, body: str) -> str:
 
     def as_html_cards(raw: str, empty_msg: str, max_lines: int = 6) -> str:
         if not raw:
-            return f"<div style='color:#667085;font-size:13px;'>{empty_msg}</div>"
+            return f"<div style='color:{EMAIL_MUTED};font-size:13px;'>{empty_msg}</div>"
         lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
         cards = []
         for ln in lines[:max_lines]:
@@ -1332,33 +1529,45 @@ def _build_brand_archetype_html(subject: str, body: str) -> str:
             if not compact:
                 continue
             cards.append(
-                "<div style='border:1px solid #eaecf0;border-radius:8px;padding:10px 12px;"
-                "margin-top:8px;font-size:13px;line-height:1.45;color:#101828;'>"
+                f"<div style='border:1px solid {EMAIL_BORDER};border-radius:10px;padding:9px 11px;"
+                f"margin-top:7px;font-size:13px;line-height:1.45;color:{EMAIL_TEXT};background:#fcfdff;'>"
                 f"{compact}</div>"
             )
         if not cards:
-            return f"<div style='color:#667085;font-size:13px;'>{empty_msg}</div>"
+            return f"<div style='color:{EMAIL_MUTED};font-size:13px;'>{empty_msg}</div>"
         return "".join(cards)
 
     return f"""
 <html>
-  <body style="margin:0;padding:0;background:#f2f4f7;font-family:Arial,sans-serif;color:#101828;">
+  <body style="margin:0;padding:0;background:{EMAIL_PAGE_BG};font-family:{EMAIL_FONT_STACK};color:{EMAIL_TEXT};">
     <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 0;">
       <tr><td align="center">
-        <table role="presentation" width="720" cellspacing="0" cellpadding="0" style="background:#ffffff;border-radius:10px;overflow:hidden;border:1px solid #eaecf0;">
+        <table role="presentation" width="760" cellspacing="0" cellpadding="0" style="background:{EMAIL_CARD_BG};border-radius:14px;overflow:hidden;border:1px solid {EMAIL_BORDER};">
           <tr>
-            <td style="background:#111827;color:#ffffff;padding:18px 24px;">
-              <div style="font-size:22px;font-weight:700;">Interac Intelligence</div>
-              <div style="font-size:13px;color:#d0d5dd;margin-top:4px;">{html.escape(subject)}</div>
-              <div style="font-size:12px;color:#98a2b3;margin-top:6px;">{html.escape(timestamp)}</div>
+            <td style="background:{EMAIL_NAVY};color:#ffffff;padding:18px 24px;border-bottom:4px solid #fdb913;">
+              <div style="font-size:24px;font-weight:700;letter-spacing:0.2px;">Interac Intelligence</div>
+              <div style="font-size:13px;color:#d8def0;margin-top:6px;">{html.escape(subject)}</div>
+              <div style="font-size:12px;color:#aebce2;margin-top:6px;">{html.escape(timestamp)}</div>
             </td>
           </tr>
           <tr><td style="padding:18px 24px;"><div style="font-size:15px;font-weight:700;">Market Snapshot</div>{as_html_cards(market_snapshot, "No market snapshot details available.", max_lines=4)}</td></tr>
-          <tr><td style="padding:0 24px 20px 24px;"><hr style="border:none;border-top:1px solid #eaecf0;"></td></tr>
-          <tr><td style="padding:0 24px 16px 24px;"><div style="font-size:15px;font-weight:700;">Active Brand Archetypes</div>{as_html_cards(archetypes, "No active archetypes identified.")}</td></tr>
-          <tr><td style="padding:0 24px 16px 24px;"><div style="font-size:15px;font-weight:700;">Competitor Movement</div>{as_html_cards(movement, "No clear competitor movement identified.")}</td></tr>
-          <tr><td style="padding:0 24px 16px 24px;"><div style="font-size:15px;font-weight:700;">What Changes For Interac</div>{as_html_cards(interac_changes, "No Interac-specific recommendations available.", max_lines=4)}</td></tr>
-          <tr><td style="padding:0 24px 24px 24px;"><div style="font-size:15px;font-weight:700;">Evidence Log</div>{as_html_cards(evidence_log, "No evidence log entries available.", max_lines=8)}</td></tr>
+          <tr><td style="padding:0 24px 20px 24px;"><hr style="border:none;border-top:1px solid {EMAIL_BORDER};"></td></tr>
+          <tr><td style="padding:0 24px 16px 24px;">
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+              <tr>
+                <td width="50%" valign="top" style="padding-right:8px;"><div style="font-size:15px;font-weight:700;">Active Brand Archetypes</div>{as_html_cards(archetypes, "No active archetypes identified.")}</td>
+                <td width="50%" valign="top" style="padding-left:8px;"><div style="font-size:15px;font-weight:700;">Competitor Movement</div>{as_html_cards(movement, "No clear competitor movement identified.")}</td>
+              </tr>
+            </table>
+          </td></tr>
+          <tr><td style="padding:0 24px 24px 24px;">
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+              <tr>
+                <td width="50%" valign="top" style="padding-right:8px;"><div style="font-size:15px;font-weight:700;">What Changes For Interac</div>{as_html_cards(interac_changes, "No Interac-specific recommendations available.", max_lines=4)}</td>
+                <td width="50%" valign="top" style="padding-left:8px;"><div style="font-size:15px;font-weight:700;">Evidence Log</div>{as_html_cards(evidence_log, "No evidence log entries available.", max_lines=8)}</td>
+              </tr>
+            </table>
+          </td></tr>
         </table>
       </td></tr>
     </table>
@@ -1433,16 +1642,16 @@ def build_email_bodies(subject: str, body: str, report_mode: str = "auto") -> tu
 
     html_body = f"""
 <html>
-  <body style="margin:0;padding:0;background:#f2f4f7;font-family:Arial,sans-serif;color:#101828;">
+  <body style="margin:0;padding:0;background:{EMAIL_PAGE_BG};font-family:{EMAIL_FONT_STACK};color:{EMAIL_TEXT};">
     <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 0;">
       <tr>
         <td align="center">
-          <table role="presentation" width="640" cellspacing="0" cellpadding="0" style="background:#ffffff;border-radius:10px;overflow:hidden;border:1px solid #eaecf0;">
+          <table role="presentation" width="760" cellspacing="0" cellpadding="0" style="background:{EMAIL_CARD_BG};border-radius:14px;overflow:hidden;border:1px solid {EMAIL_BORDER};">
             <tr>
-              <td style="background:#111827;color:#ffffff;padding:18px 24px;">
-                <div style="font-size:22px;font-weight:700;">Interac Intelligence</div>
-                <div style="font-size:13px;color:#d0d5dd;margin-top:4px;">{html.escape(subject)}</div>
-                <div style="font-size:12px;color:#98a2b3;margin-top:6px;">{html.escape(ts_text)}</div>
+              <td style="background:{EMAIL_NAVY};color:#ffffff;padding:18px 24px;border-bottom:4px solid #fdb913;">
+                <div style="font-size:24px;font-weight:700;letter-spacing:0.2px;">Interac Intelligence</div>
+                <div style="font-size:13px;color:#d8def0;margin-top:6px;">{html.escape(subject)}</div>
+                <div style="font-size:12px;color:#aebce2;margin-top:6px;">{html.escape(ts_text)}</div>
               </td>
             </tr>
             <tr>
@@ -1450,20 +1659,20 @@ def build_email_bodies(subject: str, body: str, report_mode: str = "auto") -> tu
                 <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
                   <tr>
                     <td style="width:33%;padding-right:8px;">
-                      <div style="border:1px solid #eaecf0;border-radius:8px;padding:12px;">
-                        <div style="font-size:12px;color:#667085;">Sentiment Score</div>
+                      <div style="border:1px solid {EMAIL_BORDER};border-radius:10px;padding:12px;background:#fcfdff;">
+                        <div style="font-size:12px;color:{EMAIL_MUTED};">Sentiment Score</div>
                         <div style="font-size:28px;font-weight:700;line-height:1.2;">{score_num}</div>
                       </div>
                     </td>
                     <td style="width:33%;padding:0 8px;">
-                      <div style="border:1px solid #eaecf0;border-radius:8px;padding:12px;">
-                        <div style="font-size:12px;color:#667085;">Mention Volume</div>
+                      <div style="border:1px solid {EMAIL_BORDER};border-radius:10px;padding:12px;background:#fcfdff;">
+                        <div style="font-size:12px;color:{EMAIL_MUTED};">Mention Volume</div>
                         <div style="font-size:18px;font-weight:600;line-height:1.3;">{html.escape(volume_text)}</div>
                       </div>
                     </td>
                     <td style="width:33%;padding-left:8px;">
-                      <div style="border:1px solid #eaecf0;border-radius:8px;padding:12px;">
-                        <div style="font-size:12px;color:#667085;">Status</div>
+                      <div style="border:1px solid {EMAIL_BORDER};border-radius:10px;padding:12px;background:#fcfdff;">
+                        <div style="font-size:12px;color:{EMAIL_MUTED};">Status</div>
                         <div style="display:inline-block;margin-top:6px;background:{color};color:#fff;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700;">{status}</div>
                       </div>
                     </td>
@@ -1481,29 +1690,25 @@ def build_email_bodies(subject: str, body: str, report_mode: str = "auto") -> tu
                 </ul>
               </td>
             </tr>
-            <tr><td style="padding:0 24px 20px 24px;"><hr style="border:none;border-top:1px solid #eaecf0;"></td></tr>
+            <tr><td style="padding:0 24px 20px 24px;"><hr style="border:none;border-top:1px solid {EMAIL_BORDER};"></td></tr>
             <tr>
-              <td style="padding:0 24px 20px 24px;">
-                <div style="font-size:15px;font-weight:700;">What People Are Saying</div>
-                {as_html_block(people_section)}
-              </td>
-            </tr>
-            <tr>
-              <td style="padding:0 24px 20px 24px;">
-                <div style="font-size:15px;font-weight:700;">Press & Industry</div>
-                {as_html_block(press_section)}
-              </td>
-            </tr>
-            <tr>
-              <td style="padding:0 24px 20px 24px;">
-                <div style="font-size:15px;font-weight:700;">Product Health</div>
-                {as_html_block(health_section)}
+              <td style="padding:0 24px 16px 24px;">
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+                  <tr>
+                    <td width="50%" valign="top" style="padding-right:8px;"><div style="font-size:15px;font-weight:700;">What People Are Saying</div>{as_html_block(people_section)}</td>
+                    <td width="50%" valign="top" style="padding-left:8px;"><div style="font-size:15px;font-weight:700;">Press & Industry</div>{as_html_block(press_section)}</td>
+                  </tr>
+                </table>
               </td>
             </tr>
             <tr>
               <td style="padding:0 24px 24px 24px;">
-                <div style="font-size:15px;font-weight:700;">Competitive Watch</div>
-                {as_html_block(comp_section)}
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+                  <tr>
+                    <td width="50%" valign="top" style="padding-right:8px;"><div style="font-size:15px;font-weight:700;">Product Health</div>{as_html_block(health_section)}</td>
+                    <td width="50%" valign="top" style="padding-left:8px;"><div style="font-size:15px;font-weight:700;">Competitive Watch</div>{as_html_block(comp_section)}</td>
+                  </tr>
+                </table>
               </td>
             </tr>
           </table>

@@ -15,6 +15,8 @@ You receive raw mentions grouped across time windows and sources. Produce a conc
 7. Do not use an evidence line as primary support if its date is unknown; date-unknown evidence can only be supplementary.
 8. Do not treat marketing claims or generic thought-leadership lines as proof of user pain.
 9. If direction cannot be proven across windows, write `Direction: unclear from available data`.
+10. Prefer story clusters over isolated mentions when inferring trends.
+11. A single article cannot determine direction by itself.
 
 ---
 
@@ -32,6 +34,9 @@ An archetype is valid only when there is:
 - a clear use-case,
 - and a concrete outcome (friction, switching intent, reliability, fraud confidence, etc.).
 
+Use the `=== STORY CLUSTERS ===` block in the input as the primary trend signal.
+Each cluster line includes recurrence metadata (`Articles`, `Domains`, `Timeframes`, `Dated`).
+
 ---
 
 ## OUTPUT FORMAT (USE EXACT HEADERS)
@@ -46,11 +51,11 @@ MARKET SNAPSHOT:
 ACTIVE BRAND ARCHETYPES:
 - Archetype: [name] | Direction: [rising/stable/fading]
   Brands: [comma-separated]
-  Trend proof: [one line referencing timeframe pattern or write unclear]
+  Trend proof: [one line using cluster recurrence fields: timeframes, article count, domains]
   Evidence: "[verbatim quote]" — [platform, date if available, URL]
 - Archetype: [name] | Direction: [rising/stable/fading]
   Brands: [comma-separated]
-  Trend proof: [one line referencing timeframe pattern or write unclear]
+  Trend proof: [one line using cluster recurrence fields: timeframes, article count, domains]
   Evidence: snippet: "[exact snippet]" — [platform, date if available, URL]
 
 COMPETITOR MOVEMENT:
@@ -91,3 +96,4 @@ If data is thin:
   - EVIDENCE LOG: 4-8 bullets
 - ACTIVE BRAND ARCHETYPES can include multiple archetypes, but avoid duplicates and keep each archetype block to 3 lines.
 - Do not use generic wording like "solid position", "strong trust", or "picking up traction" unless directly evidenced and dated.
+- If an archetype has only one article in one timeframe, mark direction as `unclear from available data`.
