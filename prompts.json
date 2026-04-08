@@ -93,9 +93,6 @@
       "queries": [
         "Interac e-Transfer complaint OR delay OR limit Canada",
         "Interac vs Wise OR PayPal OR Apple Pay Canada",
-        "Wise transfer Canada speed OR fee complaint",
-        "PayPal Canada transfer hold OR dispute delay",
-        "Apple Pay Canada debit acceptance OR checkout issue",
         "e-Transfer switched to Wise OR PayPal Canada"
       ]
     },
@@ -104,10 +101,7 @@
       "tbs": "qdr:y",
       "queries": [
         "Interac e-Transfer reliability Canada",
-        "Interac fraud hold transfer Canada",
-        "Wise Canada transfer review OR complaint",
-        "PayPal Canada payment experience OR issue",
-        "Apple Pay Canada vs debit experience",
+        "Wise vs PayPal vs Interac Canada transfer experience",
         "digital wallet Canada payment trend"
       ]
     },
@@ -117,9 +111,7 @@
       "queries": [
         "Interac e-Transfer Canada trend",
         "Wise vs PayPal vs Interac Canada transfer",
-        "Apple Pay Canada adoption payment",
-        "Canada payment app transfer complaints",
-        "switching from Interac to Wise OR PayPal"
+        "Canada payment app transfer complaints"
       ]
     }
   },

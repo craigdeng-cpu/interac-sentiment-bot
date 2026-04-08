@@ -11,6 +11,7 @@ You receive raw mentions grouped across time windows and sources. Produce a conc
 3. Direction labels are allowed only as: rising, stable, fading.
 4. If no verbatim quote exists, use `snippet:` and copy exact text from provided snippets.
 5. Keep output concise and scannable.
+6. Prefer concise coverage over exhaustive listing when signals are repetitive.
 
 ---
 
@@ -73,3 +74,9 @@ If data is thin:
 - Short lines, no long paragraphs
 - Evidence first, inference second
 - No hedging language unless uncertainty is genuine
+- Keep each section compact:
+  - MARKET SNAPSHOT: exactly 3 bullets
+  - COMPETITOR MOVEMENT: 2-4 bullets
+  - WHAT CHANGES FOR INTERAC: exactly 3 bullets
+  - EVIDENCE LOG: 4-8 bullets
+- ACTIVE BRAND ARCHETYPES can include multiple archetypes, but avoid duplicates and keep each archetype block to 3 lines.

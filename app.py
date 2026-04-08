@@ -13,6 +13,7 @@ import smtplib
 import asyncio
 import re
 import html
+from time import monotonic
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
@@ -491,10 +492,13 @@ async def fetch_historical_mentions() -> str:
     return "\n".join(lines)
 
 
-async def fetch_brand_archetype_mentions() -> str:
+async def fetch_brand_archetype_mentions(fetch_budget_seconds: int = 200) -> str:
     config = load_prompts()
     brand_queries = config.get("brand_historical_queries", {})
-    max_per = int(config.get("historical_max_mentions_per_source", 10))
+    # Hotfix: keep brand scan leaner than historical deep scan.
+    max_per = min(int(config.get("historical_max_mentions_per_source", 10)), 5)
+    started_at = monotonic()
+    partial_data = False
 
     if not brand_queries:
         return "No brand historical query config found."
@@ -510,6 +514,14 @@ async def fetch_brand_archetype_mentions() -> str:
         mentions = []
 
         for query in queries:
+            elapsed = monotonic() - started_at
+            if elapsed >= fetch_budget_seconds:
+                partial_data = True
+                debug_lines.append(
+                    f"  fetch budget reached at {elapsed:.1f}s; stopping before query: {query[:50]}..."
+                )
+                break
+
             has_site = _has_site_restriction(query)
 
             search_results = await web_search(query, "search", max_per, tbs=tbs)
@@ -540,6 +552,10 @@ async def fetch_brand_archetype_mentions() -> str:
                     f"  {query[:50]}... → search={len(search_results)} (site-restricted, skipped news/x)"
                 )
 
+        if partial_data:
+            # Stop processing additional windows once budget is exhausted.
+            break
+
         seen = set()
         unique = []
         for m in mentions:
@@ -564,7 +580,11 @@ async def fetch_brand_archetype_mentions() -> str:
 
     total_mentions = sum(timeframe_counts.values())
     lines.insert(1, f"TOTAL BRAND HISTORICAL MENTIONS: {total_mentions}")
+    if partial_data:
+        lines.insert(2, "PARTIAL DATA: fetch budget reached; report built from collected mentions.")
     idx = 2
+    if partial_data:
+        idx = 3
     for label, count in timeframe_counts.items():
         lines.insert(idx, f"- {label}: {count}")
         idx += 1
@@ -1813,7 +1833,11 @@ async def cmd_brandscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🏷️ Running historical brand archetype scan — fetching data...")
     _search_errors.clear()
     try:
-        brand_mentions = await asyncio.wait_for(fetch_brand_archetype_mentions(), timeout=180)
+        await update.message.reply_text("⏳ Step 1/3: Fetching market mentions...")
+        brand_mentions = await asyncio.wait_for(
+            fetch_brand_archetype_mentions(fetch_budget_seconds=200),
+            timeout=210,
+        )
         last_mentions_raw = brand_mentions
 
         mention_count = 0
@@ -1826,7 +1850,7 @@ async def cmd_brandscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 break
 
         await update.message.reply_text(
-            f"📊 Fetched {mention_count} raw brand mentions. Building archetypes with Kimi..."
+            f"📊 Fetched {mention_count} raw brand mentions. Step 2/3: Building archetypes with Kimi..."
         )
 
         if _search_errors:
@@ -1847,6 +1871,7 @@ async def cmd_brandscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         telegram_message = f"🏷️ *Interac Brand Archetype Scan* — {now_est()}\n\n{report}"
         await send_chunked_message(update, telegram_message, parse_mode="Markdown")
 
+        await update.message.reply_text("📧 Step 3/3: Sending brand archetype email...")
         subject = f"{EMAIL_SUBJECT_PREFIX} — BRAND ARCHETYPE SCAN"
         email_body = f"Interac Brand Archetype Scan — {now_est()}\n\n{report}"
         ok, send_reason = send_email(subject, email_body, report_mode="brand_archetype")
@@ -1856,7 +1881,9 @@ async def cmd_brandscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(f"❌ Brand archetype email failed: {send_reason}")
     except asyncio.TimeoutError:
-        await update.message.reply_text("⏱️ /brandscan timed out after 180 seconds.")
+        await update.message.reply_text(
+            "⏱️ /brandscan timed out. Partial-data fallback may apply; try rerunning shortly."
+        )
     except Exception as e:
         logger.error(f"/brandscan failed: {e}")
         await update.message.reply_text(f"❌ /brandscan failed: {e}")
