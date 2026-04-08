@@ -77,6 +77,32 @@ last_weekly_email_key: str | None = None
 
 # Per-user daily rate limiting
 user_usage: dict[int, dict] = defaultdict(lambda: {"count": 0, "date": None})
+active_tasks: set[asyncio.Task] = set()
+
+
+def _track_current_task() -> asyncio.Task | None:
+    task = asyncio.current_task()
+    if task is not None:
+        active_tasks.add(task)
+    return task
+
+
+def _untrack_task(task: asyncio.Task | None) -> None:
+    if task is not None:
+        active_tasks.discard(task)
+
+
+def _cancel_active_tasks(*, exclude: asyncio.Task | None = None) -> int:
+    cancelled = 0
+    for task in list(active_tasks):
+        if exclude is not None and task is exclude:
+            continue
+        if task.done():
+            active_tasks.discard(task)
+            continue
+        task.cancel()
+        cancelled += 1
+    return cancelled
 
 
 def now_est() -> str:
@@ -892,35 +918,39 @@ def parse_scan_mode(args: list[str]) -> tuple[str, str | None]:
 
 async def run_scan_mode(update: Update, mode: str) -> None:
     global last_report, last_mentions_raw, last_sentiment_score
+    tracked = _track_current_task()
 
-    scan_label = "persona" if mode == "persona" else "signal"
-    await update.message.reply_text(
-        f"🔍 Running {scan_label} scan on Reddit, X, RedFlagDeals, news..."
-    )
+    try:
+        scan_label = "persona" if mode == "persona" else "signal"
+        await update.message.reply_text(
+            f"🔍 Running {scan_label} scan on Reddit, X, RedFlagDeals, news..."
+        )
 
-    mentions = await asyncio.wait_for(fetch_all_mentions(), timeout=120)
-    last_mentions_raw = mentions
-    report = await asyncio.wait_for(analyze_scan(mentions, mode), timeout=120)
-    last_report = report
+        mentions = await asyncio.wait_for(fetch_all_mentions(), timeout=120)
+        last_mentions_raw = mentions
+        report = await asyncio.wait_for(analyze_scan(mentions, mode), timeout=120)
+        last_report = report
 
-    if mode == "persona":
+        if mode == "persona":
+            await send_chunked_message(
+                update,
+                f"🧠 *Interac Persona Scan* — {now_est()}\n\n{report}",
+                parse_mode="Markdown",
+            )
+            return
+
+        score = extract_sentiment_score(report)
+        last_sentiment_score = score
+        config = load_prompts()
+        threshold = config.get("alert_threshold", 35)
+        alert_prefix = f"🚨 *ALERT: Sentiment {score}/100* 🚨\n\n" if score < threshold else ""
         await send_chunked_message(
             update,
-            f"🧠 *Interac Persona Scan* — {now_est()}\n\n{report}",
+            f"{alert_prefix}📊 *Interac Intelligence* — {now_est()}\n\n{report}",
             parse_mode="Markdown",
         )
-        return
-
-    score = extract_sentiment_score(report)
-    last_sentiment_score = score
-    config = load_prompts()
-    threshold = config.get("alert_threshold", 35)
-    alert_prefix = f"🚨 *ALERT: Sentiment {score}/100* 🚨\n\n" if score < threshold else ""
-    await send_chunked_message(
-        update,
-        f"{alert_prefix}📊 *Interac Intelligence* — {now_est()}\n\n{report}",
-        parse_mode="Markdown",
-    )
+    finally:
+        _untrack_task(tracked)
 
 
 def extract_sentiment_score(report: str) -> int:
@@ -1287,6 +1317,37 @@ EMAIL_MUTED = "#667085"
 EMAIL_ACCENT = "#175CD3"
 
 
+def _compact_panel(raw: str, empty_msg: str, *, max_lines: int = 3, list_mode: bool = True) -> str:
+    if not raw:
+        return (
+            f"<div style='border:1px solid {EMAIL_BORDER};border-radius:10px;padding:8px 10px;margin-top:6px;"
+            f"font-size:12px;line-height:1.35;color:{EMAIL_MUTED};background:#fcfdff;'>{html.escape(empty_msg)}</div>"
+        )
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    items = []
+    for ln in lines[:max_lines]:
+        compact = _compact_email_line(ln)
+        if compact:
+            items.append(compact)
+    if not items:
+        return (
+            f"<div style='border:1px solid {EMAIL_BORDER};border-radius:10px;padding:8px 10px;margin-top:6px;"
+            f"font-size:12px;line-height:1.35;color:{EMAIL_MUTED};background:#fcfdff;'>{html.escape(empty_msg)}</div>"
+        )
+    if list_mode:
+        joined = "".join(f"<li style='margin:0 0 4px 0;'>{it}</li>" for it in items)
+        return (
+            f"<div style='border:1px solid {EMAIL_BORDER};border-radius:10px;padding:8px 10px;margin-top:6px;background:#fcfdff;'>"
+            f"<ul style='margin:0 0 0 16px;padding:0;color:{EMAIL_TEXT};font-size:12px;line-height:1.35;'>{joined}</ul>"
+            "</div>"
+        )
+    joined = "<br>".join(items)
+    return (
+        f"<div style='border:1px solid {EMAIL_BORDER};border-radius:10px;padding:8px 10px;margin-top:6px;"
+        f"font-size:12px;line-height:1.35;color:{EMAIL_TEXT};background:#fcfdff;'>{joined}</div>"
+    )
+
+
 def _styled_raw_report_html(subject: str, body: str) -> str:
     escaped = html.escape(body)
     return f"""
@@ -1340,21 +1401,12 @@ def _build_historical_html(subject: str, body: str) -> str:
         return _styled_raw_report_html(subject, body)
 
     def as_html_block(raw: str) -> str:
-        if not raw:
-            return f"<div style='color:{EMAIL_MUTED};font-size:13px;'>No notable findings in this timeframe.</div>"
-        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-        cards = []
-        for ln in lines[:4]:
-            compact = _compact_email_line(ln)
-            if compact:
-                cards.append(
-                    f"<div style='border:1px solid {EMAIL_BORDER};border-radius:10px;padding:9px 11px;"
-                    f"margin-top:7px;font-size:13px;line-height:1.45;color:{EMAIL_TEXT};background:#fcfdff;'>"
-                    f"{compact}</div>"
-                )
-        if not cards:
-            return f"<div style='color:{EMAIL_MUTED};font-size:13px;'>No notable findings in this timeframe.</div>"
-        return "".join(cards)
+        return _compact_panel(
+            raw,
+            "No notable findings in this timeframe.",
+            max_lines=3,
+            list_mode=True,
+        )
 
     return f"""
 <html>
@@ -1428,22 +1480,7 @@ def _build_persona_html(subject: str, body: str) -> str:
         return _styled_raw_report_html(subject, body)
 
     def as_html_cards(raw: str, empty_msg: str) -> str:
-        if not raw:
-            return f"<div style='color:{EMAIL_MUTED};font-size:13px;'>{empty_msg}</div>"
-        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-        cards = []
-        for ln in lines[:6]:
-            compact = _compact_email_line(ln)
-            if not compact:
-                continue
-            cards.append(
-                f"<div style='border:1px solid {EMAIL_BORDER};border-radius:10px;padding:9px 11px;"
-                f"margin-top:7px;font-size:13px;line-height:1.45;color:{EMAIL_TEXT};background:#fcfdff;'>"
-                f"{compact}</div>"
-            )
-        if not cards:
-            return f"<div style='color:{EMAIL_MUTED};font-size:13px;'>{empty_msg}</div>"
-        return "".join(cards)
+        return _compact_panel(raw, empty_msg, max_lines=3, list_mode=True)
 
     return f"""
 <html>
@@ -1520,22 +1557,7 @@ def _build_brand_archetype_html(subject: str, body: str) -> str:
         return _styled_raw_report_html(subject, body)
 
     def as_html_cards(raw: str, empty_msg: str, max_lines: int = 6) -> str:
-        if not raw:
-            return f"<div style='color:{EMAIL_MUTED};font-size:13px;'>{empty_msg}</div>"
-        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-        cards = []
-        for ln in lines[:max_lines]:
-            compact = _compact_email_line(ln)
-            if not compact:
-                continue
-            cards.append(
-                f"<div style='border:1px solid {EMAIL_BORDER};border-radius:10px;padding:9px 11px;"
-                f"margin-top:7px;font-size:13px;line-height:1.45;color:{EMAIL_TEXT};background:#fcfdff;'>"
-                f"{compact}</div>"
-            )
-        if not cards:
-            return f"<div style='color:{EMAIL_MUTED};font-size:13px;'>{empty_msg}</div>"
-        return "".join(cards)
+        return _compact_panel(raw, empty_msg, max_lines=min(max_lines, 4), list_mode=True)
 
     return f"""
 <html>
@@ -1627,15 +1649,7 @@ def build_email_bodies(subject: str, body: str, report_mode: str = "auto") -> tu
     comp_section = _extract_section(body, "COMPETITIVE WATCH:", [])
 
     def as_html_block(raw: str) -> str:
-        if not raw:
-            return "<div style='color:#667085;'>No material updates in this section.</div>"
-        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-        bullets = []
-        for ln in lines[:5]:
-            compact = _compact_email_line(ln)
-            if compact:
-                bullets.append(f"<li>{compact}</li>")
-        return f"<ul style='margin:8px 0 0 20px;padding:0;color:#101828;'>{''.join(bullets)}</ul>"
+        return _compact_panel(raw, "No material updates in this section.", max_lines=3, list_mode=True)
 
     if not any(s.strip() for s in [people_section, press_section, health_section, comp_section]):
         return body, _styled_raw_report_html(subject, body)
@@ -1680,17 +1694,13 @@ def build_email_bodies(subject: str, body: str, report_mode: str = "auto") -> tu
                 </table>
               </td>
             </tr>
-            <tr>
-              <td style="padding:0 24px 20px 24px;">
-                <div style="font-size:16px;font-weight:700;margin-bottom:8px;">Executive Summary</div>
-                <ul style="margin:0 0 0 20px;padding:0;color:#101828;">
-                  <li>Current sentiment status is <b>{status}</b> with score <b>{score_num}</b>.</li>
-                  <li>Mention volume appears <b>{html.escape(volume_text)}</b> for this cycle.</li>
-                  <li>Use sections below to review user signals, press updates, and product health.</li>
-                </ul>
-              </td>
-            </tr>
-            <tr><td style="padding:0 24px 20px 24px;"><hr style="border:none;border-top:1px solid {EMAIL_BORDER};"></td></tr>
+            <tr><td style="padding:0 24px 14px 24px;">
+              <div style="font-size:12px;color:{EMAIL_MUTED};line-height:1.4;">
+                Status <b style="color:{EMAIL_TEXT};">{status}</b> at score <b style="color:{EMAIL_TEXT};">{score_num}</b> with
+                volume <b style="color:{EMAIL_TEXT};">{html.escape(volume_text)}</b>.
+              </div>
+            </td></tr>
+            <tr><td style="padding:0 24px 16px 24px;"><hr style="border:none;border-top:1px solid {EMAIL_BORDER};"></td></tr>
             <tr>
               <td style="padding:0 24px 16px 24px;">
                 <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
@@ -1798,6 +1808,7 @@ async def send_chunked_message(
 # ─── Scheduled Broadcast ─────────────────────────────────────────────────────
 async def scheduled_sentiment_broadcast(context: ContextTypes.DEFAULT_TYPE):
     global last_report, last_mentions_raw, last_sentiment_score, last_alert_kind
+    tracked = _track_current_task()
     logger.info(f"[{now_est()}] Running scheduled Interac sentiment scan...")
 
     try:
@@ -1857,10 +1868,13 @@ async def scheduled_sentiment_broadcast(context: ContextTypes.DEFAULT_TYPE):
                 subscribed_chats.discard(chat_id)
     except Exception as e:
         logger.error(f"Scheduled job failed: {e}")
+    finally:
+        _untrack_task(tracked)
 
 
 async def scheduled_weekly_email_digest(context: ContextTypes.DEFAULT_TYPE):
     global last_report, last_mentions_raw, last_sentiment_score
+    tracked = _track_current_task()
     now_local = datetime.now(EST)
     target_weekday = WEEKDAY_TO_INDEX.get(EMAIL_WEEKLY_DAY, 0)
     if now_local.weekday() != target_weekday or now_local.hour != EMAIL_WEEKLY_HOUR:
@@ -1889,6 +1903,8 @@ async def scheduled_weekly_email_digest(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Weekly email failed: {send_reason}")
     except Exception as e:
         logger.error(f"Weekly email digest failed: {e}")
+    finally:
+        _untrack_task(tracked)
 
 
 # ─── Command Handlers ────────────────────────────────────────────────────────
@@ -1908,6 +1924,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /email — Admin: run scan + send email now\n"
         "• /deepscan — Admin: historical scan + email\n"
         "• /brandscan — Admin: historical brand archetype scan + email\n"
+        "• /stop — Admin: cancel all running jobs now\n"
         "• /personas — Alias for /scan persona\n"
         "• /smtpcheck — Admin: check SMTP config/login\n"
         "• Any text → Follow-up on latest report",
@@ -1984,6 +2001,7 @@ async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Admin only.")
         return
 
+    tracked = _track_current_task()
     await update.message.reply_text("📧 Running fresh scan and sending email...")
     try:
         # Hard timeout so manual email runs never hang indefinitely.
@@ -2016,6 +2034,8 @@ async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"/email failed: {e}")
         await update.message.reply_text(f"❌ /email failed: {e}")
+    finally:
+        _untrack_task(tracked)
 
 
 async def cmd_deepscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2023,6 +2043,7 @@ async def cmd_deepscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Admin only.")
         return
 
+    tracked = _track_current_task()
     # Run a diagnostic probe first
     diag = await _search_diagnostic()
     await update.message.reply_text(f"🔬 Search diagnostic: {diag}")
@@ -2079,6 +2100,8 @@ async def cmd_deepscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"/deepscan failed: {e}")
         await update.message.reply_text(f"❌ /deepscan failed: {e}")
+    finally:
+        _untrack_task(tracked)
 
 
 async def cmd_brandscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2087,6 +2110,7 @@ async def cmd_brandscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Admin only.")
         return
 
+    tracked = _track_current_task()
     diag = await _search_diagnostic()
     await update.message.reply_text(f"🔬 Search diagnostic: {diag}")
     if diag.startswith("FAIL"):
@@ -2150,6 +2174,18 @@ async def cmd_brandscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"/brandscan failed: {e}")
         await update.message.reply_text(f"❌ /brandscan failed: {e}")
+    finally:
+        _untrack_task(tracked)
+
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    current = asyncio.current_task()
+    cancelled = _cancel_active_tasks(exclude=current)
+    await update.message.reply_text(f"🛑 Stop requested. Cancelled {cancelled} running task(s).")
 
 
 async def cmd_personas(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2214,6 +2250,7 @@ def main():
     app.add_handler(CommandHandler("email", cmd_email))
     app.add_handler(CommandHandler("deepscan", cmd_deepscan))
     app.add_handler(CommandHandler("brandscan", cmd_brandscan))
+    app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("personas", cmd_personas))
     app.add_handler(CommandHandler("smtpcheck", cmd_smtpcheck))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
