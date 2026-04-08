@@ -491,6 +491,91 @@ async def fetch_historical_mentions() -> str:
     return "\n".join(lines)
 
 
+async def fetch_brand_archetype_mentions() -> str:
+    config = load_prompts()
+    brand_queries = config.get("brand_historical_queries", {})
+    max_per = int(config.get("historical_max_mentions_per_source", 10))
+
+    if not brand_queries:
+        return "No brand historical query config found."
+
+    lines = [f"=== BRAND ARCHETYPE HISTORICAL SCAN — {now_est()} ==="]
+    timeframe_counts: dict[str, int] = {}
+    debug_lines: list[str] = []
+
+    for timeframe_key, block in brand_queries.items():
+        label = block.get("label", timeframe_key)
+        tbs = normalize_tbs(block.get("tbs", "qdr:m"))
+        queries = block.get("queries", [])
+        mentions = []
+
+        for query in queries:
+            has_site = _has_site_restriction(query)
+
+            search_results = await web_search(query, "search", max_per, tbs=tbs)
+            for r in search_results:
+                link = r.get("link", "")
+                channel, source = _classify_channel_and_source(link)
+                r["channel"] = channel
+                r["source"] = source if source != "News/Other" else r.get("source", "search")
+                mentions.append(r)
+
+            if not has_site:
+                news_results = await web_search(query, "news", max_per, tbs=tbs)
+                for r in news_results:
+                    r["channel"] = "press"
+                    r["source"] = r.get("source", "News")
+                    mentions.append(r)
+
+                x_results = await search_twitter(query, max_per, tbs=tbs)
+                for r in x_results:
+                    r["channel"] = "people"
+                    r["source"] = "X/Twitter"
+                mentions.extend(x_results)
+                debug_lines.append(
+                    f"  {query[:50]}... → search={len(search_results)} news={len(news_results)} x={len(x_results)}"
+                )
+            else:
+                debug_lines.append(
+                    f"  {query[:50]}... → search={len(search_results)} (site-restricted, skipped news/x)"
+                )
+
+        seen = set()
+        unique = []
+        for m in mentions:
+            link = m.get("link", "")
+            if not link or link in seen:
+                continue
+            seen.add(link)
+            unique.append(m)
+
+        timeframe_counts[label] = len(unique)
+        lines.append(
+            f"\n=== {label} | tbs={tbs or 'ALL TIME'} | mentions={len(unique)} ==="
+        )
+        for i, m in enumerate(unique[:20], 1):
+            platform = m.get("source", "unknown")
+            date_value = m.get("date") or "unknown"
+            url_value = m.get("link", "")
+            snippet = " ".join((m.get("snippet", "") or "").split())[:260]
+            lines.append(
+                f"[B{i}] Platform: {platform} | Date: {date_value} | URL: {url_value} | Snippet: {snippet}"
+            )
+
+    total_mentions = sum(timeframe_counts.values())
+    lines.insert(1, f"TOTAL BRAND HISTORICAL MENTIONS: {total_mentions}")
+    idx = 2
+    for label, count in timeframe_counts.items():
+        lines.insert(idx, f"- {label}: {count}")
+        idx += 1
+
+    logger.info(f"Brand historical scan totals: {timeframe_counts} = {total_mentions}")
+    for dl in debug_lines:
+        logger.info(dl)
+
+    return "\n".join(lines)
+
+
 # ─── Kimi K2.5 Analysis ──────────────────────────────────────────────────────
 async def call_kimi(system_prompt: str, user_content: str) -> str:
     # 8192 token limit total. System prompt ~500 tokens, output ~800 tokens.
@@ -538,6 +623,12 @@ async def analyze_historical(mentions_text: str) -> str:
 async def analyze_personas(mentions_text: str) -> str:
     config = load_prompts()
     prompt = config["persona_prompt"].replace("{timestamp}", now_est())
+    return await call_kimi(prompt, mentions_text)
+
+
+async def analyze_brand_archetypes(mentions_text: str) -> str:
+    config = load_prompts()
+    prompt = config["brand_archetype_prompt"].replace("{timestamp}", now_est())
     return await call_kimi(prompt, mentions_text)
 
 
@@ -1125,17 +1216,94 @@ def _build_persona_html(subject: str, body: str) -> str:
 """.strip()
 
 
+def _build_brand_archetype_html(subject: str, body: str) -> str:
+    timestamp = _extract_report_field(body, "TIMESTAMP")
+    market_snapshot = _extract_section(
+        body,
+        "MARKET SNAPSHOT:",
+        ["ACTIVE BRAND ARCHETYPES:", "COMPETITOR MOVEMENT:", "WHAT CHANGES FOR INTERAC:", "EVIDENCE LOG:"],
+    )
+    archetypes = _extract_section(
+        body,
+        "ACTIVE BRAND ARCHETYPES:",
+        ["COMPETITOR MOVEMENT:", "WHAT CHANGES FOR INTERAC:", "EVIDENCE LOG:"],
+    )
+    movement = _extract_section(
+        body,
+        "COMPETITOR MOVEMENT:",
+        ["WHAT CHANGES FOR INTERAC:", "EVIDENCE LOG:"],
+    )
+    interac_changes = _extract_section(
+        body,
+        "WHAT CHANGES FOR INTERAC:",
+        ["EVIDENCE LOG:"],
+    )
+    evidence_log = _extract_section(body, "EVIDENCE LOG:", [])
+
+    sections = [market_snapshot, archetypes, movement, interac_changes, evidence_log]
+    if not any(s.strip() for s in sections):
+        return _styled_raw_report_html(subject, body)
+
+    def as_html_cards(raw: str, empty_msg: str, max_lines: int = 6) -> str:
+        if not raw:
+            return f"<div style='color:#667085;font-size:13px;'>{empty_msg}</div>"
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        cards = []
+        for ln in lines[:max_lines]:
+            compact = _compact_email_line(ln)
+            if not compact:
+                continue
+            cards.append(
+                "<div style='border:1px solid #eaecf0;border-radius:8px;padding:10px 12px;"
+                "margin-top:8px;font-size:13px;line-height:1.45;color:#101828;'>"
+                f"{compact}</div>"
+            )
+        if not cards:
+            return f"<div style='color:#667085;font-size:13px;'>{empty_msg}</div>"
+        return "".join(cards)
+
+    return f"""
+<html>
+  <body style="margin:0;padding:0;background:#f2f4f7;font-family:Arial,sans-serif;color:#101828;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 0;">
+      <tr><td align="center">
+        <table role="presentation" width="720" cellspacing="0" cellpadding="0" style="background:#ffffff;border-radius:10px;overflow:hidden;border:1px solid #eaecf0;">
+          <tr>
+            <td style="background:#111827;color:#ffffff;padding:18px 24px;">
+              <div style="font-size:22px;font-weight:700;">Interac Intelligence</div>
+              <div style="font-size:13px;color:#d0d5dd;margin-top:4px;">{html.escape(subject)}</div>
+              <div style="font-size:12px;color:#98a2b3;margin-top:6px;">{html.escape(timestamp)}</div>
+            </td>
+          </tr>
+          <tr><td style="padding:18px 24px;"><div style="font-size:15px;font-weight:700;">Market Snapshot</div>{as_html_cards(market_snapshot, "No market snapshot details available.", max_lines=4)}</td></tr>
+          <tr><td style="padding:0 24px 20px 24px;"><hr style="border:none;border-top:1px solid #eaecf0;"></td></tr>
+          <tr><td style="padding:0 24px 16px 24px;"><div style="font-size:15px;font-weight:700;">Active Brand Archetypes</div>{as_html_cards(archetypes, "No active archetypes identified.")}</td></tr>
+          <tr><td style="padding:0 24px 16px 24px;"><div style="font-size:15px;font-weight:700;">Competitor Movement</div>{as_html_cards(movement, "No clear competitor movement identified.")}</td></tr>
+          <tr><td style="padding:0 24px 16px 24px;"><div style="font-size:15px;font-weight:700;">What Changes For Interac</div>{as_html_cards(interac_changes, "No Interac-specific recommendations available.", max_lines=4)}</td></tr>
+          <tr><td style="padding:0 24px 24px 24px;"><div style="font-size:15px;font-weight:700;">Evidence Log</div>{as_html_cards(evidence_log, "No evidence log entries available.", max_lines=8)}</td></tr>
+        </table>
+      </td></tr>
+    </table>
+  </body>
+</html>
+""".strip()
+
+
 def build_email_bodies(subject: str, body: str, report_mode: str = "auto") -> tuple[str, str]:
     resolved_mode = report_mode
     if resolved_mode == "auto":
         if "OVERALL TREND:" in body:
             resolved_mode = "historical"
+        elif "MARKET SNAPSHOT:" in body and "ACTIVE BRAND ARCHETYPES:" in body:
+            resolved_mode = "brand_archetype"
         elif "PRIMARY ARCHETYPES:" in body and "TOP PAIN THEMES:" in body:
             resolved_mode = "persona"
         else:
             resolved_mode = "daily"
     if resolved_mode == "historical":
         return body, _build_historical_html(subject, body)
+    if resolved_mode == "brand_archetype":
+        return body, _build_brand_archetype_html(subject, body)
     if resolved_mode == "persona":
         return body, _build_persona_html(subject, body)
 
@@ -1456,6 +1624,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /status — Check schedule\n"
         "• /email — Admin: run scan + send email now\n"
         "• /deepscan — Admin: historical scan + email\n"
+        "• /brandscan — Admin: historical brand archetype scan + email\n"
         "• /personas — Alias for /scan persona\n"
         "• /smtpcheck — Admin: check SMTP config/login\n"
         "• Any text → Follow-up on latest report",
@@ -1629,6 +1798,70 @@ async def cmd_deepscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ /deepscan failed: {e}")
 
 
+async def cmd_brandscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global last_report, last_mentions_raw
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    diag = await _search_diagnostic()
+    await update.message.reply_text(f"🔬 Search diagnostic: {diag}")
+    if diag.startswith("FAIL"):
+        await update.message.reply_text("❌ Search provider is not working. Fix the issue above before scanning.")
+        return
+
+    await update.message.reply_text("🏷️ Running historical brand archetype scan — fetching data...")
+    _search_errors.clear()
+    try:
+        brand_mentions = await asyncio.wait_for(fetch_brand_archetype_mentions(), timeout=180)
+        last_mentions_raw = brand_mentions
+
+        mention_count = 0
+        for line in brand_mentions.split("\n"):
+            if line.startswith("TOTAL BRAND HISTORICAL MENTIONS:"):
+                try:
+                    mention_count = int(line.split(":")[1].strip())
+                except ValueError:
+                    pass
+                break
+
+        await update.message.reply_text(
+            f"📊 Fetched {mention_count} raw brand mentions. Building archetypes with Kimi..."
+        )
+
+        if _search_errors:
+            unique_errors = list(dict.fromkeys(_search_errors[:5]))
+            err_text = "\n".join(f"• {e[:120]}" for e in unique_errors)
+            await update.message.reply_text(f"⚠️ Search errors encountered:\n{err_text}")
+
+        if mention_count == 0:
+            await update.message.reply_text(
+                "⚠️ Zero mentions found. Raw output:\n\n"
+                + brand_mentions[:1500]
+            )
+            return
+
+        report = await asyncio.wait_for(analyze_brand_archetypes(brand_mentions), timeout=120)
+        last_report = report
+
+        telegram_message = f"🏷️ *Interac Brand Archetype Scan* — {now_est()}\n\n{report}"
+        await send_chunked_message(update, telegram_message, parse_mode="Markdown")
+
+        subject = f"{EMAIL_SUBJECT_PREFIX} — BRAND ARCHETYPE SCAN"
+        email_body = f"Interac Brand Archetype Scan — {now_est()}\n\n{report}"
+        ok, send_reason = send_email(subject, email_body, report_mode="brand_archetype")
+        if ok:
+            _record_email_sent("on_demand")
+            await update.message.reply_text("✅ Brand archetype email sent successfully.")
+        else:
+            await update.message.reply_text(f"❌ Brand archetype email failed: {send_reason}")
+    except asyncio.TimeoutError:
+        await update.message.reply_text("⏱️ /brandscan timed out after 180 seconds.")
+    except Exception as e:
+        logger.error(f"/brandscan failed: {e}")
+        await update.message.reply_text(f"❌ /brandscan failed: {e}")
+
+
 async def cmd_personas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Temporary alias for /scan persona while users transition.
     try:
@@ -1690,6 +1923,7 @@ def main():
     app.add_handler(CommandHandler("prompt", cmd_prompt))
     app.add_handler(CommandHandler("email", cmd_email))
     app.add_handler(CommandHandler("deepscan", cmd_deepscan))
+    app.add_handler(CommandHandler("brandscan", cmd_brandscan))
     app.add_handler(CommandHandler("personas", cmd_personas))
     app.add_handler(CommandHandler("smtpcheck", cmd_smtpcheck))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
