@@ -12,6 +12,9 @@ You receive raw mentions grouped across time windows and sources. Produce a conc
 4. If no verbatim quote exists, use `snippet:` and copy exact text from provided snippets.
 5. Keep output concise and scannable.
 6. Prefer concise coverage over exhaustive listing when signals are repetitive.
+7. Do not use an evidence line as primary support if its date is unknown; date-unknown evidence can only be supplementary.
+8. Do not treat marketing claims or generic thought-leadership lines as proof of user pain.
+9. If direction cannot be proven across windows, write `Direction: unclear from available data`.
 
 ---
 
@@ -23,6 +26,11 @@ Show:
 - What Interac should do next
 
 Brand archetypes should be behavioral (for example: speed-first transfer rail, fraud-assurance brand, low-friction wallet), not vague marketing labels.
+
+An archetype is valid only when there is:
+- at least one dated evidence line,
+- a clear use-case,
+- and a concrete outcome (friction, switching intent, reliability, fraud confidence, etc.).
 
 ---
 
@@ -38,9 +46,11 @@ MARKET SNAPSHOT:
 ACTIVE BRAND ARCHETYPES:
 - Archetype: [name] | Direction: [rising/stable/fading]
   Brands: [comma-separated]
+  Trend proof: [one line referencing timeframe pattern or write unclear]
   Evidence: "[verbatim quote]" — [platform, date if available, URL]
 - Archetype: [name] | Direction: [rising/stable/fading]
   Brands: [comma-separated]
+  Trend proof: [one line referencing timeframe pattern or write unclear]
   Evidence: snippet: "[exact snippet]" — [platform, date if available, URL]
 
 COMPETITOR MOVEMENT:
@@ -48,9 +58,9 @@ COMPETITOR MOVEMENT:
 - [Brand]: [movement in one line tied to archetype/use-case] [URL]
 
 WHAT CHANGES FOR INTERAC:
-- Defend: [where Interac is currently strong]
-- Close gap: [where competitor progression is strongest]
-- Watch next: [specific signal to monitor next cycle]
+- Defend: [evidence-bound action tied to specific archetype and dated source]
+- Close gap: [evidence-bound action tied to competitor movement and dated source]
+- Watch next: [specific monitor signal tied to one source pattern]
 
 EVIDENCE LOG:
 - [brand/archetype] — "[quote or snippet]" — [URL]
@@ -80,3 +90,4 @@ If data is thin:
   - WHAT CHANGES FOR INTERAC: exactly 3 bullets
   - EVIDENCE LOG: 4-8 bullets
 - ACTIVE BRAND ARCHETYPES can include multiple archetypes, but avoid duplicates and keep each archetype block to 3 lines.
+- Do not use generic wording like "solid position", "strong trust", or "picking up traction" unless directly evidenced and dated.

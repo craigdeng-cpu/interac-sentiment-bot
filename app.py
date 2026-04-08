@@ -174,6 +174,57 @@ def _classify_channel_and_source(link: str) -> tuple[str, str]:
     return "press", "News/Other"
 
 
+def _source_quality_tier(link: str, channel: str) -> str:
+    url = (link or "").lower()
+    if channel == "people":
+        return "tier1_user_generated"
+    if any(d in url for d in ["reddit.com", "x.com", "twitter.com", "redflagdeals.com"]):
+        return "tier1_user_generated"
+    if any(
+        d in url
+        for d in [
+            "reuters.com",
+            "bloomberg.com",
+            "cbc.ca",
+            "theglobeandmail.com",
+            "financialpost.com",
+        ]
+    ):
+        return "tier2_reported"
+    return "tier3_commentary_or_unknown"
+
+
+def _detect_brands(text: str) -> str:
+    content = (text or "").lower()
+    brand_order = [
+        ("interac", "Interac"),
+        ("wise", "Wise"),
+        ("paypal", "PayPal"),
+        ("apple pay", "ApplePay"),
+        ("google pay", "GooglePay"),
+        ("samsung pay", "SamsungPay"),
+        ("venmo", "Venmo"),
+        ("cash app", "CashApp"),
+    ]
+    found = [name for token, name in brand_order if token in content]
+    return ", ".join(found) if found else "Unknown"
+
+
+def _detect_use_case(text: str) -> str:
+    content = (text or "").lower()
+    if any(x in content for x in ["cross-border", "outside canada", "international", "remittance"]):
+        return "cross_border_transfer"
+    if any(x in content for x in ["fraud", "scam", "security", "hold", "risk"]):
+        return "fraud_assurance"
+    if any(x in content for x in ["wallet", "apple pay", "google pay", "checkout", "tap"]):
+        return "wallet_or_checkout"
+    if any(x in content for x in ["business", "payroll", "merchant"]):
+        return "business_payment"
+    if any(x in content for x in ["delay", "slow", "instant", "speed", "pending", "transfer"]):
+        return "domestic_transfer_speed"
+    return "general_payments"
+
+
 def _extract_platform_context(link: str) -> dict[str, str]:
     """Extract persona-relevant metadata from mention URLs."""
     url = (link or "").lower()
@@ -574,8 +625,15 @@ async def fetch_brand_archetype_mentions(fetch_budget_seconds: int = 200) -> str
             date_value = m.get("date") or "unknown"
             url_value = m.get("link", "")
             snippet = " ".join((m.get("snippet", "") or "").split())[:260]
+            title_value = " ".join((m.get("title", "") or "").split())[:120]
+            text_blob = f"{title_value} {snippet}".strip()
+            brands = _detect_brands(text_blob)
+            use_case = _detect_use_case(text_blob)
+            quality_tier = _source_quality_tier(url_value, m.get("channel", "press"))
             lines.append(
-                f"[B{i}] Platform: {platform} | Date: {date_value} | URL: {url_value} | Snippet: {snippet}"
+                f"[B{i}] Timeframe: {label} | Platform: {platform} | Date: {date_value} "
+                f"| SourceTier: {quality_tier} | Brands: {brands} | UseCase: {use_case} "
+                f"| URL: {url_value} | Snippet: {snippet}"
             )
 
     total_mentions = sum(timeframe_counts.values())
