@@ -173,6 +173,48 @@ def _classify_channel_and_source(link: str) -> tuple[str, str]:
     return "press", "News/Other"
 
 
+def _extract_platform_context(link: str) -> dict[str, str]:
+    """Extract persona-relevant metadata from mention URLs."""
+    url = (link or "").lower()
+    ctx = {
+        "subreddit": "",
+        "forum_section": "",
+        "platform_demo_hint": "",
+    }
+
+    subreddit_match = re.search(r"reddit\.com/r/([a-z0-9_]+)", url)
+    if subreddit_match:
+        subreddit = subreddit_match.group(1)
+        subreddit_hints = {
+            "personalfinancecanada": "personal finance consumer, likely 25-45",
+            "canadianinvestor": "investor, likely 30-55",
+            "canada": "general Canadian public",
+            "ontario": "Ontario resident",
+        }
+        ctx["subreddit"] = subreddit
+        ctx["platform_demo_hint"] = subreddit_hints.get(
+            subreddit,
+            "Reddit community user, likely detail-oriented and price-sensitive",
+        )
+        return ctx
+
+    if "redflagdeals.com" in url:
+        ctx["forum_section"] = "RedFlagDeals"
+        ctx["platform_demo_hint"] = "deal-seeking consumer, budget-conscious, likely 25-45"
+        return ctx
+
+    if "x.com" in url or "twitter.com" in url:
+        ctx["forum_section"] = "X/Twitter"
+        ctx["platform_demo_hint"] = "social media user, skews 20-40, more reactive"
+        return ctx
+
+    if "forum" in url or "community" in url:
+        ctx["forum_section"] = "Forum/Community"
+        ctx["platform_demo_hint"] = "community forum user, likely troubleshooting-focused"
+
+    return ctx
+
+
 def _tbs_to_timelimit(tbs: str) -> str | None:
     mapping = {"qdr:d": "d", "qdr:w": "w", "qdr:m": "m", "qdr:y": "y"}
     return mapping.get(tbs) if tbs else None
@@ -266,6 +308,7 @@ async def fetch_all_mentions() -> str:
             for r in results:
                 r["category"] = category
                 r["channel"] = "press"
+                r["platform_context"] = _extract_platform_context(r.get("link", ""))
             press_mentions.extend(results)
 
         # Reddit / forums (people)
@@ -273,6 +316,7 @@ async def fetch_all_mentions() -> str:
             results = await web_search(query, "search", max_per, tbs=tbs)
             for r in results:
                 r["category"] = category
+                r["platform_context"] = _extract_platform_context(r.get("link", ""))
                 # Classify by domain
                 link = r.get("link", "")
                 if "reddit.com" in link:
@@ -292,6 +336,7 @@ async def fetch_all_mentions() -> str:
             for r in results:
                 r["category"] = category
                 r["channel"] = "people"
+                r["platform_context"] = _extract_platform_context(r.get("link", ""))
             people_mentions.extend(results)
 
     # Deduplicate each pool
@@ -318,13 +363,41 @@ async def fetch_all_mentions() -> str:
         lines.append("=== PEOPLE (Reddit, X, RFD) ===")
         for i, m in enumerate(people_mentions[:15], 1):
             date_str = f" ({m['date']})" if m.get("date") else ""
-            lines.append(f"[P{i}] {m['title']} | {m['source']}{date_str}\n  {m['snippet'][:150]}\n  {m['link']}")
+            platform_context = m.get("platform_context", {})
+            source_label = m.get("source", "unknown")
+            if platform_context.get("subreddit"):
+                source_label = f"{source_label} (r/{platform_context['subreddit']})"
+            elif platform_context.get("forum_section"):
+                source_label = f"{source_label} ({platform_context['forum_section']})"
+
+            context_line = platform_context.get("platform_demo_hint", "")
+            snippet = m.get("snippet", "")[:150]
+            row = f"[P{i}] {m['title']} | {source_label}{date_str}\n  {snippet}\n  {m['link']}"
+            if context_line:
+                row = (
+                    f"[P{i}] {m['title']} | {source_label}{date_str}\n"
+                    f"  Context: {context_line}\n"
+                    f"  {snippet}\n"
+                    f"  {m['link']}"
+                )
+            lines.append(row)
 
     if press_mentions:
         lines.append("\n=== PRESS ===")
         for i, m in enumerate(press_mentions[:10], 1):
             date_str = f" ({m['date']})" if m.get("date") else ""
-            lines.append(f"[N{i}] {m['title']} | {m['source']}{date_str}\n  {m['snippet'][:150]}\n  {m['link']}")
+            platform_context = m.get("platform_context", {})
+            context_line = platform_context.get("platform_demo_hint", "")
+            snippet = m.get("snippet", "")[:150]
+            row = f"[N{i}] {m['title']} | {m['source']}{date_str}\n  {snippet}\n  {m['link']}"
+            if context_line:
+                row = (
+                    f"[N{i}] {m['title']} | {m['source']}{date_str}\n"
+                    f"  Context: {context_line}\n"
+                    f"  {snippet}\n"
+                    f"  {m['link']}"
+                )
+            lines.append(row)
 
     return "\n".join(lines)
 
@@ -460,6 +533,62 @@ async def analyze_historical(mentions_text: str) -> str:
     config = load_prompts()
     prompt = config["historical_prompt"].replace("{timestamp}", now_est())
     return await call_kimi(prompt, mentions_text)
+
+
+async def analyze_personas(mentions_text: str) -> str:
+    config = load_prompts()
+    prompt = config["persona_prompt"].replace("{timestamp}", now_est())
+    return await call_kimi(prompt, mentions_text)
+
+
+async def analyze_scan(mentions_text: str, mode: str) -> str:
+    if mode == "persona":
+        return await analyze_personas(mentions_text)
+    return await analyze_sentiment(mentions_text)
+
+
+def parse_scan_mode(args: list[str]) -> tuple[str, str | None]:
+    if not args:
+        return "signal", None
+    if len(args) > 1:
+        return "", "Usage: /scan [signal|persona]"
+    mode = args[0].strip().lower()
+    if mode in {"signal", "persona"}:
+        return mode, None
+    return "", "Usage: /scan [signal|persona]"
+
+
+async def run_scan_mode(update: Update, mode: str) -> None:
+    global last_report, last_mentions_raw, last_sentiment_score
+
+    scan_label = "persona" if mode == "persona" else "signal"
+    await update.message.reply_text(
+        f"🔍 Running {scan_label} scan on Reddit, X, RedFlagDeals, news..."
+    )
+
+    mentions = await asyncio.wait_for(fetch_all_mentions(), timeout=120)
+    last_mentions_raw = mentions
+    report = await asyncio.wait_for(analyze_scan(mentions, mode), timeout=120)
+    last_report = report
+
+    if mode == "persona":
+        await send_chunked_message(
+            update,
+            f"🧠 *Interac Persona Scan* — {now_est()}\n\n{report}",
+            parse_mode="Markdown",
+        )
+        return
+
+    score = extract_sentiment_score(report)
+    last_sentiment_score = score
+    config = load_prompts()
+    threshold = config.get("alert_threshold", 35)
+    alert_prefix = f"🚨 *ALERT: Sentiment {score}/100* 🚨\n\n" if score < threshold else ""
+    await send_chunked_message(
+        update,
+        f"{alert_prefix}📊 *Interac Intelligence* — {now_est()}\n\n{report}",
+        parse_mode="Markdown",
+    )
 
 
 def extract_sentiment_score(report: str) -> int:
@@ -920,12 +1049,95 @@ def _build_historical_html(subject: str, body: str) -> str:
 """.strip()
 
 
+def _build_persona_html(subject: str, body: str) -> str:
+    timestamp = _extract_report_field(body, "TIMESTAMP")
+    data_quality = _extract_report_field(body, "DATA QUALITY")
+    archetypes = _extract_section(
+        body,
+        "PRIMARY ARCHETYPES:",
+        ["TOP PAIN THEMES:", "FI/SEGMENT SIGNALS:", "FOCUS RECOMMENDATION:"],
+    )
+    pain_themes = _extract_section(
+        body,
+        "TOP PAIN THEMES:",
+        ["FI/SEGMENT SIGNALS:", "FOCUS RECOMMENDATION:"],
+    )
+    fi_signals = _extract_section(
+        body,
+        "FI/SEGMENT SIGNALS:",
+        ["FOCUS RECOMMENDATION:"],
+    )
+    recommendation = _extract_section(body, "FOCUS RECOMMENDATION:", [])
+
+    sections = [archetypes, pain_themes, fi_signals, recommendation]
+    if not any(s.strip() for s in sections):
+        return _styled_raw_report_html(subject, body)
+
+    def as_html_cards(raw: str, empty_msg: str) -> str:
+        if not raw:
+            return f"<div style='color:#667085;font-size:13px;'>{empty_msg}</div>"
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        cards = []
+        for ln in lines[:6]:
+            compact = _compact_email_line(ln)
+            if not compact:
+                continue
+            cards.append(
+                "<div style='border:1px solid #eaecf0;border-radius:8px;padding:10px 12px;"
+                "margin-top:8px;font-size:13px;line-height:1.45;color:#101828;'>"
+                f"{compact}</div>"
+            )
+        if not cards:
+            return f"<div style='color:#667085;font-size:13px;'>{empty_msg}</div>"
+        return "".join(cards)
+
+    return f"""
+<html>
+  <body style="margin:0;padding:0;background:#f2f4f7;font-family:Arial,sans-serif;color:#101828;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 0;">
+      <tr><td align="center">
+        <table role="presentation" width="720" cellspacing="0" cellpadding="0" style="background:#ffffff;border-radius:10px;overflow:hidden;border:1px solid #eaecf0;">
+          <tr>
+            <td style="background:#111827;color:#ffffff;padding:18px 24px;">
+              <div style="font-size:22px;font-weight:700;">Interac Intelligence</div>
+              <div style="font-size:13px;color:#d0d5dd;margin-top:4px;">{html.escape(subject)}</div>
+              <div style="font-size:12px;color:#98a2b3;margin-top:6px;">{html.escape(timestamp)}</div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:18px 24px;">
+              <div style="border:1px solid #dbe7ff;background:#f5f8ff;border-radius:8px;padding:12px 14px;">
+                <div style="font-size:12px;color:#475467;">Data Quality</div>
+                <div style="font-size:14px;font-weight:600;line-height:1.45;">{html.escape(data_quality)}</div>
+              </div>
+            </td>
+          </tr>
+          <tr><td style="padding:0 24px 20px 24px;"><hr style="border:none;border-top:1px solid #eaecf0;"></td></tr>
+          <tr><td style="padding:0 24px 16px 24px;"><div style="font-size:15px;font-weight:700;">Primary Archetypes</div>{as_html_cards(archetypes, "No clear archetypes identified.")}</td></tr>
+          <tr><td style="padding:0 24px 16px 24px;"><div style="font-size:15px;font-weight:700;">Top Pain Themes</div>{as_html_cards(pain_themes, "No repeated pain themes identified.")}</td></tr>
+          <tr><td style="padding:0 24px 16px 24px;"><div style="font-size:15px;font-weight:700;">FI / Segment Signals</div>{as_html_cards(fi_signals, "No FI-specific segment signal identified.")}</td></tr>
+          <tr><td style="padding:0 24px 24px 24px;"><div style="font-size:15px;font-weight:700;">Focus Recommendation</div>{as_html_cards(recommendation, "No recommendation provided.")}</td></tr>
+        </table>
+      </td></tr>
+    </table>
+  </body>
+</html>
+""".strip()
+
+
 def build_email_bodies(subject: str, body: str, report_mode: str = "auto") -> tuple[str, str]:
     resolved_mode = report_mode
     if resolved_mode == "auto":
-        resolved_mode = "historical" if "OVERALL TREND:" in body else "daily"
+        if "OVERALL TREND:" in body:
+            resolved_mode = "historical"
+        elif "PRIMARY ARCHETYPES:" in body and "TOP PAIN THEMES:" in body:
+            resolved_mode = "persona"
+        else:
+            resolved_mode = "daily"
     if resolved_mode == "historical":
         return body, _build_historical_html(subject, body)
+    if resolved_mode == "persona":
+        return body, _build_persona_html(subject, body)
 
     score_text = _extract_report_field(body, "SENTIMENT SCORE")
     volume_text = _extract_report_field(body, "MENTION VOLUME")
@@ -1140,7 +1352,7 @@ async def scheduled_sentiment_broadcast(context: ContextTypes.DEFAULT_TYPE):
     try:
         mentions = await fetch_all_mentions()
         last_mentions_raw = mentions
-        report = await analyze_sentiment(mentions)
+        report = await analyze_scan(mentions, "signal")
         last_report = report
 
         score = extract_sentiment_score(report)
@@ -1212,7 +1424,7 @@ async def scheduled_weekly_email_digest(context: ContextTypes.DEFAULT_TYPE):
     try:
         mentions = await fetch_all_mentions()
         last_mentions_raw = mentions
-        report = await analyze_sentiment(mentions)
+        report = await analyze_scan(mentions, "signal")
         last_report = report
         score = extract_sentiment_score(report)
         last_sentiment_score = score
@@ -1237,12 +1449,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Commands:*\n"
         "• /subscribe — Get scheduled reports\n"
         "• /unsubscribe — Stop reports\n"
-        "• /scan — Run a scan now\n"
+        "• /scan — Run signal scan now\n"
+        "• /scan persona — Run persona-first scan now\n"
         "• /raw — See raw mentions from last scan\n"
         "• /prompt — View current config\n"
         "• /status — Check schedule\n"
         "• /email — Admin: run scan + send email now\n"
         "• /deepscan — Admin: historical scan + email\n"
+        "• /personas — Alias for /scan persona\n"
         "• /smtpcheck — Admin: check SMTP config/login\n"
         "• Any text → Follow-up on latest report",
         parse_mode="Markdown",
@@ -1276,26 +1490,14 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global last_report, last_mentions_raw, last_sentiment_score
-    await update.message.reply_text("🔍 Scanning Reddit, X, RedFlagDeals, news...")
-
+    mode, error = parse_scan_mode(context.args)
+    if error:
+        await update.message.reply_text(error)
+        return
     try:
-        mentions = await fetch_all_mentions()
-        last_mentions_raw = mentions
-        report = await analyze_sentiment(mentions)
-        last_report = report
-
-        score = extract_sentiment_score(report)
-        last_sentiment_score = score
-
-        config = load_prompts()
-        threshold = config.get("alert_threshold", 35)
-        alert_prefix = f"🚨 *ALERT: Sentiment {score}/100* 🚨\n\n" if score < threshold else ""
-
-        await update.message.reply_text(
-            f"{alert_prefix}📊 *Interac Intelligence* — {now_est()}\n\n{report}",
-            parse_mode="Markdown",
-        )
+        await run_scan_mode(update, mode)
+    except asyncio.TimeoutError:
+        await update.message.reply_text("⏱️ /scan timed out after 120 seconds.")
     except Exception as e:
         logger.error(f"Scan failed: {e}")
         await update.message.reply_text(f"❌ Scan failed: {e}")
@@ -1335,7 +1537,7 @@ async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Hard timeout so manual email runs never hang indefinitely.
         mentions = await asyncio.wait_for(fetch_all_mentions(), timeout=120)
         last_mentions_raw = mentions
-        report = await asyncio.wait_for(analyze_sentiment(mentions), timeout=120)
+        report = await asyncio.wait_for(analyze_scan(mentions, "signal"), timeout=120)
         last_report = report
 
         score = extract_sentiment_score(report)
@@ -1427,6 +1629,17 @@ async def cmd_deepscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ /deepscan failed: {e}")
 
 
+async def cmd_personas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Temporary alias for /scan persona while users transition.
+    try:
+        await run_scan_mode(update, "persona")
+    except asyncio.TimeoutError:
+        await update.message.reply_text("⏱️ /personas timed out after 120 seconds.")
+    except Exception as e:
+        logger.error(f"/personas failed: {e}")
+        await update.message.reply_text(f"❌ /personas failed: {e}")
+
+
 async def cmd_smtpcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Admin only.")
@@ -1477,6 +1690,7 @@ def main():
     app.add_handler(CommandHandler("prompt", cmd_prompt))
     app.add_handler(CommandHandler("email", cmd_email))
     app.add_handler(CommandHandler("deepscan", cmd_deepscan))
+    app.add_handler(CommandHandler("personas", cmd_personas))
     app.add_handler(CommandHandler("smtpcheck", cmd_smtpcheck))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 

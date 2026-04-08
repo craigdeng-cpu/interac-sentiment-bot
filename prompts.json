@@ -47,7 +47,8 @@
   "prompt_files": {
     "analysis_prompt": "prompts/analysis_prompt.md",
     "followup_prompt": "prompts/followup_prompt.md",
-    "historical_prompt": "prompts/historical_prompt.md"
+    "historical_prompt": "prompts/historical_prompt.md",
+    "persona_prompt": "prompts/persona_prompt.md"
   },
   "historical_queries": {
     "recent_1mo": {
