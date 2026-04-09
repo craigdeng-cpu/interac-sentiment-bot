@@ -898,6 +898,74 @@ async def fetch_brand_archetype_mentions(fetch_budget_seconds: int = 200) -> str
     return "\n".join(lines)
 
 
+async def fetch_biweekly_mentions() -> str:
+    """Fetch mentions for the universal biweekly scan. Social-first, 1-month lookback."""
+    config = load_prompts()
+    queries = config.get("biweekly_queries", [])
+    max_per = 5
+    tbs = "qdr:m"  # 1-month window to collect enough data for a biweekly report
+
+    all_mentions: list[dict] = []
+    seen_links: set[str] = set()
+
+    for query in queries:
+        # Web search (catches Reddit, RFD, forums, news)
+        results = await web_search(query, "search", max_per, tbs=tbs)
+        for r in results:
+            link = r.get("link", "")
+            if link and link not in seen_links:
+                seen_links.add(link)
+                channel, source = _classify_channel_and_source(link)
+                r["channel"] = channel
+                r["source"] = source if source != "News/Other" else r.get("source", "search")
+                all_mentions.append(r)
+
+        # X/Twitter
+        if not _has_site_restriction(query):
+            x_results = await search_twitter(query, max_per, tbs=tbs)
+            for r in x_results:
+                link = r.get("link", "")
+                if link and link not in seen_links:
+                    seen_links.add(link)
+                    r["channel"] = "people"
+                    r["source"] = "X/Twitter"
+                    all_mentions.append(r)
+
+    if not all_mentions:
+        return "No mentions found in the past month."
+
+    people = [m for m in all_mentions if m.get("channel") == "people"]
+    press = [m for m in all_mentions if m.get("channel") != "people"]
+
+    lines = [f"=== INTERAC BIWEEKLY SCAN — {now_est()} ==="]
+    lines.append(f"Total: {len(all_mentions)} unique mentions ({len(people)} social, {len(press)} press)")
+    lines.append("")
+
+    if people:
+        lines.append("=== SOCIAL / PEOPLE ===")
+        for i, m in enumerate(people[:20], 1):
+            date_str = f" ({m['date']})" if m.get("date") else ""
+            snippet = " ".join((m.get("snippet", "") or "").split())[:300]
+            lines.append(f"[S{i}] {m.get('source', 'unknown')}{date_str}")
+            lines.append(f"  Title: {m.get('title', '')[:120]}")
+            lines.append(f"  Snippet: {snippet}")
+            lines.append(f"  URL: {m.get('link', '')}")
+            lines.append("")
+
+    if press:
+        lines.append("=== NEWS / PRESS ===")
+        for i, m in enumerate(press[:10], 1):
+            date_str = f" ({m['date']})" if m.get("date") else ""
+            snippet = " ".join((m.get("snippet", "") or "").split())[:200]
+            lines.append(f"[N{i}] {m.get('source', 'unknown')}{date_str}")
+            lines.append(f"  Title: {m.get('title', '')[:120]}")
+            lines.append(f"  Snippet: {snippet}")
+            lines.append(f"  URL: {m.get('link', '')}")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
 # ─── Kimi K2.5 Analysis ──────────────────────────────────────────────────────
 async def call_kimi(system_prompt: str, user_content: str) -> str:
     # 8192 token limit total. System prompt ~500 tokens, output ~800 tokens.
@@ -955,6 +1023,35 @@ async def analyze_brand_archetypes(mentions_text: str) -> str:
     return _postprocess_brandscan_report(raw_report)
 
 
+async def analyze_biweekly(mentions_text: str) -> str:
+    """Run the universal biweekly scan analysis, inject prior memory for trend tracking."""
+    config = load_prompts()
+    prompt = config["biweekly_prompt"].replace("{timestamp}", now_est())
+
+    # Inject previous scan context so the LLM can populate Trend vs Last Scan
+    prev_memory = _load_biweekly_memory()
+    user_content = mentions_text
+    if prev_memory.get("last_scan_date"):
+        etransfer_themes = "; ".join(prev_memory.get("etransfer_themes", [])) or "none on record"
+        competitor_themes = "; ".join(prev_memory.get("competitor_themes", [])) or "none on record"
+        user_content += (
+            f"\n\n--- PREVIOUS SCAN CONTEXT (for Trend vs Last Scan section) ---\n"
+            f"Last scan date: {prev_memory['last_scan_date']}\n"
+            f"e-Transfer themes from last scan: {etransfer_themes}\n"
+            f"Competitor themes from last scan: {competitor_themes}\n"
+        )
+
+    report = await call_kimi(prompt, user_content)
+
+    # Persist memory and Excel after a successful analysis
+    scan_date = now_est()
+    themes = _extract_biweekly_themes(report)
+    _save_biweekly_memory(themes, scan_date)
+    _append_biweekly_excel(scan_date, report)
+
+    return report
+
+
 async def analyze_scan(mentions_text: str, mode: str) -> str:
     if mode == "persona":
         return await analyze_personas(mentions_text)
@@ -1004,6 +1101,33 @@ async def run_scan_mode(update: Update, mode: str) -> None:
             update,
             f"{alert_prefix}📊 *Interac Intelligence* — {now_est()}\n\n{report}",
             parse_mode="Markdown",
+        )
+    finally:
+        _untrack_task(tracked)
+
+
+async def run_biweekly_scan(update: Update) -> None:
+    """Run the universal biweekly e-Transfer intelligence scan and deliver to Telegram."""
+    global last_report, last_mentions_raw
+    tracked = _track_current_task()
+    try:
+        await update.message.reply_text(
+            "Running biweekly e-Transfer intelligence scan (Reddit, X, RedFlagDeals, news)..."
+        )
+        mentions = await asyncio.wait_for(fetch_biweekly_mentions(), timeout=180)
+        last_mentions_raw = mentions
+
+        if mentions.startswith("No mentions"):
+            await update.message.reply_text(f"No data found this scan.\n\n{mentions[:500]}")
+            return
+
+        await update.message.reply_text("Mentions collected. Analyzing with Kimi...")
+        report = await asyncio.wait_for(analyze_biweekly(mentions), timeout=120)
+        last_report = report
+
+        await send_chunked_message(
+            update,
+            f"Interac e-Transfer Intelligence — {now_est()}\n\n{report}",
         )
     finally:
         _untrack_task(tracked)
@@ -1374,6 +1498,8 @@ EMAIL_MUTED = "#667085"
 EMAIL_ACCENT = "#175CD3"
 EMAIL_CONTAINER_WIDTH = "920"
 BRANDSCAN_STATE_PATH = Path(__file__).parent / "state" / "brandscan_snapshot.json"
+BIWEEKLY_MEMORY_PATH = Path(__file__).parent / "state" / "biweekly_memory.json"
+BIWEEKLY_EXCEL_PATH = Path(__file__).parent / "state" / "biweekly_reports.xlsx"
 
 
 def _compact_panel(raw: str, empty_msg: str, *, max_lines: int = 3, list_mode: bool = True) -> str:
@@ -1490,6 +1616,82 @@ def _save_brandscan_snapshot(claims: dict[str, str], timestamp: str) -> None:
         BRANDSCAN_STATE_PATH.write_text(json.dumps({"claims": claims, "timestamp": timestamp}, indent=2))
     except Exception as e:
         logger.warning(f"Could not save brandscan snapshot: {e}")
+
+
+def _load_biweekly_memory() -> dict:
+    try:
+        if not BIWEEKLY_MEMORY_PATH.exists():
+            return {}
+        return json.loads(BIWEEKLY_MEMORY_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def _save_biweekly_memory(themes: dict, scan_date: str) -> None:
+    try:
+        BIWEEKLY_MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "last_scan_date": scan_date,
+            "etransfer_themes": themes.get("etransfer_themes", []),
+            "competitor_themes": themes.get("competitor_themes", []),
+        }
+        BIWEEKLY_MEMORY_PATH.write_text(json.dumps(data, indent=2))
+    except Exception as e:
+        logger.warning(f"Could not save biweekly memory: {e}")
+
+
+def _extract_biweekly_themes(report: str) -> dict:
+    """Extract short theme labels from biweekly report sections for memory storage."""
+    etransfer_raw = _extract_section(report, "e-Transfer Chatter:", ["Competitor Landscape:", "Trend vs Last Scan:"])
+    competitor_raw = _extract_section(report, "Competitor Landscape:", ["Trend vs Last Scan:"])
+
+    def _bullets_to_themes(section_text: str) -> list[str]:
+        themes = []
+        for line in (section_text or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("- ") and "Nothing notable" not in stripped:
+                theme = stripped[2:].strip()[:80]
+                if theme:
+                    themes.append(theme)
+        return themes[:6]
+
+    return {
+        "etransfer_themes": _bullets_to_themes(etransfer_raw),
+        "competitor_themes": _bullets_to_themes(competitor_raw),
+    }
+
+
+def _append_biweekly_excel(scan_date: str, report: str) -> None:
+    """Append biweekly report sections to Excel file for human review."""
+    try:
+        from openpyxl import Workbook, load_workbook
+
+        etransfer_raw = _extract_section(report, "e-Transfer Chatter:", ["Competitor Landscape:", "Trend vs Last Scan:"])
+        competitor_raw = _extract_section(report, "Competitor Landscape:", ["Trend vs Last Scan:"])
+        trend_raw = _extract_section(report, "Trend vs Last Scan:", [])
+
+        BIWEEKLY_EXCEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+        if BIWEEKLY_EXCEL_PATH.exists():
+            wb = load_workbook(BIWEEKLY_EXCEL_PATH)
+            ws = wb.active
+        else:
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Biweekly Reports"
+            ws.append(["Scan Date", "e-Transfer Chatter", "Competitor Landscape", "Trend vs Last Scan", "Full Report"])
+
+        ws.append([
+            scan_date,
+            (etransfer_raw or "").strip(),
+            (competitor_raw or "").strip(),
+            (trend_raw or "").strip(),
+            report.strip(),
+        ])
+        wb.save(BIWEEKLY_EXCEL_PATH)
+        logger.info(f"Appended biweekly report to {BIWEEKLY_EXCEL_PATH}")
+    except Exception as e:
+        logger.warning(f"Could not append to Excel: {e}")
 
 
 def _build_change_lines(current_claims: dict[str, str], previous_claims: dict[str, str]) -> list[str]:
@@ -1901,10 +2103,57 @@ def _build_brand_archetype_html(subject: str, body: str) -> str:
 """.strip()
 
 
+def _build_biweekly_html(subject: str, body: str) -> str:
+    scan_date = _extract_report_field(body, "SCAN DATE")
+    etransfer_raw = _extract_section(body, "e-Transfer Chatter:", ["Competitor Landscape:", "Trend vs Last Scan:"])
+    competitor_raw = _extract_section(body, "Competitor Landscape:", ["Trend vs Last Scan:"])
+    trend_raw = _extract_section(body, "Trend vs Last Scan:", [])
+
+    if not any(s.strip() for s in [etransfer_raw, competitor_raw, trend_raw]):
+        return _styled_raw_report_html(subject, body)
+
+    def as_block(raw: str) -> str:
+        return _compact_panel(raw, "Nothing notable this scan.", max_lines=8, list_mode=True)
+
+    return f"""
+<html>
+  <body style="margin:0;padding:0;background:{EMAIL_PAGE_BG};font-family:{EMAIL_FONT_STACK};color:{EMAIL_TEXT};">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 0;">
+      <tr><td align="center">
+        <table role="presentation" width="{EMAIL_CONTAINER_WIDTH}" cellspacing="0" cellpadding="0" style="background:{EMAIL_CARD_BG};border-radius:14px;overflow:hidden;border:1px solid {EMAIL_BORDER};">
+          <tr>
+            <td style="background:{EMAIL_NAVY};color:#ffffff;padding:18px 24px;border-bottom:4px solid #fdb913;">
+              <div style="font-size:24px;font-weight:700;letter-spacing:0.2px;">Interac Intelligence</div>
+              <div style="font-size:13px;color:#d8def0;margin-top:6px;">{html.escape(subject)}</div>
+              <div style="font-size:13px;color:#aebce2;margin-top:6px;">{html.escape(scan_date)}</div>
+            </td>
+          </tr>
+          <tr><td style="padding:20px 24px 8px 24px;">
+            <div style="font-size:15px;font-weight:700;margin-bottom:6px;">e-Transfer Chatter</div>
+            {as_block(etransfer_raw)}
+          </td></tr>
+          <tr><td style="padding:8px 24px;">
+            <div style="font-size:15px;font-weight:700;margin-bottom:6px;">Competitor Landscape</div>
+            {as_block(competitor_raw)}
+          </td></tr>
+          <tr><td style="padding:8px 24px 24px 24px;">
+            <div style="font-size:15px;font-weight:700;margin-bottom:6px;">Trend vs Last Scan</div>
+            {as_block(trend_raw)}
+          </td></tr>
+        </table>
+      </td></tr>
+    </table>
+  </body>
+</html>
+""".strip()
+
+
 def build_email_bodies(subject: str, body: str, report_mode: str = "auto") -> tuple[str, str]:
     resolved_mode = report_mode
     if resolved_mode == "auto":
-        if "OVERALL TREND:" in body:
+        if "e-Transfer Chatter:" in body and "Competitor Landscape:" in body:
+            resolved_mode = "biweekly"
+        elif "OVERALL TREND:" in body:
             resolved_mode = "historical"
         elif "MARKET SNAPSHOT:" in body and "ACTIVE BRAND ARCHETYPES:" in body:
             resolved_mode = "brand_archetype"
@@ -1912,6 +2161,8 @@ def build_email_bodies(subject: str, body: str, report_mode: str = "auto") -> tu
             resolved_mode = "persona"
         else:
             resolved_mode = "daily"
+    if resolved_mode == "biweekly":
+        return body, _build_biweekly_html(subject, body)
     if resolved_mode == "historical":
         return body, _build_historical_html(subject, body)
     if resolved_mode == "brand_archetype":
@@ -2210,26 +2461,76 @@ async def scheduled_weekly_email_digest(context: ContextTypes.DEFAULT_TYPE):
         _untrack_task(tracked)
 
 
+async def scheduled_biweekly_broadcast(context: ContextTypes.DEFAULT_TYPE):
+    """Daily job that runs the biweekly scan if 14+ days have passed since the last one."""
+    global last_report, last_mentions_raw
+
+    memory = _load_biweekly_memory()
+    last_date_str = memory.get("last_scan_date")
+    if last_date_str:
+        try:
+            last_date = datetime.fromisoformat(last_date_str)
+            if not last_date.tzinfo:
+                last_date = last_date.replace(tzinfo=EST)
+            days_since = (datetime.now(EST) - last_date).days
+            if days_since < 14:
+                logger.info(f"Biweekly scan skipped: {days_since} days since last scan (need 14).")
+                return
+        except Exception as e:
+            logger.warning(f"Could not parse last_scan_date for biweekly guard: {e}")
+
+    tracked = _track_current_task()
+    logger.info(f"[{now_est()}] Running scheduled biweekly scan...")
+    try:
+        mentions = await fetch_biweekly_mentions()
+        last_mentions_raw = mentions
+        report = await analyze_biweekly(mentions)
+        last_report = report
+
+        message = f"Interac e-Transfer Intelligence — {now_est()}\n\n{report}"
+        for chat_id in subscribed_chats.copy():
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=message)
+            except Exception as e:
+                logger.error(f"Failed to send biweekly report to {chat_id}: {e}")
+                subscribed_chats.discard(chat_id)
+
+        now_local = datetime.now(EST)
+        should_send, reason = _should_send_email(trigger="weekly", now_local=now_local)
+        if should_send:
+            subject = f"{EMAIL_SUBJECT_PREFIX} — BIWEEKLY REPORT"
+            ok, send_reason = send_email(subject, f"Interac e-Transfer Intelligence — {now_est()}\n\n{report}", report_mode="biweekly")
+            if ok:
+                _record_email_sent("weekly", now_local=now_local)
+            else:
+                logger.error(f"Biweekly email failed: {send_reason}")
+        else:
+            logger.info(f"Biweekly email not sent: {reason}")
+    except Exception as e:
+        logger.error(f"Scheduled biweekly scan failed: {e}")
+    finally:
+        _untrack_task(tracked)
+
+
 # ─── Command Handlers ────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     subscribed_chats.add(update.effective_chat.id)
     await update.message.reply_text(
         "👋 *Interac Intelligence Bot*\n\n"
-        "Scans Reddit, X, RedFlagDeals, and news for Interac signals 4x/day.\n\n"
+        "Scans Reddit, X, RedFlagDeals, and news for e-Transfer chatter. "
+        "Biweekly report delivered automatically.\n\n"
         "*Commands:*\n"
-        "• /subscribe — Get scheduled reports\n"
+        "• /subscribe — Get scheduled biweekly reports\n"
         "• /unsubscribe — Stop reports\n"
-        "• /scan — Run signal scan now\n"
-        "• /scan persona — Run persona-first scan now\n"
+        "• /scan — Run biweekly scan now\n"
         "• /raw — See raw mentions from last scan\n"
         "• /prompt — View current config\n"
-        "• /status — Check schedule\n"
+        "• /status — Check bot status\n"
         "• /email — Admin: run scan + send email now\n"
-        "• /deepscan — Admin: historical scan + email\n"
-        "• /brandscan — Admin: historical brand archetype scan + email\n"
-        "• /stop — Admin: cancel all running jobs now\n"
-        "• /personas — Alias for /scan persona\n"
-        "• /smtpcheck — Admin: check SMTP config/login\n"
+        "• /deepscan — Admin: historical deep scan\n"
+        "• /brandscan — Admin: brand archetype scan\n"
+        "• /stop — Admin: cancel running jobs\n"
+        "• /smtpcheck — Admin: check email config\n"
         "• Any text → Follow-up on latest report",
         parse_mode="Markdown",
     )
@@ -2247,29 +2548,27 @@ async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config = load_prompts()
-    q_count = sum(len(v) for v in config["data_queries"].values())
+    biweekly_q_count = len(config.get("biweekly_queries", []))
+    memory = _load_biweekly_memory()
+    last_scan = memory.get("last_scan_date", "never")
     is_admin = "✅" if update.effective_user.id in ADMIN_IDS else "❌"
     await update.message.reply_text(
         f"✅ Bot running — {now_est()}\n"
         f"Search provider: DuckDuckGo (ddgs)\n"
-        f"Active queries: {q_count}\n"
-        f"Last sentiment score: {last_sentiment_score}/100\n"
-        f"Reports at 6am, 10am, 2pm, 6pm EST\n"
-        f"Subscribed: {len(subscribed_chats)}\n"
+        f"Biweekly queries: {biweekly_q_count}\n"
+        f"Last biweekly scan: {last_scan}\n"
+        f"Schedule: daily check at 9am EST, runs every 14 days\n"
+        f"Subscribed chats: {len(subscribed_chats)}\n"
         f"Admin: {is_admin}\n"
         f"Your ID: `{update.effective_user.id}`"
     )
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mode, error = parse_scan_mode(context.args)
-    if error:
-        await update.message.reply_text(error)
-        return
     try:
-        await run_scan_mode(update, mode)
+        await run_biweekly_scan(update)
     except asyncio.TimeoutError:
-        await update.message.reply_text("⏱️ /scan timed out after 120 seconds.")
+        await update.message.reply_text("⏱️ /scan timed out after 300 seconds.")
     except Exception as e:
         logger.error(f"Scan failed: {e}")
         await update.message.reply_text(f"❌ Scan failed: {e}")
@@ -2285,15 +2584,13 @@ async def cmd_raw(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config = load_prompts()
-    queries = config["data_queries"]
-    summary = "\n".join(f"*{k}:* {len(v)} queries" for k, v in queries.items())
-    sources = config.get("sources", {})
-    active = ", ".join(k for k, v in sources.items() if v)
+    biweekly_queries = config.get("biweekly_queries", [])
+    sample = "\n".join(f"  • {q}" for q in biweekly_queries[:5])
     await update.message.reply_text(
-        f"*Query categories:*\n{summary}\n\n"
-        f"*Active sources:* {active}\n"
-        f"*Alert threshold:* <{config.get('alert_threshold', 35)}/100\n\n"
-        f"Edit `prompts.json` for config and `prompts/*.md` for prompts.",
+        f"*Biweekly scan queries:* {len(biweekly_queries)} total\n"
+        f"Sample:\n{sample}\n\n"
+        f"Edit `prompts.json` → `biweekly_queries` to change.\n"
+        f"Edit `prompts/biweekly_prompt.md` to change the report format.",
         parse_mode="Markdown",
     )
 
@@ -2558,22 +2855,12 @@ def main():
     app.add_handler(CommandHandler("smtpcheck", cmd_smtpcheck))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # 6am, 10am, 2pm, 6pm EST = 11, 15, 19, 23 UTC
+    # Biweekly scan: runs daily at 9am EST (14:00 UTC) but self-guards to only execute every 14 days.
     job_queue = app.job_queue
-    for utc_hour in [11, 15, 19, 23]:
-        job_queue.run_daily(
-            scheduled_sentiment_broadcast,
-            time=datetime.strptime(f"{utc_hour:02d}:00", "%H:%M").time(),
-            name=f"sentiment_{utc_hour:02d}",
-        )
-
-    _, weekly_hour_utc = weekly_est_to_utc(EMAIL_WEEKLY_DAY, EMAIL_WEEKLY_HOUR)
-    # Compatibility fallback: some python-telegram-bot JobQueue builds do not expose run_weekly.
-    # Run daily at the target hour and guard weekday/hour inside the callback.
     job_queue.run_daily(
-        scheduled_weekly_email_digest,
-        time=datetime.strptime(f"{weekly_hour_utc:02d}:00", "%H:%M").time(),
-        name="weekly_email_digest",
+        scheduled_biweekly_broadcast,
+        time=datetime.strptime("14:00", "%H:%M").time(),
+        name="biweekly_scan",
     )
 
     if WEBHOOK_URL:

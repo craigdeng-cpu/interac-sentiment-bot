@@ -49,8 +49,22 @@
     "followup_prompt": "prompts/followup_prompt.md",
     "historical_prompt": "prompts/historical_prompt.md",
     "persona_prompt": "prompts/persona_prompt.md",
-    "brand_archetype_prompt": "prompts/brand_archetype_prompt.md"
+    "brand_archetype_prompt": "prompts/brand_archetype_prompt.md",
+    "biweekly_prompt": "prompts/biweekly_prompt.md"
   },
+  "biweekly_queries": [
+    "e-Transfer complaint OR delay OR problem OR issue site:reddit.com",
+    "e-Transfer limit OR hold OR declined OR pending site:reddit.com",
+    "Interac e-Transfer bank friction OR slow OR broken site:reddit.com",
+    "e-Transfer fraud OR scam experience site:reddit.com",
+    "e-Transfer site:forums.redflagdeals.com",
+    "Wise vs e-Transfer Canada",
+    "PayPal vs Interac e-Transfer Canada",
+    "Venmo Canada e-Transfer alternative",
+    "Apple Pay Google Pay replace e-Transfer Canada",
+    "e-Transfer Canada complaint OR frustrated OR switched",
+    "Interac e-Transfer new feature OR update 2025 OR 2026"
+  ],
   "historical_queries": {
     "recent_1mo": {
       "label": "RECENT (1 month)",
