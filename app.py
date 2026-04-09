@@ -509,6 +509,86 @@ async def search_twitter(query: str, max_results: int = 5, tbs: str = "qdr:w") -
     return base_results
 
 
+async def search_reddit_posts(
+    query: str,
+    subreddit: str = "",
+    max_results: int = 15,
+    days_back: int = 60,
+    min_score: int = 2,
+) -> list[dict]:
+    """Fetch Reddit posts via the public JSON API.
+
+    Returns posts with exact UTC timestamps, full selftext, and score so we can:
+    - Filter by real date (not DDG's unreliable tbs)
+    - Quality-filter by upvote score
+    - Use full post body as quote material instead of a truncated DDG snippet
+    """
+    if subreddit:
+        url = f"https://www.reddit.com/r/{subreddit}/search.json"
+        params: dict = {
+            "q": query, "sort": "new", "t": "year",
+            "limit": min(max_results * 2, 25), "restrict_sr": "1", "type": "link",
+        }
+    else:
+        url = "https://www.reddit.com/search.json"
+        params = {
+            "q": query, "sort": "new", "t": "year",
+            "limit": min(max_results * 2, 25), "type": "link",
+        }
+
+    headers = {"User-Agent": "InteracIntelligenceBot/1.0"}
+    cutoff_ts = (datetime.now(timezone.utc) - timedelta(days=days_back)).timestamp()
+
+    def _fetch() -> dict:
+        import urllib.request
+        import urllib.parse
+        full_url = url + "?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(full_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+
+    try:
+        data = await asyncio.to_thread(_fetch)
+    except Exception as e:
+        logger.warning(f"Reddit API failed for '{query[:40]}': {type(e).__name__}: {e}")
+        return []
+
+    posts = []
+    for child in data.get("data", {}).get("children", []):
+        post = child.get("data", {})
+        created = post.get("created_utc", 0)
+        if not created or created < cutoff_ts:
+            continue
+        score = post.get("score", 0)
+        if score < min_score:
+            continue
+
+        post_dt = datetime.fromtimestamp(created, tz=timezone.utc)
+        date_str = post_dt.strftime("%B %d, %Y")
+
+        title = (post.get("title", "") or "").strip()
+        selftext = (post.get("selftext", "") or "").strip()
+        if selftext in ("[deleted]", "[removed]"):
+            selftext = ""
+        # Full post body gives better quote material than a search snippet
+        snippet = selftext[:600] if selftext else title
+
+        permalink = post.get("permalink", "")
+        subreddit_name = post.get("subreddit_display_name", post.get("subreddit", ""))
+
+        posts.append({
+            "title": title,
+            "snippet": snippet,
+            "link": f"https://www.reddit.com{permalink}",
+            "source": f"Reddit/r/{subreddit_name}" if subreddit_name else "Reddit",
+            "date": date_str,
+            "score": score,
+        })
+
+    posts.sort(key=lambda x: x.get("score", 0), reverse=True)
+    return posts[:max_results]
+
+
 async def _search_diagnostic() -> str:
     """Single test query to diagnose DDG search health."""
     try:
@@ -523,24 +603,76 @@ async def _search_diagnostic() -> str:
 async def fetch_biweekly_mentions() -> str:
     """Fetch mentions for the universal biweekly scan.
 
-    e-Transfer pain queries → 1-month lookback, community-focused.
-    Competitor queries → 1-year lookback (broader), both text + news search.
-    Results are split into dedicated sections so the LLM can assign them correctly.
+    Strategy:
+    - Reddit API (primary): exact dates, full post content, quality score filter.
+      Used for both e-Transfer pain posts and competitor community reactions.
+    - DDG (supplement): RFD, X/Twitter, news for things Reddit API can't cover.
+    Results split into labelled sections so the LLM assigns them correctly.
     """
     config = load_prompts()
-    # Support both old combined list and new split lists
-    etransfer_queries = config.get("etransfer_queries", config.get("biweekly_queries", []))
-    competitor_queries = config.get("competitor_queries", [])
-    max_per = 5
+    etransfer_ddg_queries = config.get("etransfer_queries", config.get("biweekly_queries", []))
+    competitor_ddg_queries = config.get("competitor_queries", [])
 
     seen_links: set[str] = set()
     etransfer_social: list[dict] = []
     etransfer_press: list[dict] = []
     competitor_mentions: list[dict] = []
 
-    # ── e-Transfer queries (pain / community) — 1-month window ──
-    for query in etransfer_queries:
-        results = await web_search(query, "search", max_per, tbs="qdr:m")
+    # ── 1. Reddit API — e-Transfer community (exact dates, fresh posts) ──
+    # These give us real Reddit voices with timestamps + full text, not stale DDG snippets.
+    reddit_et_searches = [
+        ("e-transfer", "personalfinancecanada"),
+        ("interac e-transfer", "personalfinancecanada"),
+        ("e-transfer fraud OR scam", ""),
+        ("e-transfer problem OR issue OR delay OR complaint", ""),
+        ("e-transfer limit OR hold OR declined OR pending", ""),
+    ]
+
+    sem = asyncio.Semaphore(3)  # Max 3 concurrent Reddit API calls
+
+    async def _reddit(q: str, sub: str, days: int, score: int = 2) -> list[dict]:
+        async with sem:
+            return await search_reddit_posts(q, subreddit=sub, max_results=12, days_back=days, min_score=score)
+
+    et_tasks = [_reddit(q, sub, 60) for q, sub in reddit_et_searches]
+    et_batches = await asyncio.gather(*et_tasks, return_exceptions=True)
+    for batch in et_batches:
+        if isinstance(batch, Exception) or not batch:
+            continue
+        for r in batch:
+            link = r.get("link", "")
+            if link and link not in seen_links:
+                seen_links.add(link)
+                etransfer_social.append(r)
+
+    # ── 2. Reddit API — competitor community reactions ──
+    # Captures what real Canadians say about Wise, PayPal, Wealthsimple, etc.
+    reddit_comp_searches = [
+        ("wise money transfer canada", "personalfinancecanada"),
+        ("paypal canada send money", "personalfinancecanada"),
+        ("wealthsimple cash transfer", "personalfinancecanada"),
+        ("koho card banking", "personalfinancecanada"),
+        ("best way send money canada interac alternative", "personalfinancecanada"),
+        ("apple pay google pay canada", "personalfinancecanada"),
+        ("revolut canada", "personalfinancecanada"),
+        ("neo financial banking canada", "personalfinancecanada"),
+        ("venmo paypal zelle canada", ""),
+    ]
+
+    comp_tasks = [_reddit(q, sub, 180, score=1) for q, sub in reddit_comp_searches]
+    comp_batches = await asyncio.gather(*comp_tasks, return_exceptions=True)
+    for batch in comp_batches:
+        if isinstance(batch, Exception) or not batch:
+            continue
+        for r in batch:
+            link = r.get("link", "")
+            if link and link not in seen_links:
+                seen_links.add(link)
+                competitor_mentions.append(r)
+
+    # ── 3. DDG — e-Transfer supplement (RFD, X, general web) ──
+    for query in etransfer_ddg_queries:
+        results = await web_search(query, "search", 5, tbs="qdr:m")
         for r in results:
             link = r.get("link", "")
             if not link or link in seen_links:
@@ -554,9 +686,8 @@ async def fetch_biweekly_mentions() -> str:
             else:
                 etransfer_press.append(r)
 
-        # X/Twitter for non-site-restricted queries
         if not _has_site_restriction(query):
-            x_results = await search_twitter(query, max_per, tbs="qdr:m")
+            x_results = await search_twitter(query, 5, tbs="qdr:m")
             for r in x_results:
                 link = r.get("link", "")
                 if not link or link in seen_links:
@@ -566,33 +697,21 @@ async def fetch_biweekly_mentions() -> str:
                 r["source"] = "X/Twitter"
                 etransfer_social.append(r)
 
-    # ── Competitor queries — 1-year window, text + news ──
-    for query in competitor_queries:
-        # Text search (community posts, blog coverage)
-        results = await web_search(query, "search", max_per, tbs="qdr:y")
-        for r in results:
-            link = r.get("link", "")
-            if not link or link in seen_links:
-                continue
-            seen_links.add(link)
-            _, source = _classify_channel_and_source(link)
-            r["source"] = source
-            competitor_mentions.append(r)
+    # ── 4. DDG — competitor press/news + X (launches, independent coverage) ──
+    for query in competitor_ddg_queries:
+        for search_type, tbs in [("search", "qdr:y"), ("news", "qdr:y")]:
+            results = await web_search(query, search_type, 5, tbs=tbs)
+            for r in results:
+                link = r.get("link", "")
+                if not link or link in seen_links:
+                    continue
+                seen_links.add(link)
+                _, source = _classify_channel_and_source(link)
+                r["source"] = source
+                competitor_mentions.append(r)
 
-        # News search (press releases, announcements — better dates)
-        news_results = await web_search(query, "news", max_per, tbs="qdr:y")
-        for r in news_results:
-            link = r.get("link", "")
-            if not link or link in seen_links:
-                continue
-            seen_links.add(link)
-            _, source = _classify_channel_and_source(link)
-            r["source"] = source
-            competitor_mentions.append(r)
-
-        # X/Twitter for non-site-restricted queries
         if not _has_site_restriction(query):
-            x_results = await search_twitter(query, max_per, tbs="qdr:y")
+            x_results = await search_twitter(query, 5, tbs="qdr:y")
             for r in x_results:
                 link = r.get("link", "")
                 if not link or link in seen_links:
@@ -607,8 +726,8 @@ async def fetch_biweekly_mentions() -> str:
 
     lines = [f"=== INTERAC BIWEEKLY SCAN — {now_est()} ==="]
     lines.append(
-        f"Total: {total} unique mentions "
-        f"({len(etransfer_social)} e-Transfer social, {len(etransfer_press)} e-Transfer news, "
+        f"Total: {total} mentions "
+        f"({len(etransfer_social)} e-Transfer community, {len(etransfer_press)} e-Transfer news, "
         f"{len(competitor_mentions)} competitor)"
     )
     lines.append("")
@@ -627,15 +746,15 @@ async def fetch_biweekly_mentions() -> str:
 
     if etransfer_social:
         lines.append("=== e-TRANSFER COMMUNITY (REDDIT, RFD, X) ===")
-        lines += _fmt("S", etransfer_social, 25, 500)
+        lines += _fmt("S", etransfer_social, 30, 500)
 
     if etransfer_press:
         lines.append("=== e-TRANSFER NEWS ===")
         lines += _fmt("EN", etransfer_press, 8, 300)
 
     if competitor_mentions:
-        lines.append("=== COMPETITOR INTELLIGENCE (Wise, PayPal, Apple Pay, Wealthsimple, KOHO, others) ===")
-        lines += _fmt("C", competitor_mentions, 25, 400)
+        lines.append("=== COMPETITOR INTELLIGENCE (Wise, PayPal, Apple Pay, Wealthsimple, KOHO, Venmo, Zelle, Revolut, Neo, ACH, others) ===")
+        lines += _fmt("C", competitor_mentions, 30, 450)
 
     return "\n".join(lines)
 
@@ -1248,17 +1367,26 @@ def _render_quote_bullets(raw: str, empty_msg: str) -> str:
                 url = bare_match.group(1).rstrip(".,)")
                 attr_part = re.sub(r"https?://\S+", "", attr_part).strip()
 
-        # Parse platform (first token before comma or end) and date (rest)
+        # Parse date from attribution (everything after first comma)
         attr_clean = attr_part.rstrip(".")
         if "," in attr_clean:
-            platform_label, date_label = attr_clean.split(",", 1)
-            platform_label = platform_label.strip()
+            _platform_from_llm, date_label = attr_clean.split(",", 1)
             date_label = date_label.strip().rstrip(".")
         else:
-            platform_label = attr_clean.strip()
-            date_label = ""
+            date_label = attr_clean.strip()
 
-        badge_color = _platform_badge_color(platform_label)
+        # Derive platform badge from URL domain — only community platforms get a badge.
+        # This prevents corporate sites (wise.com, paypal.com) from showing as badges.
+        COMMUNITY_SOURCES = {"Reddit", "X/Twitter", "RedFlagDeals", "Forum"}
+        show_badge = False
+        platform_label = ""
+        if url:
+            _, url_source = _classify_channel_and_source(url)
+            if url_source in COMMUNITY_SOURCES:
+                platform_label = url_source
+                show_badge = True
+
+        badge_color = _platform_badge_color(platform_label) if show_badge else "#d1d5db"
 
         # Build link HTML
         link_html = ""
@@ -1271,17 +1399,16 @@ def _render_quote_bullets(raw: str, empty_msg: str) -> str:
             )
 
         quote_html = html.escape(quote_part.strip())
-        platform_html = html.escape(platform_label) if platform_label else ""
         date_html = html.escape(date_label) if date_label else ""
 
-        # Build meta row — use margin-right instead of flex gap for email client compat
+        # Build meta row — margin-right on each element (flex gap unreliable in webmail)
         meta_inner = ""
-        if platform_html:
+        if show_badge and platform_label:
             meta_inner += (
                 f"<span style='background:{badge_color};color:#fff;font-size:10px;"
                 f"font-weight:700;padding:2px 7px;border-radius:999px;"
                 f"letter-spacing:0.3px;white-space:nowrap;margin-right:6px;display:inline-block;'>"
-                f"{platform_html}</span>"
+                f"{html.escape(platform_label)}</span>"
             )
         if date_html:
             meta_inner += (
