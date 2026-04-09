@@ -382,7 +382,17 @@ def _cluster_mentions(mentions: list[dict]) -> list[dict]:
         rep = cluster["representative"]
         domains = sorted({urlparse(m.get("url", "")).netloc.replace("www.", "") for m in cluster_mentions if m.get("url")})
         timeframes = sorted({m.get("timeframe", "unknown") for m in cluster_mentions})
+        known_dates = sorted(
+            {
+                d for d in (m.get("date", "unknown") for m in cluster_mentions)
+                if d and d != "unknown"
+            }
+        )
         dated_count = sum(1 for m in cluster_mentions if m.get("date", "unknown") != "unknown")
+        if known_dates:
+            date_span = known_dates[0] if len(known_dates) == 1 else f"{known_dates[0]} to {known_dates[-1]}"
+        else:
+            date_span = "unknown"
         summarized.append(
             {
                 "story_id": f"S{idx}",
@@ -393,6 +403,7 @@ def _cluster_mentions(mentions: list[dict]) -> list[dict]:
                 "corroboration": _corroboration_label(len(domains)),
                 "timeframes_present": ", ".join(timeframes) if timeframes else "unknown",
                 "dated_count": dated_count,
+                "date_span": date_span,
                 "sample_urls": [m.get("url", "") for m in cluster_mentions[:3] if m.get("url")],
                 "sample_snippet": rep.get("snippet", "")[:220],
             }
@@ -876,7 +887,7 @@ async def fetch_brand_archetype_mentions(fetch_budget_seconds: int = 200) -> str
                 f"[{cluster['story_id']}] ArchetypeHint={cluster['archetype_hint']} | Brands={cluster['brands']} "
                 f"| Corroboration={cluster['corroboration']} | Articles={cluster['article_count']} "
                 f"| Domains={cluster['unique_domains']} | Timeframes={cluster['timeframes_present']} "
-                f"| Dated={cluster['dated_count']} | URLs={sample_urls}",
+                f"| Dated={cluster['dated_count']} | DateRange={cluster['date_span']} | URLs={sample_urls}",
             )
             insert_at += 1
 
@@ -1316,12 +1327,13 @@ def _compact_email_line(raw_line: str) -> str:
         if meta:
             main_text = f"{main_text} ({', '.join(meta)})"
     else:
-        line = re.sub(r"\b(Source URL|Date|Product|Sentiment Summary)\s*:\s*", "", line, flags=re.IGNORECASE)
+        # Keep explicit date labels in rendered bullets for faster evidence-time checks.
+        line = re.sub(r"\b(Source URL|Product|Sentiment Summary)\s*:\s*", "", line, flags=re.IGNORECASE)
         main_text = " ".join(line.split())
 
     main_text = " ".join(main_text.split())
-    if len(main_text) > 190:
-        main_text = main_text[:187].rstrip() + "..."
+    if len(main_text) > 240:
+        main_text = main_text[:237].rstrip() + "..."
 
     links_html = ""
     if links:
@@ -1609,6 +1621,19 @@ def _build_brand_archetype_html(subject: str, body: str) -> str:
     def as_html_cards(raw: str, empty_msg: str, max_lines: int = 6) -> str:
         return _compact_panel(raw, empty_msg, max_lines=min(max_lines, 4), list_mode=True)
 
+    def dashboard_card(title: str, content_html: str) -> str:
+        return (
+            f"<table role='presentation' width='100%' cellspacing='0' cellpadding='0' "
+            f"style='border:1px solid {EMAIL_BORDER};border-radius:12px;background:#fbfcff;'>"
+            "<tr>"
+            f"<td height='228' valign='top' style='padding:12px 14px;'>"
+            f"<div style='font-size:16px;font-weight:700;color:{EMAIL_TEXT};margin-bottom:6px;'>{title}</div>"
+            f"{content_html}"
+            "</td>"
+            "</tr>"
+            "</table>"
+        )
+
     return f"""
 <html>
   <body style="margin:0;padding:0;background:{EMAIL_PAGE_BG};font-family:{EMAIL_FONT_STACK};color:{EMAIL_TEXT};">
@@ -1622,22 +1647,39 @@ def _build_brand_archetype_html(subject: str, body: str) -> str:
               <div style="font-size:13px;color:#aebce2;margin-top:6px;">{html.escape(timestamp)}</div>
             </td>
           </tr>
-          <tr><td style="padding:18px 24px;"><div style="font-size:15px;font-weight:700;">Market Snapshot</div>{as_html_cards(market_snapshot, "No market snapshot details available.", max_lines=4)}</td></tr>
-          <tr><td style="padding:0 24px 20px 24px;"><hr style="border:none;border-top:1px solid {EMAIL_BORDER};"></td></tr>
-          <tr><td style="padding:0 24px 16px 24px;"><div style="font-size:15px;font-weight:700;">Interac Chatter</div>{as_html_cards(interac_chatter, "No Interac chatter details available.")}</td></tr>
-          <tr><td style="padding:0 24px 16px 24px;">
+          <tr><td style="padding:16px 24px 12px 24px;">
             <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
               <tr>
-                <td width="50%" valign="top" style="padding-right:8px;"><div style="font-size:15px;font-weight:700;">Active Brand Archetypes</div>{as_html_cards(archetypes, "No active archetypes identified.")}</td>
-                <td width="50%" valign="top" style="padding-left:8px;"><div style="font-size:15px;font-weight:700;">Competitor Movement</div>{as_html_cards(movement, "No clear competitor movement identified.")}</td>
+                <td width="50%" valign="top" style="padding-right:8px;">
+                  {dashboard_card("Market Snapshot", as_html_cards(market_snapshot, "No market snapshot details available.", max_lines=4))}
+                </td>
+                <td width="50%" valign="top" style="padding-left:8px;">
+                  {dashboard_card("Interac Chatter", as_html_cards(interac_chatter, "No Interac chatter details available.", max_lines=4))}
+                </td>
+              </tr>
+            </table>
+          </td></tr>
+          <tr><td style="padding:0 24px 12px 24px;">
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+              <tr>
+                <td width="50%" valign="top" style="padding-right:8px;">
+                  {dashboard_card("Active Brand Archetypes", as_html_cards(archetypes, "No active archetypes identified."))}
+                </td>
+                <td width="50%" valign="top" style="padding-left:8px;">
+                  {dashboard_card("Competitor Movement", as_html_cards(movement, "No clear competitor movement identified."))}
+                </td>
               </tr>
             </table>
           </td></tr>
           <tr><td style="padding:0 24px 24px 24px;">
             <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
               <tr>
-                <td width="50%" valign="top" style="padding-right:8px;"><div style="font-size:15px;font-weight:700;">Signal Quality</div>{as_html_cards(signal_quality, "No signal quality details available.", max_lines=4)}</td>
-                <td width="50%" valign="top" style="padding-left:8px;"><div style="font-size:15px;font-weight:700;">Evidence Log</div>{as_html_cards(evidence_log, "No evidence log entries available.", max_lines=8)}</td>
+                <td width="50%" valign="top" style="padding-right:8px;">
+                  {dashboard_card("Signal Quality", as_html_cards(signal_quality, "No signal quality details available.", max_lines=4))}
+                </td>
+                <td width="50%" valign="top" style="padding-left:8px;">
+                  {dashboard_card("Evidence Log", as_html_cards(evidence_log, "No evidence log entries available.", max_lines=4))}
+                </td>
               </tr>
             </table>
           </td></tr>

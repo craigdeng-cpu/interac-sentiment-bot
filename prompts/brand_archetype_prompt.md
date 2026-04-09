@@ -9,7 +9,7 @@ You receive raw mentions and story-cluster metadata across time windows. Produce
 1. Use only evidence present in the input. Never invent claims, quotes, snippets, URLs, brands, or dates.
 2. Do not provide recommendations, advice, or action plans.
 3. Do not use strategy verbs like "should", "need to", "consider", "must", "recommend".
-4. Every claim line must include exact source URLs.
+4. Every claim line must include explicit date context and exact source URLs.
 5. Use corroboration labels:
    - `strong` = 3+ independent domains
    - `moderate` = 2 independent domains
@@ -33,26 +33,26 @@ Use the `=== STORY CLUSTERS ===` block as the primary trend signal and corrobora
 TIMESTAMP: {timestamp}
 
 MARKET SNAPSHOT:
-- Activity level: [high/medium/low]
-- Dominant themes: [comma-separated]
-- Interac chatter level: [high/medium/low] with short factual reason
+- Activity level: [high/medium/low] | Date window: [YYYY-MM-DD to YYYY-MM-DD or unknown]
+- Dominant themes: [comma-separated] | Date window: [YYYY-MM-DD to YYYY-MM-DD or unknown]
+- Interac chatter level: [high/medium/low] with short factual reason | Date window: [YYYY-MM-DD to YYYY-MM-DD or unknown]
 
 INTERAC CHATTER:
-- [factual line] | Corroboration: [strong/moderate/early] | Sources: [URL, URL]
-- [factual line] | Corroboration: [strong/moderate/early] | Sources: [URL, URL]
+- [factual line] | Date: [YYYY-MM-DD or date range or unknown] | Corroboration: [strong/moderate/early] | Sources: [URL, URL]
+- [factual line] | Date: [YYYY-MM-DD or date range or unknown] | Corroboration: [strong/moderate/early] | Sources: [URL, URL]
 
 ACTIVE BRAND ARCHETYPES:
-- Archetype: [human-readable name] | Movement: [rising/stable/fading/unclear] | Corroboration: [strong/moderate/early] | Sources: [URL, URL]
-- Archetype: [human-readable name] | Movement: [rising/stable/fading/unclear] | Corroboration: [strong/moderate/early] | Sources: [URL, URL]
+- Archetype: [human-readable name] | Movement: [rising/stable/fading/unclear] | Date: [YYYY-MM-DD or date range or unknown] | Corroboration: [strong/moderate/early] | Sources: [URL, URL]
+- Archetype: [human-readable name] | Movement: [rising/stable/fading/unclear] | Date: [YYYY-MM-DD or date range or unknown] | Corroboration: [strong/moderate/early] | Sources: [URL, URL]
 
 COMPETITOR MOVEMENT:
-- [Brand]: [fact-only movement statement] | Corroboration: [strong/moderate/early] | Sources: [URL, URL]
-- [Brand]: [fact-only movement statement] | Corroboration: [strong/moderate/early] | Sources: [URL, URL]
+- [Brand]: [fact-only movement statement] | Date: [YYYY-MM-DD or date range or unknown] | Corroboration: [strong/moderate/early] | Sources: [URL, URL]
+- [Brand]: [fact-only movement statement] | Date: [YYYY-MM-DD or date range or unknown] | Corroboration: [strong/moderate/early] | Sources: [URL, URL]
 
 SIGNAL QUALITY:
-- Dated evidence ratio: [x/y or x%]
-- Corroborated claims: [count strong+moderate / total]
-- Single-source claims: [count early]
+- Dated evidence ratio: [x/y or x%] | Date window: [YYYY-MM-DD to YYYY-MM-DD or unknown]
+- Corroborated claims: [count strong+moderate / total] | Date window: [YYYY-MM-DD to YYYY-MM-DD or unknown]
+- Single-source claims: [count early] | Date window: [YYYY-MM-DD to YYYY-MM-DD or unknown]
 
 EVIDENCE LOG:
 - [claim label] — "[quote or snippet]" — [platform, date, URL]
@@ -74,3 +74,4 @@ If data is thin:
 - Short lines, no long paragraphs
 - Human-readable labels only (no underscore_case field names)
 - Facts and citations only
+- Put date before corroboration/source fields so dates remain visible in compact renderers
