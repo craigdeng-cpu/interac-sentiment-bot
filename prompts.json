@@ -9,22 +9,24 @@
     "followup_prompt": "prompts/followup_prompt.md",
     "biweekly_prompt": "prompts/biweekly_prompt.md"
   },
-  "biweekly_queries": [
+  "etransfer_queries": [
     "e-Transfer complaint OR delay OR problem OR issue site:reddit.com",
     "e-Transfer limit OR hold OR declined OR pending site:reddit.com",
     "Interac e-Transfer bank friction OR slow OR broken site:reddit.com",
     "e-Transfer fraud OR scam experience site:reddit.com",
     "e-Transfer site:forums.redflagdeals.com",
-    "e-Transfer Canada complaint OR frustrated OR switched",
-    "Wise Canada new feature OR launch OR transfer 2025 OR 2026",
-    "PayPal Canada update OR new feature 2025 OR 2026",
-    "Apple Pay Canada payment 2025 OR 2026",
-    "Wealthsimple Cash feature OR review 2025 OR 2026",
-    "KOHO Canada payment feature 2025 OR 2026",
-    "best money transfer app Canada 2025 OR 2026",
-    "Wise Canada site:reddit.com experience OR review",
-    "PayPal Canada site:reddit.com experience OR review",
-    "Interac e-Transfer new feature OR update 2025 OR 2026"
+    "e-Transfer Canada complaint OR frustrated OR switched"
+  ],
+  "competitor_queries": [
+    "Wise money transfer Canada",
+    "Wise Canada review OR experience site:reddit.com",
+    "PayPal Canada transfer OR feature OR review",
+    "PayPal Canada site:reddit.com",
+    "Apple Pay Canada tap payment",
+    "Wealthsimple Cash send money Canada",
+    "KOHO Canada spending card transfer",
+    "best money transfer app Canada alternative e-Transfer",
+    "Interac e-Transfer new feature OR update OR change Canada"
   ],
   "timezone": "US/Eastern"
 }

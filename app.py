@@ -477,7 +477,8 @@ async def web_search(
                 "snippet": item.get("body", "") or item.get("snippet", ""),
                 "link": item.get("href", "") or item.get("url", ""),
                 "source": item.get("source", search_type),
-                "date": item.get("date", ""),
+                # text() uses "published" ("2 weeks ago"); news() uses "date" (ISO)
+                "date": item.get("date", "") or item.get("published", ""),
             })
         return normalized
 
@@ -520,69 +521,121 @@ async def _search_diagnostic() -> str:
 
 
 async def fetch_biweekly_mentions() -> str:
-    """Fetch mentions for the universal biweekly scan. Social-first, 1-month lookback."""
+    """Fetch mentions for the universal biweekly scan.
+
+    e-Transfer pain queries → 1-month lookback, community-focused.
+    Competitor queries → 1-year lookback (broader), both text + news search.
+    Results are split into dedicated sections so the LLM can assign them correctly.
+    """
     config = load_prompts()
-    queries = config.get("biweekly_queries", [])
+    # Support both old combined list and new split lists
+    etransfer_queries = config.get("etransfer_queries", config.get("biweekly_queries", []))
+    competitor_queries = config.get("competitor_queries", [])
     max_per = 5
-    tbs = "qdr:m"  # 1-month window to collect enough data for a biweekly report
 
-    all_mentions: list[dict] = []
     seen_links: set[str] = set()
+    etransfer_social: list[dict] = []
+    etransfer_press: list[dict] = []
+    competitor_mentions: list[dict] = []
 
-    for query in queries:
-        # Web search (catches Reddit, RFD, forums, news)
-        results = await web_search(query, "search", max_per, tbs=tbs)
+    # ── e-Transfer queries (pain / community) — 1-month window ──
+    for query in etransfer_queries:
+        results = await web_search(query, "search", max_per, tbs="qdr:m")
         for r in results:
             link = r.get("link", "")
-            if link and link not in seen_links:
-                seen_links.add(link)
-                channel, source = _classify_channel_and_source(link)
-                r["channel"] = channel
-                r["source"] = source if source != "News/Other" else r.get("source", "search")
-                all_mentions.append(r)
+            if not link or link in seen_links:
+                continue
+            seen_links.add(link)
+            channel, source = _classify_channel_and_source(link)
+            r["channel"] = channel
+            r["source"] = source
+            if channel == "people":
+                etransfer_social.append(r)
+            else:
+                etransfer_press.append(r)
 
-        # X/Twitter
+        # X/Twitter for non-site-restricted queries
         if not _has_site_restriction(query):
-            x_results = await search_twitter(query, max_per, tbs=tbs)
+            x_results = await search_twitter(query, max_per, tbs="qdr:m")
             for r in x_results:
                 link = r.get("link", "")
-                if link and link not in seen_links:
-                    seen_links.add(link)
-                    r["channel"] = "people"
-                    r["source"] = "X/Twitter"
-                    all_mentions.append(r)
+                if not link or link in seen_links:
+                    continue
+                seen_links.add(link)
+                r["channel"] = "people"
+                r["source"] = "X/Twitter"
+                etransfer_social.append(r)
 
-    if not all_mentions:
+    # ── Competitor queries — 1-year window, text + news ──
+    for query in competitor_queries:
+        # Text search (community posts, blog coverage)
+        results = await web_search(query, "search", max_per, tbs="qdr:y")
+        for r in results:
+            link = r.get("link", "")
+            if not link or link in seen_links:
+                continue
+            seen_links.add(link)
+            _, source = _classify_channel_and_source(link)
+            r["source"] = source
+            competitor_mentions.append(r)
+
+        # News search (press releases, announcements — better dates)
+        news_results = await web_search(query, "news", max_per, tbs="qdr:y")
+        for r in news_results:
+            link = r.get("link", "")
+            if not link or link in seen_links:
+                continue
+            seen_links.add(link)
+            _, source = _classify_channel_and_source(link)
+            r["source"] = source
+            competitor_mentions.append(r)
+
+        # X/Twitter for non-site-restricted queries
+        if not _has_site_restriction(query):
+            x_results = await search_twitter(query, max_per, tbs="qdr:y")
+            for r in x_results:
+                link = r.get("link", "")
+                if not link or link in seen_links:
+                    continue
+                seen_links.add(link)
+                r["source"] = "X/Twitter"
+                competitor_mentions.append(r)
+
+    total = len(etransfer_social) + len(etransfer_press) + len(competitor_mentions)
+    if total == 0:
         return "No mentions found in the past month."
 
-    people = [m for m in all_mentions if m.get("channel") == "people"]
-    press = [m for m in all_mentions if m.get("channel") != "people"]
-
     lines = [f"=== INTERAC BIWEEKLY SCAN — {now_est()} ==="]
-    lines.append(f"Total: {len(all_mentions)} unique mentions ({len(people)} social, {len(press)} press)")
+    lines.append(
+        f"Total: {total} unique mentions "
+        f"({len(etransfer_social)} e-Transfer social, {len(etransfer_press)} e-Transfer news, "
+        f"{len(competitor_mentions)} competitor)"
+    )
     lines.append("")
 
-    if people:
-        lines.append("=== SOCIAL / PEOPLE ===")
-        for i, m in enumerate(people[:20], 1):
+    def _fmt(prefix: str, items: list[dict], cap: int, snippet_cap: int) -> list[str]:
+        out = []
+        for i, m in enumerate(items[:cap], 1):
             date_str = f" ({m['date']})" if m.get("date") else ""
-            snippet = " ".join((m.get("snippet", "") or "").split())[:500]
-            lines.append(f"[S{i}] {m.get('source', 'unknown')}{date_str}")
-            lines.append(f"  Title: {m.get('title', '')[:120]}")
-            lines.append(f"  Snippet: {snippet}")
-            lines.append(f"  URL: {m.get('link', '')}")
-            lines.append("")
+            snippet = " ".join((m.get("snippet", "") or "").split())[:snippet_cap]
+            out.append(f"[{prefix}{i}] {m.get('source', 'unknown')}{date_str}")
+            out.append(f"  Title: {m.get('title', '')[:120]}")
+            out.append(f"  Snippet: {snippet}")
+            out.append(f"  URL: {m.get('link', '')}")
+            out.append("")
+        return out
 
-    if press:
-        lines.append("=== NEWS / PRESS ===")
-        for i, m in enumerate(press[:10], 1):
-            date_str = f" ({m['date']})" if m.get("date") else ""
-            snippet = " ".join((m.get("snippet", "") or "").split())[:300]
-            lines.append(f"[N{i}] {m.get('source', 'unknown')}{date_str}")
-            lines.append(f"  Title: {m.get('title', '')[:120]}")
-            lines.append(f"  Snippet: {snippet}")
-            lines.append(f"  URL: {m.get('link', '')}")
-            lines.append("")
+    if etransfer_social:
+        lines.append("=== e-TRANSFER COMMUNITY (REDDIT, RFD, X) ===")
+        lines += _fmt("S", etransfer_social, 25, 500)
+
+    if etransfer_press:
+        lines.append("=== e-TRANSFER NEWS ===")
+        lines += _fmt("EN", etransfer_press, 8, 300)
+
+    if competitor_mentions:
+        lines.append("=== COMPETITOR INTELLIGENCE (Wise, PayPal, Apple Pay, Wealthsimple, KOHO, others) ===")
+        lines += _fmt("C", competitor_mentions, 25, 400)
 
     return "\n".join(lines)
 
@@ -1221,24 +1274,25 @@ def _render_quote_bullets(raw: str, empty_msg: str) -> str:
         platform_html = html.escape(platform_label) if platform_label else ""
         date_html = html.escape(date_label) if date_label else ""
 
-        meta_parts = []
+        # Build meta row — use margin-right instead of flex gap for email client compat
+        meta_inner = ""
         if platform_html:
-            meta_parts.append(
+            meta_inner += (
                 f"<span style='background:{badge_color};color:#fff;font-size:10px;"
                 f"font-weight:700;padding:2px 7px;border-radius:999px;"
-                f"letter-spacing:0.3px;white-space:nowrap;'>{platform_html}</span>"
+                f"letter-spacing:0.3px;white-space:nowrap;margin-right:6px;display:inline-block;'>"
+                f"{platform_html}</span>"
             )
         if date_html:
-            meta_parts.append(
-                f"<span style='font-size:11px;color:{EMAIL_MUTED};'>{date_html}</span>"
+            meta_inner += (
+                f"<span style='font-size:11px;color:{EMAIL_MUTED};margin-right:6px;'>{date_html}</span>"
             )
         if link_html:
-            meta_parts.append(link_html)
+            meta_inner += link_html
 
         meta_row = (
-            f"<div style='margin-top:5px;display:flex;align-items:center;gap:6px;"
-            f"flex-wrap:wrap;'>" + "".join(meta_parts) + "</div>"
-            if meta_parts else ""
+            f"<div style='margin-top:5px;line-height:1.8;'>{meta_inner}</div>"
+            if meta_inner else ""
         )
 
         card = (
@@ -1519,14 +1573,15 @@ async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config = load_prompts()
-    biweekly_q_count = len(config.get("biweekly_queries", []))
+    et_count = len(config.get("etransfer_queries", config.get("biweekly_queries", [])))
+    comp_count = len(config.get("competitor_queries", []))
     memory = _load_biweekly_memory()
     last_scan = memory.get("last_scan_date", "never")
     is_admin = "✅" if update.effective_user.id in ADMIN_IDS else "❌"
     await update.message.reply_text(
         f"✅ Bot running — {now_est()}\n"
         f"Search provider: DuckDuckGo (ddgs)\n"
-        f"Biweekly queries: {biweekly_q_count}\n"
+        f"e-Transfer queries: {et_count} | Competitor queries: {comp_count}\n"
         f"Last biweekly scan: {last_scan}\n"
         f"Schedule: daily check at 9am EST, runs every 14 days\n"
         f"Subscribed chats: {len(subscribed_chats)}\n"
@@ -1555,12 +1610,14 @@ async def cmd_raw(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config = load_prompts()
-    biweekly_queries = config.get("biweekly_queries", [])
-    sample = "\n".join(f"  • {q}" for q in biweekly_queries[:5])
+    et_queries = config.get("etransfer_queries", config.get("biweekly_queries", []))
+    comp_queries = config.get("competitor_queries", [])
+    sample_et = "\n".join(f"  • {q}" for q in et_queries[:3])
+    sample_comp = "\n".join(f"  • {q}" for q in comp_queries[:3])
     await update.message.reply_text(
-        f"*Biweekly scan queries:* {len(biweekly_queries)} total\n"
-        f"Sample:\n{sample}\n\n"
-        f"Edit `prompts.json` → `biweekly_queries` to change.\n"
+        f"*e-Transfer queries:* {len(et_queries)}\n{sample_et}\n\n"
+        f"*Competitor queries:* {len(comp_queries)}\n{sample_comp}\n\n"
+        f"Edit `prompts.json` to change queries.\n"
         f"Edit `prompts/biweekly_prompt.md` to change the report format.",
         parse_mode="Markdown",
     )
