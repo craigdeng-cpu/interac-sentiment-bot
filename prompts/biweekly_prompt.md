@@ -25,10 +25,10 @@ Use these exact headers — no changes, no additions.
 SCAN DATE: {timestamp}
 
 e-Transfer Chatter:
-[Real quotes and snippets from real people about e-Transfer pain points, bank friction, delays, limits, feature issues. One bullet per quote or snippet. Format each bullet as: - "quote or snippet:" — Platform, Date if known. If nothing found: Nothing notable this scan.]
+[Real quotes and snippets from real people about e-Transfer pain points, bank friction, delays, limits, feature issues. One bullet per quote or snippet. Format each bullet as: - "quote or snippet" — Platform, Date if known. Source: URL. If nothing found: Nothing notable this scan.]
 
 Competitor Landscape:
-[What people say comparing Wise, PayPal, Venmo, Apple Pay, Google Pay, or other services to e-Transfer. One bullet per mention. Same format. If nothing found: Nothing notable this scan.]
+[What people say comparing Wise, PayPal, Venmo, Apple Pay, Google Pay, or other services to e-Transfer. One bullet per mention. Same format: - "quote or snippet" — Platform, Date if known. Source: URL. If nothing found: Nothing notable this scan.]
 
 Trend vs Last Scan:
 - Still active: [comma-separated theme labels from PREVIOUS SCAN CONTEXT that appear again in current data, or: none identified]

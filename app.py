@@ -52,7 +52,6 @@ EMAIL_ALERT_DEDUP = os.environ.get("EMAIL_ALERT_DEDUP", "1") == "1"
 EMAIL_COOLDOWN_MINUTES = int(os.environ.get("EMAIL_COOLDOWN_MINUTES", "0"))
 EMAIL_WEEKLY_DAY = os.environ.get("EMAIL_WEEKLY_DAY", "monday").strip().lower()
 EMAIL_WEEKLY_HOUR = int(os.environ.get("EMAIL_WEEKLY_HOUR", "9"))
-ALERT_HIGH_THRESHOLD = int(os.environ.get("ALERT_HIGH_THRESHOLD", "85"))
 EMAIL_PROVIDER = os.environ.get("EMAIL_PROVIDER", "smtp").strip().lower()
 
 SMTP_HOST = os.environ.get("SMTP_HOST", "")
@@ -70,8 +69,6 @@ EST = timezone(timedelta(hours=-5))
 subscribed_chats: set[int] = set()
 last_report: str = ""
 last_mentions_raw: str = ""
-last_sentiment_score: int = 50
-last_alert_kind: str | None = None
 last_email_sent_at: datetime | None = None
 last_weekly_email_key: str | None = None
 
@@ -523,381 +520,6 @@ async def _search_diagnostic() -> str:
     return f"OK: {len(results)} results, first='{results[0].get('title', 'n/a')[:80]}'"
 
 
-async def fetch_all_mentions() -> str:
-    config = load_prompts()
-    queries_config = config["data_queries"]
-    sources = config.get("sources", {})
-    max_per = config.get("max_mentions_per_source", 5)
-    lookback_hours = int(config.get("lookback_hours", 72))
-    tbs = lookback_hours_to_tbs(lookback_hours)
-
-    people_mentions = []  # Reddit, X, RFD, forums
-    press_mentions = []   # News articles
-
-    all_queries = []
-    for category, queries in queries_config.items():
-        for q in queries:
-            all_queries.append((category, q))
-
-    for category, query in all_queries:
-        is_people_category = category == "people_forums"
-
-        # News (press)
-        if sources.get("news", True) and not is_people_category:
-            results = await web_search(query, "news", max_per, tbs=tbs)
-            for r in results:
-                r["category"] = category
-                r["channel"] = "press"
-                r["platform_context"] = _extract_platform_context(r.get("link", ""))
-            press_mentions.extend(results)
-
-        # Reddit / forums (people)
-        if sources.get("reddit", True) or sources.get("forums", True):
-            results = await web_search(query, "search", max_per, tbs=tbs)
-            for r in results:
-                r["category"] = category
-                r["platform_context"] = _extract_platform_context(r.get("link", ""))
-                # Classify by domain
-                link = r.get("link", "")
-                if "reddit.com" in link:
-                    r["source"] = "Reddit"
-                    r["channel"] = "people"
-                elif "redflagdeals.com" in link:
-                    r["source"] = "RedFlagDeals"
-                    r["channel"] = "people"
-                else:
-                    r["channel"] = "press"
-            people_mentions.extend([r for r in results if r["channel"] == "people"])
-            press_mentions.extend([r for r in results if r["channel"] == "press"])
-
-        # X/Twitter (people)
-        if sources.get("twitter", True) and not is_people_category:
-            results = await search_twitter(query, max_per, tbs=tbs)
-            for r in results:
-                r["category"] = category
-                r["channel"] = "people"
-                r["platform_context"] = _extract_platform_context(r.get("link", ""))
-            people_mentions.extend(results)
-
-    # Deduplicate each pool
-    def dedup(mentions):
-        seen = set()
-        unique = []
-        for m in mentions:
-            if m["link"] not in seen:
-                seen.add(m["link"])
-                unique.append(m)
-        return unique
-
-    people_mentions = dedup(people_mentions)
-    press_mentions = dedup(press_mentions)
-    total = len(people_mentions) + len(press_mentions)
-
-    if total == 0:
-        return f"No recent mentions found across any sources in the last {lookback_hours} hours."
-
-    lines = [f"=== INTERAC INTELLIGENCE SCAN — {now_est()} ==="]
-    lines.append(f"Total: {total} unique mentions ({len(people_mentions)} people, {len(press_mentions)} press)\n")
-
-    if people_mentions:
-        lines.append("=== PEOPLE (Reddit, X, RFD) ===")
-        for i, m in enumerate(people_mentions[:15], 1):
-            date_str = f" ({m['date']})" if m.get("date") else ""
-            platform_context = m.get("platform_context", {})
-            source_label = m.get("source", "unknown")
-            if platform_context.get("subreddit"):
-                source_label = f"{source_label} (r/{platform_context['subreddit']})"
-            elif platform_context.get("forum_section"):
-                source_label = f"{source_label} ({platform_context['forum_section']})"
-
-            context_line = platform_context.get("platform_demo_hint", "")
-            snippet = m.get("snippet", "")[:150]
-            row = f"[P{i}] {m['title']} | {source_label}{date_str}\n  {snippet}\n  {m['link']}"
-            if context_line:
-                row = (
-                    f"[P{i}] {m['title']} | {source_label}{date_str}\n"
-                    f"  Context: {context_line}\n"
-                    f"  {snippet}\n"
-                    f"  {m['link']}"
-                )
-            lines.append(row)
-
-    if press_mentions:
-        lines.append("\n=== PRESS ===")
-        for i, m in enumerate(press_mentions[:10], 1):
-            date_str = f" ({m['date']})" if m.get("date") else ""
-            platform_context = m.get("platform_context", {})
-            context_line = platform_context.get("platform_demo_hint", "")
-            snippet = m.get("snippet", "")[:150]
-            row = f"[N{i}] {m['title']} | {m['source']}{date_str}\n  {snippet}\n  {m['link']}"
-            if context_line:
-                row = (
-                    f"[N{i}] {m['title']} | {m['source']}{date_str}\n"
-                    f"  Context: {context_line}\n"
-                    f"  {snippet}\n"
-                    f"  {m['link']}"
-                )
-            lines.append(row)
-
-    return "\n".join(lines)
-
-
-async def fetch_historical_mentions() -> str:
-    config = load_prompts()
-    historical_queries = config.get("historical_queries", {})
-    max_per = int(config.get("historical_max_mentions_per_source", 10))
-
-    if not historical_queries:
-        return "No historical query config found."
-
-    lines = [f"=== INTERAC HISTORICAL SCAN — {now_est()} ==="]
-    timeframe_counts: dict[str, int] = {}
-    debug_lines: list[str] = []
-
-    for timeframe_key, block in historical_queries.items():
-        label = block.get("label", timeframe_key)
-        tbs = normalize_tbs(block.get("tbs", "qdr:m"))
-        queries = block.get("queries", [])
-        mentions = []
-
-        for query in queries:
-            has_site = _has_site_restriction(query)
-
-            search_results = await web_search(query, "search", max_per, tbs=tbs)
-            for r in search_results:
-                link = r.get("link", "")
-                channel, source = _classify_channel_and_source(link)
-                r["channel"] = channel
-                r["source"] = source if source != "News/Other" else r.get("source", "search")
-                mentions.append(r)
-
-            if not has_site:
-                news_results = await web_search(query, "news", max_per, tbs=tbs)
-                for r in news_results:
-                    r["channel"] = "press"
-                    r["source"] = r.get("source", "News")
-                    mentions.append(r)
-
-                x_results = await search_twitter(query, max_per, tbs=tbs)
-                for r in x_results:
-                    r["channel"] = "people"
-                    r["source"] = "X/Twitter"
-                mentions.extend(x_results)
-                debug_lines.append(
-                    f"  {query[:50]}... → search={len(search_results)} news={len(news_results)} x={len(x_results)}"
-                )
-            else:
-                debug_lines.append(
-                    f"  {query[:50]}... → search={len(search_results)} (site-restricted, skipped news/x)"
-                )
-
-        seen = set()
-        unique = []
-        for m in mentions:
-            link = m.get("link", "")
-            if not link or link in seen:
-                continue
-            seen.add(link)
-            unique.append(m)
-
-        social_unique = [m for m in unique if m.get("channel") == "people"]
-        selected = social_unique if social_unique else unique
-
-        timeframe_counts[label] = len(selected)
-        lines.append(
-            f"\n=== {label} | tbs={tbs or 'ALL TIME'} | mentions={len(selected)} "
-            f"(social={len(social_unique)}, total={len(unique)}) ==="
-        )
-        for i, m in enumerate(selected[:15], 1):
-            platform = m.get("source", "unknown")
-            date_value = m.get("date") or "unknown"
-            url_value = m.get("link", "")
-            snippet = " ".join((m.get("snippet", "") or "").split())[:260]
-            lines.append(
-                f"[H{i}] Platform: {platform} | Date: {date_value} | URL: {url_value} | Snippet: {snippet}"
-            )
-
-    total_mentions = sum(timeframe_counts.values())
-    lines.insert(1, f"TOTAL HISTORICAL MENTIONS: {total_mentions}")
-    idx = 2
-    for label, count in timeframe_counts.items():
-        lines.insert(idx, f"- {label}: {count}")
-        idx += 1
-
-    logger.info(f"Historical scan totals: {timeframe_counts} = {total_mentions}")
-    for dl in debug_lines:
-        logger.info(dl)
-
-    return "\n".join(lines)
-
-
-async def fetch_brand_archetype_mentions(fetch_budget_seconds: int = 200) -> str:
-    config = load_prompts()
-    brand_queries = config.get("brand_historical_queries", {})
-    # Hotfix: keep brand scan leaner than historical deep scan.
-    max_per = min(int(config.get("historical_max_mentions_per_source", 10)), 5)
-    started_at = monotonic()
-    partial_data = False
-
-    if not brand_queries:
-        return "No brand historical query config found."
-
-    lines = [f"=== BRAND ARCHETYPE HISTORICAL SCAN — {now_est()} ==="]
-    timeframe_counts: dict[str, int] = {}
-    debug_lines: list[str] = []
-    all_unique_mentions: list[dict] = []
-
-    for timeframe_key, block in brand_queries.items():
-        label = block.get("label", timeframe_key)
-        tbs = normalize_tbs(block.get("tbs", "qdr:m"))
-        queries = block.get("queries", [])
-        mentions = []
-
-        for query in queries:
-            elapsed = monotonic() - started_at
-            if elapsed >= fetch_budget_seconds:
-                partial_data = True
-                debug_lines.append(
-                    f"  fetch budget reached at {elapsed:.1f}s; stopping before query: {query[:50]}..."
-                )
-                break
-
-            has_site = _has_site_restriction(query)
-
-            search_results = await web_search(query, "search", max_per, tbs=tbs)
-            for r in search_results:
-                link = r.get("link", "")
-                channel, source = _classify_channel_and_source(link)
-                r["channel"] = channel
-                r["source"] = source if source != "News/Other" else r.get("source", "search")
-                mentions.append(r)
-
-            if not has_site:
-                news_results = await web_search(query, "news", max_per, tbs=tbs)
-                for r in news_results:
-                    r["channel"] = "press"
-                    r["source"] = r.get("source", "News")
-                    mentions.append(r)
-
-                x_results = await search_twitter(query, max_per, tbs=tbs)
-                for r in x_results:
-                    r["channel"] = "people"
-                    r["source"] = "X/Twitter"
-                mentions.extend(x_results)
-                debug_lines.append(
-                    f"  {query[:50]}... → search={len(search_results)} news={len(news_results)} x={len(x_results)}"
-                )
-            else:
-                debug_lines.append(
-                    f"  {query[:50]}... → search={len(search_results)} (site-restricted, skipped news/x)"
-                )
-
-        if partial_data:
-            # Stop processing additional windows once budget is exhausted.
-            break
-
-        seen = set()
-        unique = []
-        for m in mentions:
-            link = m.get("link", "")
-            if not link or link in seen:
-                continue
-            seen.add(link)
-            unique.append(m)
-
-        timeframe_counts[label] = len(unique)
-        lines.append(
-            f"\n=== {label} | tbs={tbs or 'ALL TIME'} | mentions={len(unique)} ==="
-        )
-        for i, m in enumerate(unique[:20], 1):
-            platform = m.get("source", "unknown")
-            date_value = _normalize_date_value(m.get("date", ""))
-            url_value = m.get("link", "")
-            snippet = " ".join((m.get("snippet", "") or "").split())[:260]
-            title_value = " ".join((m.get("title", "") or "").split())[:120]
-            text_blob = f"{title_value} {snippet}".strip()
-            brands = _detect_brands(text_blob)
-            use_case = _detect_use_case(text_blob)
-            use_case_label = _use_case_label(use_case)
-            keywords = _extract_keywords(text_blob, max_keywords=8)
-            cluster_key = _cluster_key_from_components(brands, use_case, keywords)
-            quality_tier = _source_quality_tier(url_value, m.get("channel", "press"))
-            all_unique_mentions.append(
-                {
-                    "timeframe": label,
-                    "platform": platform,
-                    "date": date_value,
-                    "url": url_value,
-                    "snippet": snippet,
-                    "brands": brands,
-                    "use_case": use_case,
-                    "quality_tier": quality_tier,
-                    "keywords": keywords,
-                    "cluster_key": cluster_key,
-                }
-            )
-            lines.append(
-                f"[B{i}] Timeframe: {label} | Platform: {platform} | Date: {date_value} "
-                f"| SourceTier: {quality_tier} | Brands: {brands} | UseCase: {use_case_label} "
-                f"| URL: {url_value} | Snippet: {snippet}"
-            )
-
-    total_mentions = sum(timeframe_counts.values())
-    lines.insert(1, f"TOTAL BRAND HISTORICAL MENTIONS: {total_mentions}")
-    if partial_data:
-        lines.insert(2, "PARTIAL DATA: fetch budget reached; report built from collected mentions.")
-    idx = 2
-    if partial_data:
-        idx = 3
-    for label, count in timeframe_counts.items():
-        lines.insert(idx, f"- {label}: {count}")
-        idx += 1
-
-    story_clusters = _cluster_mentions(all_unique_mentions)
-    cluster_header_idx = idx
-    lines.insert(cluster_header_idx, "")
-    lines.insert(cluster_header_idx + 1, "=== SIGNAL QUALITY METRICS ===")
-    total_mentions_for_quality = len(all_unique_mentions)
-    dated_mentions_for_quality = sum(1 for m in all_unique_mentions if m.get("date", "unknown") != "unknown")
-    corroborated_clusters = sum(
-        1 for c in story_clusters if c.get("corroboration") in {"strong", "moderate"}
-    )
-    early_clusters = sum(1 for c in story_clusters if c.get("corroboration") == "early")
-    ratio_text = (
-        f"{dated_mentions_for_quality}/{total_mentions_for_quality}"
-        if total_mentions_for_quality
-        else "0/0"
-    )
-    lines.insert(cluster_header_idx + 2, f"- DatedEvidenceRatio: {ratio_text}")
-    lines.insert(
-        cluster_header_idx + 3,
-        f"- CorroboratedClusters: {corroborated_clusters}/{len(story_clusters)}",
-    )
-    lines.insert(cluster_header_idx + 4, f"- EarlySingleSourceClusters: {early_clusters}")
-    lines.insert(cluster_header_idx + 5, "")
-    lines.insert(cluster_header_idx + 6, "=== STORY CLUSTERS ===")
-    if not story_clusters:
-        lines.insert(cluster_header_idx + 7, "- No clusterable stories identified.")
-    else:
-        insert_at = cluster_header_idx + 7
-        for cluster in story_clusters[:12]:
-            sample_urls = ", ".join(cluster["sample_urls"][:3]) if cluster["sample_urls"] else "no-url"
-            lines.insert(
-                insert_at,
-                f"[{cluster['story_id']}] ArchetypeHint={cluster['archetype_hint']} | Brands={cluster['brands']} "
-                f"| Corroboration={cluster['corroboration']} | Articles={cluster['article_count']} "
-                f"| Domains={cluster['unique_domains']} | Timeframes={cluster['timeframes_present']} "
-                f"| Dated={cluster['dated_count']} | DateRange={cluster['date_span']} | URLs={sample_urls}",
-            )
-            insert_at += 1
-
-    logger.info(f"Brand historical scan totals: {timeframe_counts} = {total_mentions}")
-    for dl in debug_lines:
-        logger.info(dl)
-
-    return "\n".join(lines)
-
-
 async def fetch_biweekly_mentions() -> str:
     """Fetch mentions for the universal biweekly scan. Social-first, 1-month lookback."""
     config = load_prompts()
@@ -998,31 +620,6 @@ async def call_kimi(system_prompt: str, user_content: str) -> str:
         return data["choices"][0]["message"]["content"]
 
 
-async def analyze_sentiment(mentions_text: str) -> str:
-    config = load_prompts()
-    prompt = config["analysis_prompt"].replace("{timestamp}", now_est())
-    return await call_kimi(prompt, mentions_text)
-
-
-async def analyze_historical(mentions_text: str) -> str:
-    config = load_prompts()
-    prompt = config["historical_prompt"].replace("{timestamp}", now_est())
-    return await call_kimi(prompt, mentions_text)
-
-
-async def analyze_personas(mentions_text: str) -> str:
-    config = load_prompts()
-    prompt = config["persona_prompt"].replace("{timestamp}", now_est())
-    return await call_kimi(prompt, mentions_text)
-
-
-async def analyze_brand_archetypes(mentions_text: str) -> str:
-    config = load_prompts()
-    prompt = config["brand_archetype_prompt"].replace("{timestamp}", now_est())
-    raw_report = await call_kimi(prompt, mentions_text)
-    return _postprocess_brandscan_report(raw_report)
-
-
 async def analyze_biweekly(mentions_text: str) -> str:
     """Run the universal biweekly scan analysis, inject prior memory for trend tracking."""
     config = load_prompts()
@@ -1052,60 +649,6 @@ async def analyze_biweekly(mentions_text: str) -> str:
     return report
 
 
-async def analyze_scan(mentions_text: str, mode: str) -> str:
-    if mode == "persona":
-        return await analyze_personas(mentions_text)
-    return await analyze_sentiment(mentions_text)
-
-
-def parse_scan_mode(args: list[str]) -> tuple[str, str | None]:
-    if not args:
-        return "signal", None
-    if len(args) > 1:
-        return "", "Usage: /scan [signal|persona]"
-    mode = args[0].strip().lower()
-    if mode in {"signal", "persona"}:
-        return mode, None
-    return "", "Usage: /scan [signal|persona]"
-
-
-async def run_scan_mode(update: Update, mode: str) -> None:
-    global last_report, last_mentions_raw, last_sentiment_score
-    tracked = _track_current_task()
-
-    try:
-        scan_label = "persona" if mode == "persona" else "signal"
-        await update.message.reply_text(
-            f"🔍 Running {scan_label} scan on Reddit, X, RedFlagDeals, news..."
-        )
-
-        mentions = await asyncio.wait_for(fetch_all_mentions(), timeout=120)
-        last_mentions_raw = mentions
-        report = await asyncio.wait_for(analyze_scan(mentions, mode), timeout=120)
-        last_report = report
-
-        if mode == "persona":
-            await send_chunked_message(
-                update,
-                f"🧠 *Interac Persona Scan* — {now_est()}\n\n{report}",
-                parse_mode="Markdown",
-            )
-            return
-
-        score = extract_sentiment_score(report)
-        last_sentiment_score = score
-        config = load_prompts()
-        threshold = config.get("alert_threshold", 35)
-        alert_prefix = f"🚨 *ALERT: Sentiment {score}/100* 🚨\n\n" if score < threshold else ""
-        await send_chunked_message(
-            update,
-            f"{alert_prefix}📊 *Interac Intelligence* — {now_est()}\n\n{report}",
-            parse_mode="Markdown",
-        )
-    finally:
-        _untrack_task(tracked)
-
-
 async def run_biweekly_scan(update: Update) -> None:
     """Run the universal biweekly e-Transfer intelligence scan and deliver to Telegram."""
     global last_report, last_mentions_raw
@@ -1131,20 +674,6 @@ async def run_biweekly_scan(update: Update) -> None:
         )
     finally:
         _untrack_task(tracked)
-
-
-def extract_sentiment_score(report: str) -> int:
-    """Parse sentiment score from report text."""
-    for line in report.split("\n"):
-        if "SENTIMENT SCORE" in line.upper():
-            for part in line.split():
-                try:
-                    score = int(part)
-                    if 0 <= score <= 100:
-                        return score
-                except ValueError:
-                    continue
-    return 50
 
 
 def parse_email_modes() -> set[str]:
@@ -1176,7 +705,6 @@ def weekly_key(now_local: datetime) -> str:
 def _should_send_email(
     *,
     trigger: str,
-    alert_kind: str | None = None,
     now_local: datetime | None = None,
 ) -> tuple[bool, str]:
     """
@@ -1188,13 +716,8 @@ def _should_send_email(
 
     modes = parse_email_modes()
 
-    if trigger == "alert" and "alert" not in modes:
-        return False, f"mode excludes alert ({EMAIL_SEND_MODE})"
     if trigger == "weekly" and "weekly" not in modes:
         return False, f"mode excludes weekly ({EMAIL_SEND_MODE})"
-
-    if trigger == "alert" and EMAIL_ALERT_DEDUP and alert_kind is not None and alert_kind == last_alert_kind:
-        return False, f"alert dedup ({alert_kind})"
 
     if trigger == "weekly" and EMAIL_ALERT_DEDUP and now_local is not None:
         current_weekly_key = weekly_key(now_local)
@@ -1262,14 +785,14 @@ def _validate_resend_config() -> tuple[bool, str]:
     return True, "ok"
 
 
-def _send_email_smtp(subject: str, body: str, report_mode: str = "auto") -> tuple[bool, str]:
+def _send_email_smtp(subject: str, body: str) -> tuple[bool, str]:
     valid, reason = _validate_smtp_config()
     if not valid:
         logger.warning(f"Email send skipped: {reason}")
         return False, reason
 
     try:
-        text_body, html_body = build_email_bodies(subject, body, report_mode=report_mode)
+        text_body, html_body = build_email_bodies(subject, body)
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = EMAIL_FROM
@@ -1313,14 +836,14 @@ def _smtp_login_check() -> tuple[bool, str]:
         return False, str(e)
 
 
-def _send_email_resend(subject: str, body: str, report_mode: str = "auto") -> tuple[bool, str]:
+def _send_email_resend(subject: str, body: str) -> tuple[bool, str]:
     valid, reason = _validate_resend_config()
     if not valid:
         logger.warning(f"Email send skipped: {reason}")
         return False, reason
 
     try:
-        text_body, html_body = build_email_bodies(subject, body, report_mode=report_mode)
+        text_body, html_body = build_email_bodies(subject, body)
         response = httpx.post(
             RESEND_API_URL,
             headers={
@@ -1371,10 +894,10 @@ def smtp_health_check() -> tuple[bool, str]:
     return False, f"SMTP health check failed: {send_reason}. {_smtp_config_summary()}"
 
 
-def send_email(subject: str, body: str, report_mode: str = "auto") -> tuple[bool, str]:
+def send_email(subject: str, body: str) -> tuple[bool, str]:
     if EMAIL_PROVIDER == "resend":
-        return _send_email_resend(subject, body, report_mode=report_mode)
-    return _send_email_smtp(subject, body, report_mode=report_mode)
+        return _send_email_resend(subject, body)
+    return _send_email_smtp(subject, body)
 
 
 def _extract_report_field(report: str, field_name: str) -> str:
@@ -1468,26 +991,6 @@ def _compact_email_line(raw_line: str) -> str:
     return f"{html.escape(main_text)}{links_html}"
 
 
-def _score_status(score: int) -> str:
-    if score < 35:
-        return "ALERT"
-    if score > 70:
-        return "POSITIVE"
-    if score < 50:
-        return "WATCH"
-    return "STABLE"
-
-
-def _status_color(status: str) -> str:
-    if status == "ALERT":
-        return "#B42318"
-    if status == "POSITIVE":
-        return "#027A48"
-    if status == "WATCH":
-        return "#B54708"
-    return "#344054"
-
-
 EMAIL_FONT_STACK = "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif"
 EMAIL_PAGE_BG = "#eef2f8"
 EMAIL_CARD_BG = "#ffffff"
@@ -1497,7 +1000,6 @@ EMAIL_TEXT = "#101828"
 EMAIL_MUTED = "#667085"
 EMAIL_ACCENT = "#175CD3"
 EMAIL_CONTAINER_WIDTH = "920"
-BRANDSCAN_STATE_PATH = Path(__file__).parent / "state" / "brandscan_snapshot.json"
 BIWEEKLY_MEMORY_PATH = Path(__file__).parent / "state" / "biweekly_memory.json"
 BIWEEKLY_EXCEL_PATH = Path(__file__).parent / "state" / "biweekly_reports.xlsx"
 
@@ -1531,91 +1033,6 @@ def _compact_panel(raw: str, empty_msg: str, *, max_lines: int = 3, list_mode: b
         f"<div style='border:1px solid {EMAIL_BORDER};border-radius:10px;padding:10px 12px;margin-top:6px;"
         f"font-size:13px;line-height:1.45;color:{EMAIL_TEXT};background:#fcfdff;'>{joined}</div>"
     )
-
-
-def _corr_score(label: str) -> int:
-    value = (label or "").strip().lower()
-    if value == "strong":
-        return 3
-    if value == "moderate":
-        return 2
-    return 1
-
-
-def _extract_claim_key(line: str) -> str:
-    base = re.sub(r"^\s*[-*]\s*", "", line.strip())
-    base = base.split("|", 1)[0].strip().lower()
-    return re.sub(r"\s+", " ", base)
-
-
-def _line_corroboration(line: str) -> str:
-    m = re.search(r"\bCorroboration:\s*(strong|moderate|early)\b", line, flags=re.IGNORECASE)
-    return m.group(1).lower() if m else "early"
-
-
-def _has_real_url(text: str) -> bool:
-    return bool(re.search(r"https?://[^\s,\]]+", text))
-
-
-def _sanitize_claim_line(line: str, *, require_date: bool = True) -> str:
-    clean = " ".join(line.strip().split())
-    if not clean:
-        return ""
-
-    if require_date and "| Date:" not in clean:
-        clean = f"{clean} | Date: unknown"
-
-    if "Sources:" in clean:
-        source_part = clean.split("Sources:", 1)[1]
-        if not _has_real_url(source_part):
-            clean = re.sub(
-                r"Sources:\s*\[[^\]]*\]",
-                "Sources: [insufficient evidence]",
-                clean,
-                flags=re.IGNORECASE,
-            )
-            if "Sources: [insufficient evidence]" not in clean:
-                clean = re.sub(r"Sources:\s*.*$", "Sources: [insufficient evidence]", clean, flags=re.IGNORECASE)
-    else:
-        clean = f"{clean} | Sources: [insufficient evidence]"
-
-    if "| Corroboration:" not in clean:
-        clean = f"{clean} | Corroboration: early"
-    return clean
-
-
-def _section_lines(raw: str) -> list[str]:
-    lines = []
-    for line in (raw or "").splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith("- "):
-            lines.append(stripped)
-        elif stripped.startswith("* "):
-            lines.append(f"- {stripped[2:].strip()}")
-    return lines
-
-
-def _sort_claim_lines(lines: list[str]) -> list[str]:
-    return sorted(lines, key=lambda ln: _corr_score(_line_corroboration(ln)), reverse=True)
-
-
-def _load_brandscan_snapshot() -> dict:
-    try:
-        if not BRANDSCAN_STATE_PATH.exists():
-            return {"claims": {}, "timestamp": ""}
-        return json.loads(BRANDSCAN_STATE_PATH.read_text())
-    except Exception:
-        return {"claims": {}, "timestamp": ""}
-
-
-def _save_brandscan_snapshot(claims: dict[str, str], timestamp: str) -> None:
-    try:
-        BRANDSCAN_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        BRANDSCAN_STATE_PATH.write_text(json.dumps({"claims": claims, "timestamp": timestamp}, indent=2))
-    except Exception as e:
-        logger.warning(f"Could not save brandscan snapshot: {e}")
 
 
 def _load_biweekly_memory() -> dict:
@@ -1694,108 +1111,6 @@ def _append_biweekly_excel(scan_date: str, report: str) -> None:
         logger.warning(f"Could not append to Excel: {e}")
 
 
-def _build_change_lines(current_claims: dict[str, str], previous_claims: dict[str, str]) -> list[str]:
-    lines: list[str] = []
-
-    new_keys = [k for k in current_claims if k not in previous_claims]
-    if new_keys:
-        lines.append(f"- New: {len(new_keys)} claim(s) newly observed since last scan.")
-
-    strengthened = []
-    weakened = []
-    for key, corr in current_claims.items():
-        if key not in previous_claims:
-            continue
-        prev = previous_claims[key]
-        if _corr_score(corr) > _corr_score(prev):
-            strengthened.append(key)
-        elif _corr_score(corr) < _corr_score(prev):
-            weakened.append(key)
-    if strengthened:
-        lines.append(f"- Strengthened: {len(strengthened)} recurring claim(s) moved to stronger corroboration.")
-    if weakened:
-        lines.append(f"- Weakened: {len(weakened)} recurring claim(s) dropped in corroboration strength.")
-
-    dropped_keys = [k for k in previous_claims if k not in current_claims]
-    if dropped_keys:
-        lines.append(f"- Dropped: {len(dropped_keys)} prior claim(s) not seen in this scan.")
-
-    if not lines:
-        lines.append("- Change summary: no material movement versus last stored scan.")
-    return lines
-
-
-def _postprocess_brandscan_report(report: str) -> str:
-    timestamp = _extract_report_field(report, "TIMESTAMP")
-    market_snapshot = _extract_section(
-        report,
-        "MARKET SNAPSHOT:",
-        [
-            "WHAT CHANGED SINCE LAST SCAN:",
-            "INTERAC CHATTER:",
-            "ACTIVE BRAND ARCHETYPES:",
-            "COMPETITOR MOVEMENT:",
-            "SIGNAL QUALITY:",
-            "EVIDENCE LOG:",
-        ],
-    )
-    interac = _extract_section(
-        report,
-        "INTERAC CHATTER:",
-        ["ACTIVE BRAND ARCHETYPES:", "COMPETITOR MOVEMENT:", "SIGNAL QUALITY:", "EVIDENCE LOG:"],
-    )
-    archetypes = _extract_section(
-        report,
-        "ACTIVE BRAND ARCHETYPES:",
-        ["COMPETITOR MOVEMENT:", "SIGNAL QUALITY:", "EVIDENCE LOG:"],
-    )
-    movement = _extract_section(report, "COMPETITOR MOVEMENT:", ["SIGNAL QUALITY:", "EVIDENCE LOG:"])
-    signal_quality = _extract_section(report, "SIGNAL QUALITY:", ["EVIDENCE LOG:"])
-    evidence_log = _extract_section(report, "EVIDENCE LOG:", [])
-
-    interac_lines = _sort_claim_lines([_sanitize_claim_line(l) for l in _section_lines(interac)])
-    archetype_lines = _sort_claim_lines([_sanitize_claim_line(l) for l in _section_lines(archetypes)])
-    movement_lines = _sort_claim_lines([_sanitize_claim_line(l) for l in _section_lines(movement)])
-    signal_quality_lines = _section_lines(signal_quality)
-    evidence_lines = _section_lines(evidence_log)
-    market_lines = _section_lines(market_snapshot)
-
-    current_claims: dict[str, str] = {}
-    for line in interac_lines + archetype_lines + movement_lines:
-        current_claims[_extract_claim_key(line)] = _line_corroboration(line)
-
-    prev = _load_brandscan_snapshot()
-    prev_claims = prev.get("claims", {}) if isinstance(prev, dict) else {}
-    change_lines = _build_change_lines(current_claims, prev_claims if isinstance(prev_claims, dict) else {})
-    _save_brandscan_snapshot(current_claims, timestamp)
-
-    rebuilt = [
-        f"TIMESTAMP: {timestamp or now_est()}",
-        "",
-        "MARKET SNAPSHOT:",
-        *(market_lines or ["- No market snapshot details available."]),
-        "",
-        "WHAT CHANGED SINCE LAST SCAN:",
-        *change_lines,
-        "",
-        "INTERAC CHATTER:",
-        *(interac_lines or ["- No Interac chatter details available."]),
-        "",
-        "ACTIVE BRAND ARCHETYPES:",
-        *(archetype_lines or ["- No active archetypes identified."]),
-        "",
-        "COMPETITOR MOVEMENT:",
-        *(movement_lines or ["- No clear competitor movement identified."]),
-        "",
-        "SIGNAL QUALITY:",
-        *(signal_quality_lines or ["- No signal quality details available."]),
-        "",
-        "EVIDENCE LOG:",
-        *(evidence_lines or ["- No evidence log entries available."]),
-    ]
-    return "\n".join(rebuilt).strip()
-
-
 def _styled_raw_report_html(subject: str, body: str) -> str:
     escaped = html.escape(body)
     return f"""
@@ -1824,283 +1139,74 @@ def _styled_raw_report_html(subject: str, body: str) -> str:
 """.strip()
 
 
-def _build_historical_html(subject: str, body: str) -> str:
-    trend = _extract_report_field(body, "OVERALL TREND")
-    recent = _extract_section(
-        body,
-        "--- RECENT (1 month) ---",
-        ["--- MEDIUM (6 months) ---", "--- OLDER (1 year+) ---", "RECURRING THEMES:", "ACTIONABLE INSIGHT:"],
-    )
-    medium = _extract_section(
-        body,
-        "--- MEDIUM (6 months) ---",
-        ["--- OLDER (1 year+) ---", "RECURRING THEMES:", "ACTIONABLE INSIGHT:"],
-    )
-    older = _extract_section(
-        body,
-        "--- OLDER (1 year+) ---",
-        ["RECURRING THEMES:", "ACTIONABLE INSIGHT:"],
-    )
-    themes = _extract_section(body, "RECURRING THEMES:", ["ACTIONABLE INSIGHT:"])
-    insight = _extract_section(body, "ACTIONABLE INSIGHT:", [])
+def _render_quote_bullets(raw: str, empty_msg: str) -> str:
+    """Render all quote bullets from a biweekly section without truncation.
 
-    sections = [recent, medium, older, themes, insight]
-    if not any(s.strip() for s in sections):
-        return _styled_raw_report_html(subject, body)
-
-    def as_html_block(raw: str) -> str:
-        return _compact_panel(
-            raw,
-            "No notable findings in this timeframe.",
-            max_lines=3,
-            list_mode=True,
-        )
-
-    return f"""
-<html>
-  <body style="margin:0;padding:0;background:{EMAIL_PAGE_BG};font-family:{EMAIL_FONT_STACK};color:{EMAIL_TEXT};">
-    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 0;">
-      <tr><td align="center">
-        <table role="presentation" width="{EMAIL_CONTAINER_WIDTH}" cellspacing="0" cellpadding="0" style="background:{EMAIL_CARD_BG};border-radius:14px;overflow:hidden;border:1px solid {EMAIL_BORDER};">
-          <tr>
-            <td style="background:{EMAIL_NAVY};color:#ffffff;padding:18px 24px;border-bottom:4px solid #fdb913;">
-              <div style="font-size:24px;font-weight:700;letter-spacing:0.2px;">Interac Intelligence</div>
-              <div style="font-size:13px;color:#d8def0;margin-top:6px;">{html.escape(subject)}</div>
-              <div style="font-size:13px;color:#aebce2;margin-top:6px;">Historical deep scan</div>
-            </td>
-          </tr>
-          <tr>
-            <td style="padding:20px 24px;">
-              <div style="border:1px solid {EMAIL_BORDER};background:#f7faff;border-radius:10px;padding:12px;">
-                <div style="font-size:13px;color:{EMAIL_MUTED};">Overall Trend</div>
-                <div style="font-size:16px;font-weight:700;line-height:1.4;">{html.escape(trend)}</div>
-              </div>
-            </td>
-          </tr>
-          <tr><td style="padding:0 24px 20px 24px;"><hr style="border:none;border-top:1px solid {EMAIL_BORDER};"></td></tr>
-          <tr><td style="padding:0 24px 16px 24px;">
-            <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
-              <tr>
-                <td width="50%" valign="top" style="padding-right:8px;"><div style="font-size:15px;font-weight:700;">Recent (1 month)</div>{as_html_block(recent)}</td>
-                <td width="50%" valign="top" style="padding-left:8px;"><div style="font-size:15px;font-weight:700;">Medium (6 months)</div>{as_html_block(medium)}</td>
-              </tr>
-            </table>
-          </td></tr>
-          <tr><td style="padding:0 24px 16px 24px;">
-            <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
-              <tr>
-                <td width="50%" valign="top" style="padding-right:8px;"><div style="font-size:15px;font-weight:700;">Older (1 year+)</div>{as_html_block(older)}</td>
-                <td width="50%" valign="top" style="padding-left:8px;"><div style="font-size:15px;font-weight:700;">Recurring Themes</div>{as_html_block(themes)}</td>
-              </tr>
-            </table>
-          </td></tr>
-          <tr><td style="padding:0 24px 24px 24px;"><div style="font-size:15px;font-weight:700;">Actionable Insight</div>{as_html_block(insight)}</td></tr>
-        </table>
-      </td></tr>
-    </table>
-  </body>
-</html>
-""".strip()
-
-
-def _build_persona_html(subject: str, body: str) -> str:
-    timestamp = _extract_report_field(body, "TIMESTAMP")
-    data_quality = _extract_report_field(body, "DATA QUALITY")
-    archetypes = _extract_section(
-        body,
-        "PRIMARY ARCHETYPES:",
-        ["TOP PAIN THEMES:", "FI/SEGMENT SIGNALS:", "FOCUS RECOMMENDATION:"],
-    )
-    pain_themes = _extract_section(
-        body,
-        "TOP PAIN THEMES:",
-        ["FI/SEGMENT SIGNALS:", "FOCUS RECOMMENDATION:"],
-    )
-    fi_signals = _extract_section(
-        body,
-        "FI/SEGMENT SIGNALS:",
-        ["FOCUS RECOMMENDATION:"],
-    )
-    recommendation = _extract_section(body, "FOCUS RECOMMENDATION:", [])
-
-    sections = [archetypes, pain_themes, fi_signals, recommendation]
-    if not any(s.strip() for s in sections):
-        return _styled_raw_report_html(subject, body)
-
-    def as_html_cards(raw: str, empty_msg: str) -> str:
-        return _compact_panel(raw, empty_msg, max_lines=3, list_mode=True)
-
-    return f"""
-<html>
-  <body style="margin:0;padding:0;background:{EMAIL_PAGE_BG};font-family:{EMAIL_FONT_STACK};color:{EMAIL_TEXT};">
-    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 0;">
-      <tr><td align="center">
-        <table role="presentation" width="{EMAIL_CONTAINER_WIDTH}" cellspacing="0" cellpadding="0" style="background:{EMAIL_CARD_BG};border-radius:14px;overflow:hidden;border:1px solid {EMAIL_BORDER};">
-          <tr>
-            <td style="background:{EMAIL_NAVY};color:#ffffff;padding:18px 24px;border-bottom:4px solid #fdb913;">
-              <div style="font-size:24px;font-weight:700;letter-spacing:0.2px;">Interac Intelligence</div>
-              <div style="font-size:13px;color:#d8def0;margin-top:6px;">{html.escape(subject)}</div>
-              <div style="font-size:13px;color:#aebce2;margin-top:6px;">{html.escape(timestamp)}</div>
-            </td>
-          </tr>
-          <tr>
-            <td style="padding:18px 24px;">
-              <div style="border:1px solid #cdddfa;background:#f5f8ff;border-radius:10px;padding:12px 14px;">
-                <div style="font-size:13px;color:#475467;">Data Quality</div>
-                <div style="font-size:14px;font-weight:600;line-height:1.45;">{html.escape(data_quality)}</div>
-              </div>
-            </td>
-          </tr>
-          <tr><td style="padding:0 24px 20px 24px;"><hr style="border:none;border-top:1px solid {EMAIL_BORDER};"></td></tr>
-          <tr><td style="padding:0 24px 16px 24px;">
-            <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
-              <tr>
-                <td width="50%" valign="top" style="padding-right:8px;"><div style="font-size:15px;font-weight:700;">Primary Archetypes</div>{as_html_cards(archetypes, "No clear archetypes identified.")}</td>
-                <td width="50%" valign="top" style="padding-left:8px;"><div style="font-size:15px;font-weight:700;">Top Pain Themes</div>{as_html_cards(pain_themes, "No repeated pain themes identified.")}</td>
-              </tr>
-            </table>
-          </td></tr>
-          <tr><td style="padding:0 24px 24px 24px;">
-            <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
-              <tr>
-                <td width="50%" valign="top" style="padding-right:8px;"><div style="font-size:15px;font-weight:700;">FI / Segment Signals</div>{as_html_cards(fi_signals, "No FI-specific segment signal identified.")}</td>
-                <td width="50%" valign="top" style="padding-left:8px;"><div style="font-size:15px;font-weight:700;">Focus Recommendation</div>{as_html_cards(recommendation, "No recommendation provided.")}</td>
-              </tr>
-            </table>
-          </td></tr>
-        </table>
-      </td></tr>
-    </table>
-  </body>
-</html>
-""".strip()
-
-
-def _build_brand_archetype_html(subject: str, body: str) -> str:
-    timestamp = _extract_report_field(body, "TIMESTAMP")
-    market_snapshot = _extract_section(
-        body,
-        "MARKET SNAPSHOT:",
-        [
-            "WHAT CHANGED SINCE LAST SCAN:",
-            "INTERAC CHATTER:",
-            "ACTIVE BRAND ARCHETYPES:",
-            "COMPETITOR MOVEMENT:",
-            "SIGNAL QUALITY:",
-            "EVIDENCE LOG:",
-        ],
-    )
-    changes_since_last = _extract_section(
-        body,
-        "WHAT CHANGED SINCE LAST SCAN:",
-        ["INTERAC CHATTER:", "ACTIVE BRAND ARCHETYPES:", "COMPETITOR MOVEMENT:", "SIGNAL QUALITY:", "EVIDENCE LOG:"],
-    )
-    interac_chatter = _extract_section(
-        body,
-        "INTERAC CHATTER:",
-        ["ACTIVE BRAND ARCHETYPES:", "COMPETITOR MOVEMENT:", "SIGNAL QUALITY:", "EVIDENCE LOG:"],
-    )
-    archetypes = _extract_section(
-        body,
-        "ACTIVE BRAND ARCHETYPES:",
-        ["COMPETITOR MOVEMENT:", "SIGNAL QUALITY:", "EVIDENCE LOG:"],
-    )
-    movement = _extract_section(
-        body,
-        "COMPETITOR MOVEMENT:",
-        ["SIGNAL QUALITY:", "EVIDENCE LOG:"],
-    )
-    signal_quality = _extract_section(
-        body,
-        "SIGNAL QUALITY:",
-        ["EVIDENCE LOG:"],
-    )
-    evidence_log = _extract_section(body, "EVIDENCE LOG:", [])
-
-    sections = [market_snapshot, changes_since_last, interac_chatter, archetypes, movement, signal_quality, evidence_log]
-    if not any(s.strip() for s in sections):
-        return _styled_raw_report_html(subject, body)
-
-    def as_html_cards(raw: str, empty_msg: str, max_lines: int = 6) -> str:
-        return _compact_panel(raw, empty_msg, max_lines=min(max_lines, 4), list_mode=True)
-
-    def dashboard_card(title: str, content_html: str) -> str:
+    Each bullet is expected in the form:
+        - "quote text" — Platform, Date. Source: URL
+    We split on ' — ' to separate the quote from the attribution, render
+    them stacked so every quote is readable at a glance.
+    """
+    if not raw:
         return (
-            f"<table role='presentation' width='100%' cellspacing='0' cellpadding='0' "
-            f"style='border:1px solid {EMAIL_BORDER};border-radius:12px;background:#fbfcff;'>"
-            "<tr>"
-            f"<td height='228' valign='top' style='padding:12px 14px;'>"
-            f"<div style='font-size:16px;font-weight:700;color:{EMAIL_TEXT};margin-bottom:6px;'>{title}</div>"
-            f"{content_html}"
-            "</td>"
-            "</tr>"
-            "</table>"
+            f"<div style='border:1px solid {EMAIL_BORDER};border-radius:10px;padding:10px 14px;"
+            f"font-size:13px;color:{EMAIL_MUTED};background:#fcfdff;'>{html.escape(empty_msg)}</div>"
         )
 
-    return f"""
-<html>
-  <body style="margin:0;padding:0;background:{EMAIL_PAGE_BG};font-family:{EMAIL_FONT_STACK};color:{EMAIL_TEXT};">
-    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 0;">
-      <tr><td align="center">
-        <table role="presentation" width="{EMAIL_CONTAINER_WIDTH}" cellspacing="0" cellpadding="0" style="background:{EMAIL_CARD_BG};border-radius:14px;overflow:hidden;border:1px solid {EMAIL_BORDER};">
-          <tr>
-            <td style="background:{EMAIL_NAVY};color:#ffffff;padding:18px 24px;border-bottom:4px solid #fdb913;">
-              <div style="font-size:24px;font-weight:700;letter-spacing:0.2px;">Interac Intelligence</div>
-              <div style="font-size:13px;color:#d8def0;margin-top:6px;">{html.escape(subject)}</div>
-              <div style="font-size:13px;color:#aebce2;margin-top:6px;">{html.escape(timestamp)}</div>
-            </td>
-          </tr>
-          <tr><td style="padding:16px 24px 12px 24px;">
-            <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
-              <tr>
-                <td width="50%" valign="top" style="padding-right:8px;">
-                  {dashboard_card("Market Snapshot", as_html_cards(market_snapshot, "No market snapshot details available.", max_lines=4))}
-                </td>
-                <td width="50%" valign="top" style="padding-left:8px;">
-                  {dashboard_card("What Changed Since Last Scan", as_html_cards(changes_since_last, "No previous scan available for comparison.", max_lines=4))}
-                </td>
-              </tr>
-            </table>
-          </td></tr>
-          <tr><td style="padding:0 24px 12px 24px;">
-            <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
-              <tr>
-                <td width="50%" valign="top" style="padding-right:8px;">
-                  {dashboard_card("Interac Chatter", as_html_cards(interac_chatter, "No Interac chatter details available.", max_lines=4))}
-                </td>
-                <td width="50%" valign="top" style="padding-left:8px;">
-                  {dashboard_card("Active Brand Archetypes", as_html_cards(archetypes, "No active archetypes identified."))}
-                </td>
-              </tr>
-            </table>
-          </td></tr>
-          <tr><td style="padding:0 24px 24px 24px;">
-            <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
-              <tr>
-                <td width="50%" valign="top" style="padding-right:8px;">
-                  {dashboard_card("Competitor Movement", as_html_cards(movement, "No clear competitor movement identified."))}
-                </td>
-                <td width="50%" valign="top" style="padding-left:8px;">
-                  {dashboard_card("Signal Quality", as_html_cards(signal_quality, "No signal quality details available.", max_lines=4))}
-                </td>
-              </tr>
-            </table>
-          </td></tr>
-          <tr><td style="padding:0 24px 24px 24px;">
-            <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
-              <tr>
-                <td width="100%" valign="top">
-                  {dashboard_card("Evidence Log", as_html_cards(evidence_log, "No evidence log entries available.", max_lines=6))}
-                </td>
-              </tr>
-            </table>
-          </td></tr>
-        </table>
-      </td></tr>
-    </table>
-  </body>
-</html>
-""".strip()
+    items = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or not (stripped.startswith("- ") or stripped.startswith("• ")):
+            continue
+        text = stripped[2:].strip()
+        if not text or "Nothing notable" in text:
+            continue
+
+        # Split quote from attribution on ' — '
+        if " — " in text:
+            quote_part, attr_part = text.split(" — ", 1)
+        else:
+            quote_part, attr_part = text, ""
+
+        # Extract URL from attribution if present (Source: URL pattern)
+        url_match = re.search(r"Source:\s*(https?://\S+)", attr_part, re.IGNORECASE)
+        link_html = ""
+        if url_match:
+            url = url_match.group(1).rstrip(".")
+            safe_url = html.escape(url, quote=True)
+            domain = re.sub(r"^www\.", "", re.sub(r"https?://", "", url).split("/")[0])
+            link_html = f" <a href='{safe_url}' style='color:{EMAIL_ACCENT};font-size:11px;text-decoration:none;'>{html.escape(domain)}</a>"
+            # Remove Source: URL from attr display
+            attr_part = re.sub(r"\s*Source:\s*https?://\S+", "", attr_part, flags=re.IGNORECASE).strip().rstrip(".")
+
+        quote_html = html.escape(quote_part.strip())
+        attr_html = html.escape(attr_part.strip()) if attr_part.strip() else ""
+
+        item = (
+            f"<li style='margin:0 0 10px 0;padding:0;list-style:none;'>"
+            f"<div style='font-size:13px;line-height:1.5;color:{EMAIL_TEXT};'>{quote_html}</div>"
+        )
+        if attr_html or link_html:
+            item += (
+                f"<div style='font-size:11px;color:{EMAIL_MUTED};margin-top:3px;'>"
+                f"{attr_html}{link_html}</div>"
+            )
+        item += "</li>"
+        items.append(item)
+
+    if not items:
+        return (
+            f"<div style='border:1px solid {EMAIL_BORDER};border-radius:10px;padding:10px 14px;"
+            f"font-size:13px;color:{EMAIL_MUTED};background:#fcfdff;'>{html.escape(empty_msg)}</div>"
+        )
+
+    joined = "".join(items)
+    return (
+        f"<div style='border:1px solid {EMAIL_BORDER};border-radius:10px;padding:12px 14px;"
+        f"background:#fcfdff;'>"
+        f"<ul style='margin:0;padding:0;'>{joined}</ul>"
+        f"</div>"
+    )
 
 
 def _build_biweekly_html(subject: str, body: str) -> str:
@@ -2112,9 +1218,6 @@ def _build_biweekly_html(subject: str, body: str) -> str:
     if not any(s.strip() for s in [etransfer_raw, competitor_raw, trend_raw]):
         return _styled_raw_report_html(subject, body)
 
-    def as_block(raw: str) -> str:
-        return _compact_panel(raw, "Nothing notable this scan.", max_lines=8, list_mode=True)
-
     return f"""
 <html>
   <body style="margin:0;padding:0;background:{EMAIL_PAGE_BG};font-family:{EMAIL_FONT_STACK};color:{EMAIL_TEXT};">
@@ -2123,22 +1226,23 @@ def _build_biweekly_html(subject: str, body: str) -> str:
         <table role="presentation" width="{EMAIL_CONTAINER_WIDTH}" cellspacing="0" cellpadding="0" style="background:{EMAIL_CARD_BG};border-radius:14px;overflow:hidden;border:1px solid {EMAIL_BORDER};">
           <tr>
             <td style="background:{EMAIL_NAVY};color:#ffffff;padding:18px 24px;border-bottom:4px solid #fdb913;">
-              <div style="font-size:24px;font-weight:700;letter-spacing:0.2px;">Interac Intelligence</div>
-              <div style="font-size:13px;color:#d8def0;margin-top:6px;">{html.escape(subject)}</div>
+              <div style="font-size:22px;font-weight:700;letter-spacing:0.2px;">Interac e-Transfer Intelligence</div>
               <div style="font-size:13px;color:#aebce2;margin-top:6px;">{html.escape(scan_date)}</div>
             </td>
           </tr>
           <tr><td style="padding:20px 24px 8px 24px;">
-            <div style="font-size:15px;font-weight:700;margin-bottom:6px;">e-Transfer Chatter</div>
-            {as_block(etransfer_raw)}
+            <div style="font-size:15px;font-weight:700;margin-bottom:8px;">e-Transfer Chatter</div>
+            {_render_quote_bullets(etransfer_raw, "Nothing notable this scan.")}
           </td></tr>
-          <tr><td style="padding:8px 24px;">
-            <div style="font-size:15px;font-weight:700;margin-bottom:6px;">Competitor Landscape</div>
-            {as_block(competitor_raw)}
+          <tr><td style="padding:16px 24px 8px 24px;"><hr style="border:none;border-top:1px solid {EMAIL_BORDER};"></td></tr>
+          <tr><td style="padding:8px 24px 8px 24px;">
+            <div style="font-size:15px;font-weight:700;margin-bottom:8px;">Competitor Landscape</div>
+            {_render_quote_bullets(competitor_raw, "Nothing notable this scan.")}
           </td></tr>
+          <tr><td style="padding:16px 24px 8px 24px;"><hr style="border:none;border-top:1px solid {EMAIL_BORDER};"></td></tr>
           <tr><td style="padding:8px 24px 24px 24px;">
-            <div style="font-size:15px;font-weight:700;margin-bottom:6px;">Trend vs Last Scan</div>
-            {as_block(trend_raw)}
+            <div style="font-size:15px;font-weight:700;margin-bottom:8px;">Trend vs Last Scan</div>
+            {_compact_panel(trend_raw, "No trend data yet.", max_lines=10, list_mode=True)}
           </td></tr>
         </table>
       </td></tr>
@@ -2148,150 +1252,14 @@ def _build_biweekly_html(subject: str, body: str) -> str:
 """.strip()
 
 
-def build_email_bodies(subject: str, body: str, report_mode: str = "auto") -> tuple[str, str]:
-    resolved_mode = report_mode
-    if resolved_mode == "auto":
-        if "e-Transfer Chatter:" in body and "Competitor Landscape:" in body:
-            resolved_mode = "biweekly"
-        elif "OVERALL TREND:" in body:
-            resolved_mode = "historical"
-        elif "MARKET SNAPSHOT:" in body and "ACTIVE BRAND ARCHETYPES:" in body:
-            resolved_mode = "brand_archetype"
-        elif "PRIMARY ARCHETYPES:" in body and "TOP PAIN THEMES:" in body:
-            resolved_mode = "persona"
-        else:
-            resolved_mode = "daily"
-    if resolved_mode == "biweekly":
-        return body, _build_biweekly_html(subject, body)
-    if resolved_mode == "historical":
-        return body, _build_historical_html(subject, body)
-    if resolved_mode == "brand_archetype":
-        return body, _build_brand_archetype_html(subject, body)
-    if resolved_mode == "persona":
-        return body, _build_persona_html(subject, body)
-
-    score_text = _extract_report_field(body, "SENTIMENT SCORE")
-    volume_text = _extract_report_field(body, "MENTION VOLUME")
-    ts_text = _extract_report_field(body, "TIMESTAMP")
-
-    score_num = 50
-    m = re.search(r"\b(\d{1,3})\b", score_text)
-    if m:
-        try:
-            score_num = int(m.group(1))
-        except ValueError:
-            pass
-
-    status = _score_status(score_num)
-    color = _status_color(status)
-
-    people_section = _extract_section(
-        body,
-        "--- WHAT PEOPLE ARE SAYING",
-        ["--- PRESS & INDUSTRY ---", "PRODUCT HEALTH:", "COMPETITIVE WATCH:"],
-    )
-    press_section = _extract_section(
-        body,
-        "--- PRESS & INDUSTRY ---",
-        ["PRODUCT HEALTH:", "COMPETITIVE WATCH:"],
-    )
-    health_section = _extract_section(
-        body,
-        "PRODUCT HEALTH:",
-        ["COMPETITIVE WATCH:"],
-    )
-    comp_section = _extract_section(body, "COMPETITIVE WATCH:", [])
-
-    def as_html_block(raw: str) -> str:
-        return _compact_panel(raw, "No material updates in this section.", max_lines=3, list_mode=True)
-
-    if not any(s.strip() for s in [people_section, press_section, health_section, comp_section]):
-        return body, _styled_raw_report_html(subject, body)
-
-    html_body = f"""
-<html>
-  <body style="margin:0;padding:0;background:{EMAIL_PAGE_BG};font-family:{EMAIL_FONT_STACK};color:{EMAIL_TEXT};">
-    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 0;">
-      <tr>
-        <td align="center">
-          <table role="presentation" width="{EMAIL_CONTAINER_WIDTH}" cellspacing="0" cellpadding="0" style="background:{EMAIL_CARD_BG};border-radius:14px;overflow:hidden;border:1px solid {EMAIL_BORDER};">
-            <tr>
-              <td style="background:{EMAIL_NAVY};color:#ffffff;padding:18px 24px;border-bottom:4px solid #fdb913;">
-                <div style="font-size:24px;font-weight:700;letter-spacing:0.2px;">Interac Intelligence</div>
-                <div style="font-size:13px;color:#d8def0;margin-top:6px;">{html.escape(subject)}</div>
-                <div style="font-size:13px;color:#aebce2;margin-top:6px;">{html.escape(ts_text)}</div>
-              </td>
-            </tr>
-            <tr>
-              <td style="padding:20px 24px;">
-                <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
-                  <tr>
-                    <td style="width:33%;padding-right:8px;">
-                      <div style="border:1px solid {EMAIL_BORDER};border-radius:10px;padding:12px;background:#fcfdff;">
-                        <div style="font-size:13px;color:{EMAIL_MUTED};">Sentiment Score</div>
-                        <div style="font-size:28px;font-weight:700;line-height:1.2;">{score_num}</div>
-                      </div>
-                    </td>
-                    <td style="width:33%;padding:0 8px;">
-                      <div style="border:1px solid {EMAIL_BORDER};border-radius:10px;padding:12px;background:#fcfdff;">
-                        <div style="font-size:13px;color:{EMAIL_MUTED};">Mention Volume</div>
-                        <div style="font-size:18px;font-weight:600;line-height:1.3;">{html.escape(volume_text)}</div>
-                      </div>
-                    </td>
-                    <td style="width:33%;padding-left:8px;">
-                      <div style="border:1px solid {EMAIL_BORDER};border-radius:10px;padding:12px;background:#fcfdff;">
-                        <div style="font-size:13px;color:{EMAIL_MUTED};">Status</div>
-                        <div style="display:inline-block;margin-top:6px;background:{color};color:#fff;padding:4px 10px;border-radius:999px;font-size:13px;font-weight:700;">{status}</div>
-                      </div>
-                    </td>
-                  </tr>
-                </table>
-              </td>
-            </tr>
-            <tr><td style="padding:0 24px 14px 24px;">
-              <div style="font-size:13px;color:{EMAIL_MUTED};line-height:1.45;">
-                Status <b style="color:{EMAIL_TEXT};">{status}</b> at score <b style="color:{EMAIL_TEXT};">{score_num}</b> with
-                volume <b style="color:{EMAIL_TEXT};">{html.escape(volume_text)}</b>.
-              </div>
-            </td></tr>
-            <tr><td style="padding:0 24px 16px 24px;"><hr style="border:none;border-top:1px solid {EMAIL_BORDER};"></td></tr>
-            <tr>
-              <td style="padding:0 24px 16px 24px;">
-                <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
-                  <tr>
-                    <td width="50%" valign="top" style="padding-right:8px;"><div style="font-size:15px;font-weight:700;">What People Are Saying</div>{as_html_block(people_section)}</td>
-                    <td width="50%" valign="top" style="padding-left:8px;"><div style="font-size:15px;font-weight:700;">Press & Industry</div>{as_html_block(press_section)}</td>
-                  </tr>
-                </table>
-              </td>
-            </tr>
-            <tr>
-              <td style="padding:0 24px 24px 24px;">
-                <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
-                  <tr>
-                    <td width="50%" valign="top" style="padding-right:8px;"><div style="font-size:15px;font-weight:700;">Product Health</div>{as_html_block(health_section)}</td>
-                    <td width="50%" valign="top" style="padding-left:8px;"><div style="font-size:15px;font-weight:700;">Competitive Watch</div>{as_html_block(comp_section)}</td>
-                  </tr>
-                </table>
-              </td>
-            </tr>
-          </table>
-        </td>
-      </tr>
-    </table>
-  </body>
-</html>
-""".strip()
-
-    return body, html_body
+def build_email_bodies(subject: str, body: str) -> tuple[str, str]:
+    return body, _build_biweekly_html(subject, body)
 
 
-def _record_email_sent(trigger: str, *, alert_kind: str | None = None, now_local: datetime | None = None) -> None:
-    global last_email_sent_at, last_alert_kind, last_weekly_email_key
+def _record_email_sent(trigger: str, *, now_local: datetime | None = None) -> None:
+    global last_email_sent_at, last_weekly_email_key
     last_email_sent_at = datetime.now(timezone.utc)
-    if trigger == "alert":
-        last_alert_kind = alert_kind
-    elif trigger == "weekly" and now_local is not None:
+    if trigger == "weekly" and now_local is not None:
         last_weekly_email_key = weekly_key(now_local)
 
 
@@ -2360,107 +1328,6 @@ async def send_chunked_message(
 
 
 # ─── Scheduled Broadcast ─────────────────────────────────────────────────────
-async def scheduled_sentiment_broadcast(context: ContextTypes.DEFAULT_TYPE):
-    global last_report, last_mentions_raw, last_sentiment_score, last_alert_kind
-    tracked = _track_current_task()
-    logger.info(f"[{now_est()}] Running scheduled Interac sentiment scan...")
-
-    try:
-        mentions = await fetch_all_mentions()
-        last_mentions_raw = mentions
-        report = await analyze_scan(mentions, "signal")
-        last_report = report
-
-        score = extract_sentiment_score(report)
-        config = load_prompts()
-        threshold = config.get("alert_threshold", 35)
-
-        # Check for low/high alert conditions.
-        alert_prefix = ""
-        is_low_alert = score < threshold
-        is_high_alert = score > ALERT_HIGH_THRESHOLD
-        alert_kind = None
-        if is_low_alert:
-            alert_kind = "low"
-            alert_prefix = f"🚨 *ALERT: Sentiment dropped to {score}/100* 🚨\n\n"
-        elif is_high_alert:
-            alert_kind = "high"
-            alert_prefix = f"🔥 *SPIKE: Sentiment jumped to {score}/100* 🔥\n\n"
-
-        last_sentiment_score = score
-        message = f"{alert_prefix}📊 *Interac Intelligence* — {now_est()}\n\n{report}"
-
-        if alert_kind is not None:
-            should_send, reason = _should_send_email(trigger="alert", alert_kind=alert_kind)
-        else:
-            should_send, reason = (False, "no alert condition")
-
-        if should_send:
-            label = "ALERT" if alert_kind == "low" else "SPIKE"
-            subject = f"{EMAIL_SUBJECT_PREFIX} — {label} ({score}/100)"
-            body_lines = [f"Interac Intelligence — {now_est()}", ""]
-            if alert_kind == "low":
-                body_lines += [f"ALERT: Sentiment dropped to {score}/100 (threshold {threshold})", ""]
-            elif alert_kind == "high":
-                body_lines += [f"SPIKE: Sentiment rose to {score}/100 (high threshold {ALERT_HIGH_THRESHOLD})", ""]
-            body_lines.append(report)
-            ok, send_reason = send_email(subject=subject, body="\n".join(body_lines), report_mode="daily")
-            if ok:
-                _record_email_sent("alert", alert_kind=alert_kind)
-            else:
-                logger.error(f"Alert email failed: {send_reason}")
-        else:
-            logger.info(f"Email not sent: {reason}")
-
-        last_alert_kind = alert_kind
-
-        for chat_id in subscribed_chats.copy():
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=message, parse_mode="Markdown")
-            except Exception as e:
-                logger.error(f"Failed to send to {chat_id}: {e}")
-                subscribed_chats.discard(chat_id)
-    except Exception as e:
-        logger.error(f"Scheduled job failed: {e}")
-    finally:
-        _untrack_task(tracked)
-
-
-async def scheduled_weekly_email_digest(context: ContextTypes.DEFAULT_TYPE):
-    global last_report, last_mentions_raw, last_sentiment_score
-    tracked = _track_current_task()
-    now_local = datetime.now(EST)
-    target_weekday = WEEKDAY_TO_INDEX.get(EMAIL_WEEKLY_DAY, 0)
-    if now_local.weekday() != target_weekday or now_local.hour != EMAIL_WEEKLY_HOUR:
-        return
-
-    should_send, reason = _should_send_email(trigger="weekly", now_local=now_local)
-    if not should_send:
-        logger.info(f"Weekly email not sent: {reason}")
-        return
-
-    logger.info(f"[{now_est()}] Running weekly email digest scan...")
-    try:
-        mentions = await fetch_all_mentions()
-        last_mentions_raw = mentions
-        report = await analyze_scan(mentions, "signal")
-        last_report = report
-        score = extract_sentiment_score(report)
-        last_sentiment_score = score
-
-        subject = f"{EMAIL_SUBJECT_PREFIX} — WEEKLY DIGEST ({score}/100)"
-        body = f"Interac Intelligence Weekly Digest — {now_est()}\n\n{report}"
-        ok, send_reason = send_email(subject, body, report_mode="daily")
-        if ok:
-            _record_email_sent("weekly", now_local=now_local)
-        else:
-            logger.error(f"Weekly email failed: {send_reason}")
-    except Exception as e:
-        logger.error(f"Weekly email digest failed: {e}")
-    finally:
-        _untrack_task(tracked)
-
-
 async def scheduled_biweekly_broadcast(context: ContextTypes.DEFAULT_TYPE):
     """Daily job that runs the biweekly scan if 14+ days have passed since the last one."""
     global last_report, last_mentions_raw
@@ -2499,7 +1366,7 @@ async def scheduled_biweekly_broadcast(context: ContextTypes.DEFAULT_TYPE):
         should_send, reason = _should_send_email(trigger="weekly", now_local=now_local)
         if should_send:
             subject = f"{EMAIL_SUBJECT_PREFIX} — BIWEEKLY REPORT"
-            ok, send_reason = send_email(subject, f"Interac e-Transfer Intelligence — {now_est()}\n\n{report}", report_mode="biweekly")
+            ok, send_reason = send_email(subject, f"Interac e-Transfer Intelligence — {now_est()}\n\n{report}")
             if ok:
                 _record_email_sent("weekly", now_local=now_local)
             else:
@@ -2526,9 +1393,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /raw — See raw mentions from last scan\n"
         "• /prompt — View current config\n"
         "• /status — Check bot status\n"
-        "• /email — Admin: run scan + send email now\n"
-        "• /deepscan — Admin: historical deep scan\n"
-        "• /brandscan — Admin: brand archetype scan\n"
+        "• /email — Admin: run fresh biweekly scan + send email\n"
         "• /stop — Admin: cancel running jobs\n"
         "• /smtpcheck — Admin: check email config\n"
         "• Any text → Follow-up on latest report",
@@ -2596,184 +1461,38 @@ async def cmd_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global last_report, last_mentions_raw, last_sentiment_score
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Admin only.")
-        return
-
-    tracked = _track_current_task()
-    await update.message.reply_text("📧 Running fresh scan and sending email...")
-    try:
-        # Hard timeout so manual email runs never hang indefinitely.
-        mentions = await asyncio.wait_for(fetch_all_mentions(), timeout=120)
-        last_mentions_raw = mentions
-        report = await asyncio.wait_for(analyze_scan(mentions, "signal"), timeout=120)
-        last_report = report
-
-        score = extract_sentiment_score(report)
-        last_sentiment_score = score
-        config = load_prompts()
-        low_threshold = config.get("alert_threshold", 35)
-
-        subject = f"{EMAIL_SUBJECT_PREFIX} — MANUAL REPORT ({score}/100)"
-        body = (
-            f"Interac Intelligence — {now_est()}\n\n"
-            f"Manual /email trigger\n"
-            f"Low alert threshold: {low_threshold}\n"
-            f"High alert threshold: {ALERT_HIGH_THRESHOLD}\n\n"
-            f"{report}"
-        )
-        ok, send_reason = send_email(subject, body, report_mode="daily")
-        if ok:
-            _record_email_sent("on_demand")
-            await update.message.reply_text("✅ Email sent successfully.")
-        else:
-            await update.message.reply_text(f"❌ Email failed: {send_reason}")
-    except asyncio.TimeoutError:
-        await update.message.reply_text("⏱️ /email timed out after 60 seconds.")
-    except Exception as e:
-        logger.error(f"/email failed: {e}")
-        await update.message.reply_text(f"❌ /email failed: {e}")
-    finally:
-        _untrack_task(tracked)
-
-
-async def cmd_deepscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Admin only.")
-        return
-
-    tracked = _track_current_task()
-    # Run a diagnostic probe first
-    diag = await _search_diagnostic()
-    await update.message.reply_text(f"🔬 Search diagnostic: {diag}")
-
-    if diag.startswith("FAIL"):
-        await update.message.reply_text("❌ Search provider is not working. Fix the issue above before scanning.")
-        return
-
-    await update.message.reply_text("🧠 Running historical deep scan — fetching data...")
-    _search_errors.clear()
-    try:
-        historical_mentions = await asyncio.wait_for(fetch_historical_mentions(), timeout=180)
-
-        mention_count = 0
-        for line in historical_mentions.split("\n"):
-            if line.startswith("TOTAL HISTORICAL MENTIONS:"):
-                try:
-                    mention_count = int(line.split(":")[1].strip())
-                except ValueError:
-                    pass
-                break
-
-        await update.message.reply_text(
-            f"📊 Fetched {mention_count} raw mentions. Analyzing with Kimi..."
-        )
-
-        if _search_errors:
-            unique_errors = list(dict.fromkeys(_search_errors[:5]))
-            err_text = "\n".join(f"• {e[:120]}" for e in unique_errors)
-            await update.message.reply_text(f"⚠️ Search errors encountered:\n{err_text}")
-
-        if mention_count == 0:
-            await update.message.reply_text(
-                "⚠️ Zero mentions found. Raw output:\n\n"
-                + historical_mentions[:1500]
-            )
-            return
-
-        report = await asyncio.wait_for(analyze_historical(historical_mentions), timeout=120)
-
-        telegram_message = f"📚 *Interac Historical Deep Scan* — {now_est()}\n\n{report}"
-        await send_chunked_message(update, telegram_message, parse_mode="Markdown")
-
-        subject = f"{EMAIL_SUBJECT_PREFIX} — HISTORICAL DEEP SCAN"
-        email_body = f"Interac Historical Deep Scan — {now_est()}\n\n{report}"
-        ok, send_reason = send_email(subject, email_body, report_mode="historical")
-        if ok:
-            _record_email_sent("on_demand")
-            await update.message.reply_text("✅ Deep scan email sent successfully.")
-        else:
-            await update.message.reply_text(f"❌ Deep scan email failed: {send_reason}")
-    except asyncio.TimeoutError:
-        await update.message.reply_text("⏱️ /deepscan timed out after 180 seconds.")
-    except Exception as e:
-        logger.error(f"/deepscan failed: {e}")
-        await update.message.reply_text(f"❌ /deepscan failed: {e}")
-    finally:
-        _untrack_task(tracked)
-
-
-async def cmd_brandscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_report, last_mentions_raw
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Admin only.")
         return
 
     tracked = _track_current_task()
-    diag = await _search_diagnostic()
-    await update.message.reply_text(f"🔬 Search diagnostic: {diag}")
-    if diag.startswith("FAIL"):
-        await update.message.reply_text("❌ Search provider is not working. Fix the issue above before scanning.")
-        return
-
-    await update.message.reply_text("🏷️ Running historical brand archetype scan — fetching data...")
-    _search_errors.clear()
+    await update.message.reply_text("📧 Running fresh biweekly scan and sending email...")
     try:
-        await update.message.reply_text("⏳ Step 1/3: Fetching market mentions...")
-        brand_mentions = await asyncio.wait_for(
-            fetch_brand_archetype_mentions(fetch_budget_seconds=200),
-            timeout=210,
-        )
-        last_mentions_raw = brand_mentions
+        mentions = await asyncio.wait_for(fetch_biweekly_mentions(), timeout=180)
+        last_mentions_raw = mentions
 
-        mention_count = 0
-        for line in brand_mentions.split("\n"):
-            if line.startswith("TOTAL BRAND HISTORICAL MENTIONS:"):
-                try:
-                    mention_count = int(line.split(":")[1].strip())
-                except ValueError:
-                    pass
-                break
-
-        await update.message.reply_text(
-            f"📊 Fetched {mention_count} raw brand mentions. Step 2/3: Building archetypes with Kimi..."
-        )
-
-        if _search_errors:
-            unique_errors = list(dict.fromkeys(_search_errors[:5]))
-            err_text = "\n".join(f"• {e[:120]}" for e in unique_errors)
-            await update.message.reply_text(f"⚠️ Search errors encountered:\n{err_text}")
-
-        if mention_count == 0:
-            await update.message.reply_text(
-                "⚠️ Zero mentions found. Raw output:\n\n"
-                + brand_mentions[:1500]
-            )
+        if mentions.startswith("No mentions"):
+            await update.message.reply_text(f"No data found this scan.\n\n{mentions[:500]}")
             return
 
-        report = await asyncio.wait_for(analyze_brand_archetypes(brand_mentions), timeout=120)
+        await update.message.reply_text("Mentions collected. Analyzing with Kimi...")
+        report = await asyncio.wait_for(analyze_biweekly(mentions), timeout=120)
         last_report = report
 
-        telegram_message = f"🏷️ *Interac Brand Archetype Scan* — {now_est()}\n\n{report}"
-        await send_chunked_message(update, telegram_message, parse_mode="Markdown")
-
-        await update.message.reply_text("📧 Step 3/3: Sending brand archetype email...")
-        subject = f"{EMAIL_SUBJECT_PREFIX} — BRAND ARCHETYPE SCAN"
-        email_body = f"Interac Brand Archetype Scan — {now_est()}\n\n{report}"
-        ok, send_reason = send_email(subject, email_body, report_mode="brand_archetype")
+        subject = f"{EMAIL_SUBJECT_PREFIX} — MANUAL REPORT"
+        body = f"Interac e-Transfer Intelligence — {now_est()}\n\n{report}"
+        ok, send_reason = send_email(subject, body)
         if ok:
             _record_email_sent("on_demand")
-            await update.message.reply_text("✅ Brand archetype email sent successfully.")
+            await update.message.reply_text("✅ Email sent successfully.")
         else:
-            await update.message.reply_text(f"❌ Brand archetype email failed: {send_reason}")
+            await update.message.reply_text(f"❌ Email failed: {send_reason}")
     except asyncio.TimeoutError:
-        await update.message.reply_text(
-            "⏱️ /brandscan timed out. Partial-data fallback may apply; try rerunning shortly."
-        )
+        await update.message.reply_text("⏱️ /email timed out after 300 seconds.")
     except Exception as e:
-        logger.error(f"/brandscan failed: {e}")
-        await update.message.reply_text(f"❌ /brandscan failed: {e}")
+        logger.error(f"/email failed: {e}")
+        await update.message.reply_text(f"❌ /email failed: {e}")
     finally:
         _untrack_task(tracked)
 
@@ -2786,17 +1505,6 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current = asyncio.current_task()
     cancelled = _cancel_active_tasks(exclude=current)
     await update.message.reply_text(f"🛑 Stop requested. Cancelled {cancelled} running task(s).")
-
-
-async def cmd_personas(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Temporary alias for /scan persona while users transition.
-    try:
-        await run_scan_mode(update, "persona")
-    except asyncio.TimeoutError:
-        await update.message.reply_text("⏱️ /personas timed out after 120 seconds.")
-    except Exception as e:
-        logger.error(f"/personas failed: {e}")
-        await update.message.reply_text(f"❌ /personas failed: {e}")
 
 
 async def cmd_smtpcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2848,10 +1556,7 @@ def main():
     app.add_handler(CommandHandler("raw", cmd_raw))
     app.add_handler(CommandHandler("prompt", cmd_prompt))
     app.add_handler(CommandHandler("email", cmd_email))
-    app.add_handler(CommandHandler("deepscan", cmd_deepscan))
-    app.add_handler(CommandHandler("brandscan", cmd_brandscan))
     app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("personas", cmd_personas))
     app.add_handler(CommandHandler("smtpcheck", cmd_smtpcheck))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 

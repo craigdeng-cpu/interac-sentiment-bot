@@ -1,43 +1,4 @@
 {
-  "data_queries": {
-    "products": [
-      "Interac e-Transfer outage OR complaint OR issue",
-      "Interac e-Transfer new feature OR update OR launch",
-      "Interac Debit contactless OR tap OR issue",
-      "Konek by Interac",
-      "Interac Verified",
-      "Interac API OR open banking Canada"
-    ],
-    "fi_competitive": [
-      "TD Bank e-Transfer OR Interac debit",
-      "RBC e-Transfer OR Interac debit",
-      "BMO e-Transfer OR Interac debit",
-      "Scotiabank e-Transfer OR Interac debit",
-      "CIBC e-Transfer OR Interac debit",
-      "Wealthsimple e-Transfer OR Interac",
-      "EQ Bank e-Transfer OR Interac",
-      "Tangerine e-Transfer OR Interac",
-      "National Bank e-Transfer OR Interac",
-      "Desjardins e-Transfer OR Interac"
-    ],
-    "competitive_threats": [
-      "Apple Pay Canada replacing debit OR e-Transfer",
-      "Wise Canada vs Interac e-Transfer",
-      "PayPal Canada vs Interac e-Transfer",
-      "crypto Canada payment replacing Interac",
-      "open banking Canada Interac competitor"
-    ],
-    "people_forums": [
-      "Interac site:reddit.com/r/PersonalFinanceCanada",
-      "Interac site:reddit.com/r/canadianinvestor",
-      "e-Transfer site:reddit.com/r/PersonalFinanceCanada",
-      "Interac site:forums.redflagdeals.com",
-      "e-Transfer site:forums.redflagdeals.com",
-      "Interac debit site:forums.redflagdeals.com",
-      "Interac e-Transfer complaint OR broken OR slow OR fraud"
-    ]
-  },
-
   "sources": {
     "reddit": true,
     "news": true,
@@ -45,11 +6,7 @@
     "twitter": true
   },
   "prompt_files": {
-    "analysis_prompt": "prompts/analysis_prompt.md",
     "followup_prompt": "prompts/followup_prompt.md",
-    "historical_prompt": "prompts/historical_prompt.md",
-    "persona_prompt": "prompts/persona_prompt.md",
-    "brand_archetype_prompt": "prompts/brand_archetype_prompt.md",
     "biweekly_prompt": "prompts/biweekly_prompt.md"
   },
   "biweekly_queries": [
@@ -65,74 +22,5 @@
     "e-Transfer Canada complaint OR frustrated OR switched",
     "Interac e-Transfer new feature OR update 2025 OR 2026"
   ],
-  "historical_queries": {
-    "recent_1mo": {
-      "label": "RECENT (1 month)",
-      "tbs": "qdr:m",
-      "queries": [
-        "Interac e-Transfer",
-        "Interac e-Transfer complaint OR issue OR outage",
-        "Interac Debit tap contactless",
-        "Interac e-Transfer reddit",
-        "Interac redflagdeals"
-      ]
-    },
-    "medium_6mo": {
-      "label": "MEDIUM (6 months)",
-      "tbs": "qdr:y",
-      "queries": [
-        "Interac e-Transfer review OR experience",
-        "Interac e-Transfer problem OR fraud OR limit",
-        "Interac Debit Canada",
-        "Interac outage OR disruption",
-        "Interac open banking Canada"
-      ]
-    },
-    "older_1yr": {
-      "label": "OLDER (1 year+)",
-      "tbs": "all",
-      "queries": [
-        "Interac e-Transfer Canada",
-        "Interac vs Apple Pay vs PayPal Canada",
-        "Interac e-Transfer complaint",
-        "Interac debit acceptance Canada",
-        "Interac competitor fintech Canada"
-      ]
-    }
-  },
-  "brand_historical_queries": {
-    "recent_1mo": {
-      "label": "RECENT (1 month)",
-      "tbs": "qdr:m",
-      "queries": [
-        "Interac e-Transfer complaint OR delay OR limit Canada",
-        "Interac vs Wise OR PayPal OR Apple Pay Canada",
-        "e-Transfer switched to Wise OR PayPal Canada"
-      ]
-    },
-    "medium_6mo": {
-      "label": "MEDIUM (6 months)",
-      "tbs": "qdr:y",
-      "queries": [
-        "Interac e-Transfer reliability Canada",
-        "Wise vs PayPal vs Interac Canada transfer experience",
-        "digital wallet Canada payment trend"
-      ]
-    },
-    "older_1yr": {
-      "label": "OLDER (1 year+)",
-      "tbs": "all",
-      "queries": [
-        "Interac e-Transfer Canada trend",
-        "Wise vs PayPal vs Interac Canada transfer",
-        "Canada payment app transfer complaints"
-      ]
-    }
-  },
-
-  "alert_threshold": 35,
-  "historical_max_mentions_per_source": 10,
-  "max_mentions_per_source": 3,
-  "lookback_hours": 24,
   "timezone": "US/Eastern"
 }
