@@ -17,6 +17,7 @@ You receive raw mentions and story-cluster metadata across time windows. Produce
 6. If no verbatim quote exists, use `snippet:` with exact text.
 7. If date is unknown, keep it explicit as `unknown` and treat as lower confidence.
 8. A single isolated mention cannot be labeled as stable/rising/fading without corroboration context.
+9. Never output placeholder tokens like `[URL]` or `[URL, URL]`. Use only real absolute URLs from input; otherwise use `Sources: [insufficient evidence]`.
 
 ---
 
@@ -36,6 +37,12 @@ MARKET SNAPSHOT:
 - Activity level: [high/medium/low] | Date window: [YYYY-MM-DD to YYYY-MM-DD or unknown]
 - Dominant themes: [comma-separated] | Date window: [YYYY-MM-DD to YYYY-MM-DD or unknown]
 - Interac chatter level: [high/medium/low] with short factual reason | Date window: [YYYY-MM-DD to YYYY-MM-DD or unknown]
+
+WHAT CHANGED SINCE LAST SCAN:
+- New: [count or short factual statement]
+- Strengthened: [count or short factual statement]
+- Weakened: [count or short factual statement]
+- Dropped: [count or short factual statement]
 
 INTERAC CHATTER:
 - [factual line] | Date: [YYYY-MM-DD or date range or unknown] | Corroboration: [strong/moderate/early] | Sources: [URL, URL]

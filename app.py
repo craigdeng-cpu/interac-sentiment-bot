@@ -951,7 +951,8 @@ async def analyze_personas(mentions_text: str) -> str:
 async def analyze_brand_archetypes(mentions_text: str) -> str:
     config = load_prompts()
     prompt = config["brand_archetype_prompt"].replace("{timestamp}", now_est())
-    return await call_kimi(prompt, mentions_text)
+    raw_report = await call_kimi(prompt, mentions_text)
+    return _postprocess_brandscan_report(raw_report)
 
 
 async def analyze_scan(mentions_text: str, mode: str) -> str:
@@ -1372,6 +1373,7 @@ EMAIL_TEXT = "#101828"
 EMAIL_MUTED = "#667085"
 EMAIL_ACCENT = "#175CD3"
 EMAIL_CONTAINER_WIDTH = "920"
+BRANDSCAN_STATE_PATH = Path(__file__).parent / "state" / "brandscan_snapshot.json"
 
 
 def _compact_panel(raw: str, empty_msg: str, *, max_lines: int = 3, list_mode: bool = True) -> str:
@@ -1403,6 +1405,193 @@ def _compact_panel(raw: str, empty_msg: str, *, max_lines: int = 3, list_mode: b
         f"<div style='border:1px solid {EMAIL_BORDER};border-radius:10px;padding:10px 12px;margin-top:6px;"
         f"font-size:13px;line-height:1.45;color:{EMAIL_TEXT};background:#fcfdff;'>{joined}</div>"
     )
+
+
+def _corr_score(label: str) -> int:
+    value = (label or "").strip().lower()
+    if value == "strong":
+        return 3
+    if value == "moderate":
+        return 2
+    return 1
+
+
+def _extract_claim_key(line: str) -> str:
+    base = re.sub(r"^\s*[-*]\s*", "", line.strip())
+    base = base.split("|", 1)[0].strip().lower()
+    return re.sub(r"\s+", " ", base)
+
+
+def _line_corroboration(line: str) -> str:
+    m = re.search(r"\bCorroboration:\s*(strong|moderate|early)\b", line, flags=re.IGNORECASE)
+    return m.group(1).lower() if m else "early"
+
+
+def _has_real_url(text: str) -> bool:
+    return bool(re.search(r"https?://[^\s,\]]+", text))
+
+
+def _sanitize_claim_line(line: str, *, require_date: bool = True) -> str:
+    clean = " ".join(line.strip().split())
+    if not clean:
+        return ""
+
+    if require_date and "| Date:" not in clean:
+        clean = f"{clean} | Date: unknown"
+
+    if "Sources:" in clean:
+        source_part = clean.split("Sources:", 1)[1]
+        if not _has_real_url(source_part):
+            clean = re.sub(
+                r"Sources:\s*\[[^\]]*\]",
+                "Sources: [insufficient evidence]",
+                clean,
+                flags=re.IGNORECASE,
+            )
+            if "Sources: [insufficient evidence]" not in clean:
+                clean = re.sub(r"Sources:\s*.*$", "Sources: [insufficient evidence]", clean, flags=re.IGNORECASE)
+    else:
+        clean = f"{clean} | Sources: [insufficient evidence]"
+
+    if "| Corroboration:" not in clean:
+        clean = f"{clean} | Corroboration: early"
+    return clean
+
+
+def _section_lines(raw: str) -> list[str]:
+    lines = []
+    for line in (raw or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("- "):
+            lines.append(stripped)
+        elif stripped.startswith("* "):
+            lines.append(f"- {stripped[2:].strip()}")
+    return lines
+
+
+def _sort_claim_lines(lines: list[str]) -> list[str]:
+    return sorted(lines, key=lambda ln: _corr_score(_line_corroboration(ln)), reverse=True)
+
+
+def _load_brandscan_snapshot() -> dict:
+    try:
+        if not BRANDSCAN_STATE_PATH.exists():
+            return {"claims": {}, "timestamp": ""}
+        return json.loads(BRANDSCAN_STATE_PATH.read_text())
+    except Exception:
+        return {"claims": {}, "timestamp": ""}
+
+
+def _save_brandscan_snapshot(claims: dict[str, str], timestamp: str) -> None:
+    try:
+        BRANDSCAN_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        BRANDSCAN_STATE_PATH.write_text(json.dumps({"claims": claims, "timestamp": timestamp}, indent=2))
+    except Exception as e:
+        logger.warning(f"Could not save brandscan snapshot: {e}")
+
+
+def _build_change_lines(current_claims: dict[str, str], previous_claims: dict[str, str]) -> list[str]:
+    lines: list[str] = []
+
+    new_keys = [k for k in current_claims if k not in previous_claims]
+    if new_keys:
+        lines.append(f"- New: {len(new_keys)} claim(s) newly observed since last scan.")
+
+    strengthened = []
+    weakened = []
+    for key, corr in current_claims.items():
+        if key not in previous_claims:
+            continue
+        prev = previous_claims[key]
+        if _corr_score(corr) > _corr_score(prev):
+            strengthened.append(key)
+        elif _corr_score(corr) < _corr_score(prev):
+            weakened.append(key)
+    if strengthened:
+        lines.append(f"- Strengthened: {len(strengthened)} recurring claim(s) moved to stronger corroboration.")
+    if weakened:
+        lines.append(f"- Weakened: {len(weakened)} recurring claim(s) dropped in corroboration strength.")
+
+    dropped_keys = [k for k in previous_claims if k not in current_claims]
+    if dropped_keys:
+        lines.append(f"- Dropped: {len(dropped_keys)} prior claim(s) not seen in this scan.")
+
+    if not lines:
+        lines.append("- Change summary: no material movement versus last stored scan.")
+    return lines
+
+
+def _postprocess_brandscan_report(report: str) -> str:
+    timestamp = _extract_report_field(report, "TIMESTAMP")
+    market_snapshot = _extract_section(
+        report,
+        "MARKET SNAPSHOT:",
+        [
+            "WHAT CHANGED SINCE LAST SCAN:",
+            "INTERAC CHATTER:",
+            "ACTIVE BRAND ARCHETYPES:",
+            "COMPETITOR MOVEMENT:",
+            "SIGNAL QUALITY:",
+            "EVIDENCE LOG:",
+        ],
+    )
+    interac = _extract_section(
+        report,
+        "INTERAC CHATTER:",
+        ["ACTIVE BRAND ARCHETYPES:", "COMPETITOR MOVEMENT:", "SIGNAL QUALITY:", "EVIDENCE LOG:"],
+    )
+    archetypes = _extract_section(
+        report,
+        "ACTIVE BRAND ARCHETYPES:",
+        ["COMPETITOR MOVEMENT:", "SIGNAL QUALITY:", "EVIDENCE LOG:"],
+    )
+    movement = _extract_section(report, "COMPETITOR MOVEMENT:", ["SIGNAL QUALITY:", "EVIDENCE LOG:"])
+    signal_quality = _extract_section(report, "SIGNAL QUALITY:", ["EVIDENCE LOG:"])
+    evidence_log = _extract_section(report, "EVIDENCE LOG:", [])
+
+    interac_lines = _sort_claim_lines([_sanitize_claim_line(l) for l in _section_lines(interac)])
+    archetype_lines = _sort_claim_lines([_sanitize_claim_line(l) for l in _section_lines(archetypes)])
+    movement_lines = _sort_claim_lines([_sanitize_claim_line(l) for l in _section_lines(movement)])
+    signal_quality_lines = _section_lines(signal_quality)
+    evidence_lines = _section_lines(evidence_log)
+    market_lines = _section_lines(market_snapshot)
+
+    current_claims: dict[str, str] = {}
+    for line in interac_lines + archetype_lines + movement_lines:
+        current_claims[_extract_claim_key(line)] = _line_corroboration(line)
+
+    prev = _load_brandscan_snapshot()
+    prev_claims = prev.get("claims", {}) if isinstance(prev, dict) else {}
+    change_lines = _build_change_lines(current_claims, prev_claims if isinstance(prev_claims, dict) else {})
+    _save_brandscan_snapshot(current_claims, timestamp)
+
+    rebuilt = [
+        f"TIMESTAMP: {timestamp or now_est()}",
+        "",
+        "MARKET SNAPSHOT:",
+        *(market_lines or ["- No market snapshot details available."]),
+        "",
+        "WHAT CHANGED SINCE LAST SCAN:",
+        *change_lines,
+        "",
+        "INTERAC CHATTER:",
+        *(interac_lines or ["- No Interac chatter details available."]),
+        "",
+        "ACTIVE BRAND ARCHETYPES:",
+        *(archetype_lines or ["- No active archetypes identified."]),
+        "",
+        "COMPETITOR MOVEMENT:",
+        *(movement_lines or ["- No clear competitor movement identified."]),
+        "",
+        "SIGNAL QUALITY:",
+        *(signal_quality_lines or ["- No signal quality details available."]),
+        "",
+        "EVIDENCE LOG:",
+        *(evidence_lines or ["- No evidence log entries available."]),
+    ]
+    return "\n".join(rebuilt).strip()
 
 
 def _styled_raw_report_html(subject: str, body: str) -> str:
@@ -1590,6 +1779,18 @@ def _build_brand_archetype_html(subject: str, body: str) -> str:
     market_snapshot = _extract_section(
         body,
         "MARKET SNAPSHOT:",
+        [
+            "WHAT CHANGED SINCE LAST SCAN:",
+            "INTERAC CHATTER:",
+            "ACTIVE BRAND ARCHETYPES:",
+            "COMPETITOR MOVEMENT:",
+            "SIGNAL QUALITY:",
+            "EVIDENCE LOG:",
+        ],
+    )
+    changes_since_last = _extract_section(
+        body,
+        "WHAT CHANGED SINCE LAST SCAN:",
         ["INTERAC CHATTER:", "ACTIVE BRAND ARCHETYPES:", "COMPETITOR MOVEMENT:", "SIGNAL QUALITY:", "EVIDENCE LOG:"],
     )
     interac_chatter = _extract_section(
@@ -1614,7 +1815,7 @@ def _build_brand_archetype_html(subject: str, body: str) -> str:
     )
     evidence_log = _extract_section(body, "EVIDENCE LOG:", [])
 
-    sections = [market_snapshot, interac_chatter, archetypes, movement, signal_quality, evidence_log]
+    sections = [market_snapshot, changes_since_last, interac_chatter, archetypes, movement, signal_quality, evidence_log]
     if not any(s.strip() for s in sections):
         return _styled_raw_report_html(subject, body)
 
@@ -1654,7 +1855,7 @@ def _build_brand_archetype_html(subject: str, body: str) -> str:
                   {dashboard_card("Market Snapshot", as_html_cards(market_snapshot, "No market snapshot details available.", max_lines=4))}
                 </td>
                 <td width="50%" valign="top" style="padding-left:8px;">
-                  {dashboard_card("Interac Chatter", as_html_cards(interac_chatter, "No Interac chatter details available.", max_lines=4))}
+                  {dashboard_card("What Changed Since Last Scan", as_html_cards(changes_since_last, "No previous scan available for comparison.", max_lines=4))}
                 </td>
               </tr>
             </table>
@@ -1663,10 +1864,10 @@ def _build_brand_archetype_html(subject: str, body: str) -> str:
             <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
               <tr>
                 <td width="50%" valign="top" style="padding-right:8px;">
-                  {dashboard_card("Active Brand Archetypes", as_html_cards(archetypes, "No active archetypes identified."))}
+                  {dashboard_card("Interac Chatter", as_html_cards(interac_chatter, "No Interac chatter details available.", max_lines=4))}
                 </td>
                 <td width="50%" valign="top" style="padding-left:8px;">
-                  {dashboard_card("Competitor Movement", as_html_cards(movement, "No clear competitor movement identified."))}
+                  {dashboard_card("Active Brand Archetypes", as_html_cards(archetypes, "No active archetypes identified."))}
                 </td>
               </tr>
             </table>
@@ -1675,10 +1876,19 @@ def _build_brand_archetype_html(subject: str, body: str) -> str:
             <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
               <tr>
                 <td width="50%" valign="top" style="padding-right:8px;">
-                  {dashboard_card("Signal Quality", as_html_cards(signal_quality, "No signal quality details available.", max_lines=4))}
+                  {dashboard_card("Competitor Movement", as_html_cards(movement, "No clear competitor movement identified."))}
                 </td>
                 <td width="50%" valign="top" style="padding-left:8px;">
-                  {dashboard_card("Evidence Log", as_html_cards(evidence_log, "No evidence log entries available.", max_lines=4))}
+                  {dashboard_card("Signal Quality", as_html_cards(signal_quality, "No signal quality details available.", max_lines=4))}
+                </td>
+              </tr>
+            </table>
+          </td></tr>
+          <tr><td style="padding:0 24px 24px 24px;">
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+              <tr>
+                <td width="100%" valign="top">
+                  {dashboard_card("Evidence Log", as_html_cards(evidence_log, "No evidence log entries available.", max_lines=6))}
                 </td>
               </tr>
             </table>
