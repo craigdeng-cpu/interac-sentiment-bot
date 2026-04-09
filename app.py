@@ -566,7 +566,7 @@ async def fetch_biweekly_mentions() -> str:
         lines.append("=== SOCIAL / PEOPLE ===")
         for i, m in enumerate(people[:20], 1):
             date_str = f" ({m['date']})" if m.get("date") else ""
-            snippet = " ".join((m.get("snippet", "") or "").split())[:300]
+            snippet = " ".join((m.get("snippet", "") or "").split())[:500]
             lines.append(f"[S{i}] {m.get('source', 'unknown')}{date_str}")
             lines.append(f"  Title: {m.get('title', '')[:120]}")
             lines.append(f"  Snippet: {snippet}")
@@ -577,7 +577,7 @@ async def fetch_biweekly_mentions() -> str:
         lines.append("=== NEWS / PRESS ===")
         for i, m in enumerate(press[:10], 1):
             date_str = f" ({m['date']})" if m.get("date") else ""
-            snippet = " ".join((m.get("snippet", "") or "").split())[:200]
+            snippet = " ".join((m.get("snippet", "") or "").split())[:300]
             lines.append(f"[N{i}] {m.get('source', 'unknown')}{date_str}")
             lines.append(f"  Title: {m.get('title', '')[:120]}")
             lines.append(f"  Snippet: {snippet}")
@@ -1066,7 +1066,10 @@ def _extract_biweekly_themes(report: str) -> dict:
         for line in (section_text or "").splitlines():
             stripped = line.strip()
             if stripped.startswith("- ") and "Nothing notable" not in stripped:
-                theme = stripped[2:].strip()[:80]
+                quote_only = stripped[2:].strip()
+                if " — " in quote_only:
+                    quote_only = quote_only.split(" — ")[0].strip()
+                theme = quote_only[:60]
                 if theme:
                     themes.append(theme)
         return themes[:6]
@@ -1138,19 +1141,32 @@ def _styled_raw_report_html(subject: str, body: str) -> str:
 """.strip()
 
 
+def _platform_badge_color(platform: str) -> str:
+    """Return badge color for a platform name."""
+    p = platform.lower()
+    if "reddit" in p:
+        return "#FF4500"
+    if "redflagdeal" in p or "rfd" in p:
+        return "#CC1200"
+    if "twitter" in p or "x/" in p or p == "x":
+        return "#1a1a1a"
+    if "forum" in p:
+        return "#6b7280"
+    return "#1a73e8"  # News/Other
+
+
 def _render_quote_bullets(raw: str, empty_msg: str) -> str:
-    """Render all quote bullets from a biweekly section without truncation.
+    """Render quote bullets as styled cards with platform badge, date, and hyperlink.
 
     Each bullet is expected in the form:
         - "quote text" — Platform, Date. Source: URL
-    We split on ' — ' to separate the quote from the attribution, render
-    them stacked so every quote is readable at a glance.
     """
+    _empty = (
+        f"<div style='padding:12px 14px;font-size:13px;color:{EMAIL_MUTED};'>"
+        f"{html.escape(empty_msg)}</div>"
+    )
     if not raw:
-        return (
-            f"<div style='border:1px solid {EMAIL_BORDER};border-radius:10px;padding:10px 14px;"
-            f"font-size:13px;color:{EMAIL_MUTED};background:#fcfdff;'>{html.escape(empty_msg)}</div>"
-        )
+        return _empty
 
     items = []
     for line in raw.splitlines():
@@ -1167,45 +1183,104 @@ def _render_quote_bullets(raw: str, empty_msg: str) -> str:
         else:
             quote_part, attr_part = text, ""
 
-        # Extract URL from attribution if present (Source: URL pattern)
+        # Extract URL — try "Source: URL" first, then bare https?:// in attr
+        url = ""
         url_match = re.search(r"Source:\s*(https?://\S+)", attr_part, re.IGNORECASE)
-        link_html = ""
         if url_match:
-            url = url_match.group(1).rstrip(".")
+            url = url_match.group(1).rstrip(".,)")
+            attr_part = re.sub(r"\s*Source:\s*https?://\S+", "", attr_part, flags=re.IGNORECASE).strip()
+        else:
+            bare_match = re.search(r"(https?://\S+)", attr_part)
+            if bare_match:
+                url = bare_match.group(1).rstrip(".,)")
+                attr_part = re.sub(r"https?://\S+", "", attr_part).strip()
+
+        # Parse platform (first token before comma or end) and date (rest)
+        attr_clean = attr_part.rstrip(".")
+        if "," in attr_clean:
+            platform_label, date_label = attr_clean.split(",", 1)
+            platform_label = platform_label.strip()
+            date_label = date_label.strip().rstrip(".")
+        else:
+            platform_label = attr_clean.strip()
+            date_label = ""
+
+        badge_color = _platform_badge_color(platform_label)
+
+        # Build link HTML
+        link_html = ""
+        if url:
             safe_url = html.escape(url, quote=True)
             domain = re.sub(r"^www\.", "", re.sub(r"https?://", "", url).split("/")[0])
-            link_html = f" <a href='{safe_url}' style='color:{EMAIL_ACCENT};font-size:11px;text-decoration:none;'>{html.escape(domain)}</a>"
-            # Remove Source: URL from attr display
-            attr_part = re.sub(r"\s*Source:\s*https?://\S+", "", attr_part, flags=re.IGNORECASE).strip().rstrip(".")
+            link_html = (
+                f"<a href='{safe_url}' style='font-size:11px;color:{EMAIL_ACCENT};"
+                f"text-decoration:none;'>{html.escape(domain)}</a>"
+            )
 
         quote_html = html.escape(quote_part.strip())
-        attr_html = html.escape(attr_part.strip()) if attr_part.strip() else ""
+        platform_html = html.escape(platform_label) if platform_label else ""
+        date_html = html.escape(date_label) if date_label else ""
 
-        item = (
-            f"<li style='margin:0 0 10px 0;padding:0;list-style:none;'>"
-            f"<div style='font-size:13px;line-height:1.5;color:{EMAIL_TEXT};'>{quote_html}</div>"
-        )
-        if attr_html or link_html:
-            item += (
-                f"<div style='font-size:11px;color:{EMAIL_MUTED};margin-top:3px;'>"
-                f"{attr_html}{link_html}</div>"
+        meta_parts = []
+        if platform_html:
+            meta_parts.append(
+                f"<span style='background:{badge_color};color:#fff;font-size:10px;"
+                f"font-weight:700;padding:2px 7px;border-radius:999px;"
+                f"letter-spacing:0.3px;white-space:nowrap;'>{platform_html}</span>"
             )
-        item += "</li>"
-        items.append(item)
+        if date_html:
+            meta_parts.append(
+                f"<span style='font-size:11px;color:{EMAIL_MUTED};'>{date_html}</span>"
+            )
+        if link_html:
+            meta_parts.append(link_html)
+
+        meta_row = (
+            f"<div style='margin-top:5px;display:flex;align-items:center;gap:6px;"
+            f"flex-wrap:wrap;'>" + "".join(meta_parts) + "</div>"
+            if meta_parts else ""
+        )
+
+        card = (
+            f"<div style='border-left:3px solid {badge_color};padding:8px 0 8px 12px;"
+            f"margin-bottom:14px;'>"
+            f"<div style='font-size:13px;line-height:1.55;color:{EMAIL_TEXT};'>{quote_html}</div>"
+            f"{meta_row}"
+            f"</div>"
+        )
+        items.append(card)
 
     if not items:
-        return (
-            f"<div style='border:1px solid {EMAIL_BORDER};border-radius:10px;padding:10px 14px;"
-            f"font-size:13px;color:{EMAIL_MUTED};background:#fcfdff;'>{html.escape(empty_msg)}</div>"
-        )
+        return _empty
 
-    joined = "".join(items)
+    return "".join(items)
+
+
+def _trend_mini_card(label: str, content: str, accent: str) -> str:
+    """Render a single Trend sub-column card."""
+    safe_content = html.escape(content.strip()) if content.strip() else "none identified"
     return (
-        f"<div style='border:1px solid {EMAIL_BORDER};border-radius:10px;padding:12px 14px;"
-        f"background:#fcfdff;'>"
-        f"<ul style='margin:0;padding:0;'>{joined}</ul>"
-        f"</div>"
+        f"<td style='width:33%;vertical-align:top;padding:0 8px 0 0;'>"
+        f"<div style='background:#eef2f8;border-radius:10px;padding:12px 14px;height:100%;box-sizing:border-box;'>"
+        f"<div style='font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;"
+        f"color:{accent};margin-bottom:6px;'>{html.escape(label)}</div>"
+        f"<div style='font-size:12px;line-height:1.55;color:{EMAIL_TEXT};'>{safe_content}</div>"
+        f"</div></td>"
     )
+
+
+def _parse_trend_fields(trend_raw: str) -> tuple[str, str, str]:
+    """Extract Still active / Went quiet / New this scan values from trend section."""
+    still, quiet, new = "", "", ""
+    for line in (trend_raw or "").splitlines():
+        l = line.strip()
+        if l.lower().startswith("- still active:"):
+            still = l.split(":", 1)[1].strip()
+        elif l.lower().startswith("- went quiet:"):
+            quiet = l.split(":", 1)[1].strip()
+        elif l.lower().startswith("- new this scan:"):
+            new = l.split(":", 1)[1].strip()
+    return still, quiet, new
 
 
 def _build_biweekly_html(subject: str, body: str) -> str:
@@ -1217,38 +1292,70 @@ def _build_biweekly_html(subject: str, body: str) -> str:
     if not any(s.strip() for s in [etransfer_raw, competitor_raw, trend_raw]):
         return _styled_raw_report_html(subject, body)
 
-    return f"""
+    etransfer_html = _render_quote_bullets(etransfer_raw, "Nothing notable this scan.")
+    competitor_html = _render_quote_bullets(competitor_raw, "Nothing notable this scan.")
+
+    still, quiet, new_themes = _parse_trend_fields(trend_raw)
+    trend_html = (
+        f"<table role='presentation' width='100%' cellspacing='0' cellpadding='0'><tr>"
+        + _trend_mini_card("Still active", still, "#027A48")
+        + _trend_mini_card("Went quiet", quiet, "#667085")
+        + _trend_mini_card("New this scan", new_themes, "#175CD3")
+        + "</tr></table>"
+    )
+
+    return f"""<!DOCTYPE html>
 <html>
-  <body style="margin:0;padding:0;background:{EMAIL_PAGE_BG};font-family:{EMAIL_FONT_STACK};color:{EMAIL_TEXT};">
-    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 0;">
-      <tr><td align="center">
-        <table role="presentation" width="{EMAIL_CONTAINER_WIDTH}" cellspacing="0" cellpadding="0" style="background:{EMAIL_CARD_BG};border-radius:14px;overflow:hidden;border:1px solid {EMAIL_BORDER};">
-          <tr>
-            <td style="background:{EMAIL_NAVY};color:#ffffff;padding:18px 24px;border-bottom:4px solid #fdb913;">
-              <div style="font-size:22px;font-weight:700;letter-spacing:0.2px;">Interac e-Transfer Intelligence</div>
-              <div style="font-size:13px;color:#aebce2;margin-top:6px;">{html.escape(scan_date)}</div>
-            </td>
-          </tr>
-          <tr><td style="padding:20px 24px 8px 24px;">
-            <div style="font-size:15px;font-weight:700;margin-bottom:8px;">e-Transfer Chatter</div>
-            {_render_quote_bullets(etransfer_raw, "Nothing notable this scan.")}
-          </td></tr>
-          <tr><td style="padding:16px 24px 8px 24px;"><hr style="border:none;border-top:1px solid {EMAIL_BORDER};"></td></tr>
-          <tr><td style="padding:8px 24px 8px 24px;">
-            <div style="font-size:15px;font-weight:700;margin-bottom:8px;">Competitor Landscape</div>
-            {_render_quote_bullets(competitor_raw, "Nothing notable this scan.")}
-          </td></tr>
-          <tr><td style="padding:16px 24px 8px 24px;"><hr style="border:none;border-top:1px solid {EMAIL_BORDER};"></td></tr>
-          <tr><td style="padding:8px 24px 24px 24px;">
-            <div style="font-size:15px;font-weight:700;margin-bottom:8px;">Trend vs Last Scan</div>
-            {_compact_panel(trend_raw, "No trend data yet.", max_lines=10, list_mode=True)}
-          </td></tr>
-        </table>
-      </td></tr>
-    </table>
-  </body>
-</html>
-""".strip()
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  .qcard:hover {{ background:#f5f8ff !important; }}
+  a:hover {{ text-decoration:underline !important; }}
+</style>
+</head>
+<body style="margin:0;padding:0;background:{EMAIL_PAGE_BG};font-family:{EMAIL_FONT_STACK};color:{EMAIL_TEXT};">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 0;">
+    <tr><td align="center">
+      <table role="presentation" width="1200" cellspacing="0" cellpadding="0" style="background:{EMAIL_CARD_BG};border-radius:14px;overflow:hidden;border:1px solid {EMAIL_BORDER};">
+
+        <!-- HEADER -->
+        <tr>
+          <td colspan="2" style="background:{EMAIL_NAVY};color:#ffffff;padding:20px 28px;border-bottom:4px solid #fdb913;">
+            <div style="font-size:24px;font-weight:700;letter-spacing:0.2px;">Interac e-Transfer Intelligence</div>
+            <div style="font-size:13px;color:#aebce2;margin-top:5px;">{html.escape(scan_date)}</div>
+          </td>
+        </tr>
+
+        <!-- TWO-COLUMN BODY -->
+        <tr>
+          <!-- LEFT: e-Transfer Chatter -->
+          <td width="50%" style="vertical-align:top;padding:22px 14px 22px 28px;border-right:1px solid {EMAIL_BORDER};">
+            <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;color:#c4320a;margin-bottom:4px;">Pain points</div>
+            <div style="font-size:16px;font-weight:700;color:{EMAIL_TEXT};margin-bottom:16px;">e-Transfer Chatter</div>
+            {etransfer_html}
+          </td>
+          <!-- RIGHT: Competitor Landscape -->
+          <td width="50%" style="vertical-align:top;padding:22px 28px 22px 14px;">
+            <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;color:#027A48;margin-bottom:4px;">What's working</div>
+            <div style="font-size:16px;font-weight:700;color:{EMAIL_TEXT};margin-bottom:16px;">Competitor Landscape</div>
+            {competitor_html}
+          </td>
+        </tr>
+
+        <!-- TREND SECTION -->
+        <tr>
+          <td colspan="2" style="padding:0 28px 28px 28px;border-top:1px solid {EMAIL_BORDER};">
+            <div style="font-size:16px;font-weight:700;color:{EMAIL_TEXT};margin:20px 0 12px 0;">Trend vs Last Scan</div>
+            {trend_html}
+          </td>
+        </tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>""".strip()
 
 
 def build_email_bodies(subject: str, body: str) -> tuple[str, str]:
