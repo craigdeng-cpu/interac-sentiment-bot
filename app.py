@@ -133,7 +133,6 @@ def load_prompts() -> dict:
 
     prompt_files = config.get("prompt_files", {})
     default_prompt_files = {
-        "analysis_prompt": "prompts/analysis_prompt.md",
         "followup_prompt": "prompts/followup_prompt.md",
     }
     for prompt_key, default_path in default_prompt_files.items():
