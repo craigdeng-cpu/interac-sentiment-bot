@@ -470,10 +470,8 @@ def _resolve_relative_date(date_str: str, *, tbs: str = "") -> str:
     if not date_str:
         # No date from the source — approximate from the search time window.
         now = datetime.now(tz=timezone.utc)
-        if tbs in ("qdr:d", "qdr:w"):
+        if tbs in ("qdr:d", "qdr:w", "qdr:m"):
             return now.strftime("%B %d, %Y")
-        if tbs == "qdr:m":
-            return now.strftime("%B %Y")
         return date_str
     # If it already looks like a real date (contains a digit + year-ish), keep it
     if re.search(r"\d{4}", date_str):
