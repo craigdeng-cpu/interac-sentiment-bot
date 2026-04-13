@@ -456,15 +456,24 @@ def _tbs_to_timelimit(tbs: str) -> str | None:
     return mapping.get(tbs) if tbs else None
 
 
-def _resolve_relative_date(date_str: str) -> str:
+def _resolve_relative_date(date_str: str, *, tbs: str = "") -> str:
     """Convert DDG's relative 'published' strings to approximate absolute dates.
 
     DDG text() returns things like '3 weeks ago', '2 months ago', '1 year ago'.
     The biweekly prompt requires specific dates; relative strings cause the LLM
     to fall back to 'date unknown'. We approximate from today's date.
+
+    If date_str is empty and tbs is provided, returns an approximate date derived
+    from the search time range (qdr:d/qdr:w → today, qdr:m → "Month YYYY").
     Returns the original string unchanged if it already looks like a real date.
     """
     if not date_str:
+        # No date from the source — approximate from the search time window.
+        now = datetime.now(tz=timezone.utc)
+        if tbs in ("qdr:d", "qdr:w"):
+            return now.strftime("%B %d, %Y")
+        if tbs == "qdr:m":
+            return now.strftime("%B %Y")
         return date_str
     # If it already looks like a real date (contains a digit + year-ish), keep it
     if re.search(r"\d{4}", date_str):
@@ -477,7 +486,7 @@ def _resolve_relative_date(date_str: str) -> str:
             except ValueError:
                 pass
         return date_str
-    # Parse relative strings
+    # Parse relative strings — day/week/month/year
     now = datetime.now(tz=timezone.utc)
     m = re.match(r"(\d+)\s+(day|week|month|year)s?\s+ago", date_str.strip(), re.IGNORECASE)
     if m:
@@ -492,6 +501,9 @@ def _resolve_relative_date(date_str: str) -> str:
         else:  # year
             dt = now - timedelta(days=n * 365)
         return dt.strftime("%B %d, %Y")
+    # "N hours/minutes ago" → treat as today
+    if re.match(r"\d+\s+(hour|minute)s?\s+ago", date_str.strip(), re.IGNORECASE):
+        return datetime.now(tz=timezone.utc).strftime("%B %d, %Y")
     return date_str  # unknown format — keep as-is
 
 
@@ -518,7 +530,11 @@ async def web_search(
                 "source": item.get("source", search_type),
                 # text() uses "published" ("2 weeks ago"); news() uses "date" (ISO).
                 # _resolve_relative_date converts relative strings to real dates.
-                "date": _resolve_relative_date(item.get("date", "") or item.get("published", "")),
+                # Pass tbs so empty dates get an approximate fallback from the search window.
+                "date": _resolve_relative_date(
+                    item.get("date", "") or item.get("published", ""),
+                    tbs=tbs,
+                ),
             })
         return normalized
 
@@ -1541,13 +1557,16 @@ def _render_quote_bullets(raw: str, empty_msg: str) -> str:
                 url = bare_match.group(1).rstrip(".,)")
                 attr_part = re.sub(r"https?://\S+", "", attr_part).strip()
 
-        # Parse date from attribution (everything after first comma)
+        # Parse date from attribution (everything after first comma).
+        # Format with date:    — Platform, Date.
+        # Format without date: — Platform.  (no comma, so no date)
         attr_clean = attr_part.rstrip(".")
         if "," in attr_clean:
             _platform_from_llm, date_label = attr_clean.split(",", 1)
             date_label = date_label.strip().rstrip(".")
         else:
-            date_label = attr_clean.strip()
+            # No comma → attribution is platform only, no date
+            date_label = ""
 
         # Derive platform badge from URL domain — only community platforms get a badge.
         # This prevents corporate sites (wise.com, paypal.com) from showing as badges.

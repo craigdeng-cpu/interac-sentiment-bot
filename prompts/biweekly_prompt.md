@@ -28,7 +28,9 @@ Do not use competitor sources for e-Transfer Chatter, and do not use e-Transfer 
 6. Label the platform when known: Reddit, X/Twitter, RedFlagDeals, News, etc.
 7. Do not add a bullet if you have no real text from the input to support it.
 8. If a source snippet ends with "..." or is clearly cut off, do NOT reproduce the trailing dots. Use the meaningful portion before the cut-off.
-9. Every bullet must include a date. Each source entry has a `Date:` field — use that exact value (e.g., "April 3, 2025", "March 12, 2025"). If the `Date:` field is missing or says "unknown", write "date unknown".
+9. Each source entry has a `Date:` field. If it contains a real value (e.g., "April 3, 2025", "March 2026"), copy it exactly into the attribution. If the `Date:` field is empty or says "unknown", **omit the date entirely** — do not write "date unknown". Two formats are valid:
+   - With date:    `- "quote or snippet" — Platform, Date. Source: URL`
+   - Without date: `- "quote or snippet" — Platform. Source: URL`
 10. **Relevance filter for e-Transfer Chatter**: Only include a bullet if the source text explicitly mentions e-Transfer, Interac, auto-deposit, or a specific product behaviour (transfer limits, fees, holds, fraud, delays). Skip results that mention money or banking only in a general way.
 11. **Source quality for Competitor Landscape**: Prefer quotes from Reddit posts or independent news over content from the company's own website. If a source is the company's own blog or marketing page, only include it if it describes a concrete feature, product launch, or pricing change — not generic marketing language.
 12. **Competitor diversity**: Include at most 2 bullets per competitor brand in the Competitor Landscape section. If the input has more than 2 results for one company, pick the 2 most informative and skip the rest. Actively spread coverage across different companies — Wise, PayPal, Apple Pay, Google Pay, Wealthsimple Cash, KOHO, Revolut, Neo Financial, Venmo, and others. Do not let any single brand dominate the section.
@@ -42,10 +44,10 @@ Use these exact headers — no changes, no additions.
 SCAN DATE: {timestamp}
 
 e-Transfer Chatter:
-[Pain points, friction, confusion, fraud, and frustration from real people about e-Transfer. Source only from the e-TRANSFER COMMUNITY and e-TRANSFER NEWS sections. Apply the relevance filter (Rule 10). One bullet per quote or snippet. Format: - "quote or snippet" — Platform, Date. Source: URL. If nothing found: Nothing notable this scan.]
+[Pain points, friction, confusion, fraud, and frustration from real people about e-Transfer. Source only from the e-TRANSFER COMMUNITY and e-TRANSFER NEWS sections. Apply the relevance filter (Rule 10). One bullet per quote or snippet. Format (with date): - "quote or snippet" — Platform, Date. Source: URL. Format (no date): - "quote or snippet" — Platform. Source: URL. If nothing found: Nothing notable this scan.]
 
 Competitor Landscape:
-[Source ONLY from the COMPETITOR INTELLIGENCE section. Cover the full range of competitors — Wise, PayPal, Apple Pay, Google Pay, Wealthsimple Cash, KOHO, Venmo, Zelle, ACH, Revolut, Neo Financial, Square, Stripe, or any other digital payment product. Include new features, product launches, positive user experiences, pricing changes, and adoption news. Do not focus on one company — distribute coverage across all relevant mentions. Prefer Reddit community reactions and independent news over company marketing sites. One bullet per mention. Format: - "quote or snippet" — Platform, Date. Source: URL. If nothing found: Nothing notable this scan.]
+[Source ONLY from the COMPETITOR INTELLIGENCE section. Cover the full range of competitors — Wise, PayPal, Apple Pay, Google Pay, Wealthsimple Cash, KOHO, Venmo, Zelle, ACH, Revolut, Neo Financial, Square, Stripe, or any other digital payment product. Include new features, product launches, positive user experiences, pricing changes, and adoption news. Do not focus on one company — distribute coverage across all relevant mentions. Prefer Reddit community reactions and independent news over company marketing sites. One bullet per mention. Format (with date): - "quote or snippet" — Platform, Date. Source: URL. Format (no date): - "quote or snippet" — Platform. Source: URL. If nothing found: Nothing notable this scan.]
 
 Trend vs Last Scan:
 - Still active: [comma-separated short theme labels from PREVIOUS SCAN CONTEXT that appear again in current data, or: none identified]
@@ -61,4 +63,4 @@ Trend vs Last Scan:
 - Short, factual, no filler text
 - No sentiment scores, no percentages, no bar charts
 - Honest scarcity is better than padded length
-- Dates must be specific when available — use the exact date from the source
+- Dates: copy the exact value from the `Date:` field when present; omit the date element entirely when the field is empty or "unknown" — never write "date unknown"
