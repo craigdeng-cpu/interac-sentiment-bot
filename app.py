@@ -456,6 +456,45 @@ def _tbs_to_timelimit(tbs: str) -> str | None:
     return mapping.get(tbs) if tbs else None
 
 
+def _resolve_relative_date(date_str: str) -> str:
+    """Convert DDG's relative 'published' strings to approximate absolute dates.
+
+    DDG text() returns things like '3 weeks ago', '2 months ago', '1 year ago'.
+    The biweekly prompt requires specific dates; relative strings cause the LLM
+    to fall back to 'date unknown'. We approximate from today's date.
+    Returns the original string unchanged if it already looks like a real date.
+    """
+    if not date_str:
+        return date_str
+    # If it already looks like a real date (contains a digit + year-ish), keep it
+    if re.search(r"\d{4}", date_str):
+        # ISO dates like "2025-04-10T14:22:00" → format nicely
+        m = re.match(r"(\d{4})-(\d{2})-(\d{2})", date_str)
+        if m:
+            try:
+                dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                return dt.strftime("%B %d, %Y")
+            except ValueError:
+                pass
+        return date_str
+    # Parse relative strings
+    now = datetime.now(tz=timezone.utc)
+    m = re.match(r"(\d+)\s+(day|week|month|year)s?\s+ago", date_str.strip(), re.IGNORECASE)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2).lower()
+        if unit == "day":
+            dt = now - timedelta(days=n)
+        elif unit == "week":
+            dt = now - timedelta(weeks=n)
+        elif unit == "month":
+            dt = now - timedelta(days=n * 30)
+        else:  # year
+            dt = now - timedelta(days=n * 365)
+        return dt.strftime("%B %d, %Y")
+    return date_str  # unknown format — keep as-is
+
+
 async def web_search(
     query: str,
     search_type: str = "search",
@@ -477,8 +516,9 @@ async def web_search(
                 "snippet": item.get("body", "") or item.get("snippet", ""),
                 "link": item.get("href", "") or item.get("url", ""),
                 "source": item.get("source", search_type),
-                # text() uses "published" ("2 weeks ago"); news() uses "date" (ISO)
-                "date": item.get("date", "") or item.get("published", ""),
+                # text() uses "published" ("2 weeks ago"); news() uses "date" (ISO).
+                # _resolve_relative_date converts relative strings to real dates.
+                "date": _resolve_relative_date(item.get("date", "") or item.get("published", "")),
             })
         return normalized
 

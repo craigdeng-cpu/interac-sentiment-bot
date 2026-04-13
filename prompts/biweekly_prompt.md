@@ -31,6 +31,7 @@ Do not use competitor sources for e-Transfer Chatter, and do not use e-Transfer 
 9. Every bullet must include a date. Use the exact date from the source (e.g., "April 3, 2025", "March 12, 2025"). If the source has no date, write "date unknown".
 10. **Relevance filter for e-Transfer Chatter**: Only include a bullet if the source text explicitly mentions e-Transfer, Interac, auto-deposit, or a specific product behaviour (transfer limits, fees, holds, fraud, delays). Skip results that mention money or banking only in a general way.
 11. **Source quality for Competitor Landscape**: Prefer quotes from Reddit posts or independent news over content from the company's own website. If a source is the company's own blog or marketing page, only include it if it describes a concrete feature, product launch, or pricing change — not generic marketing language.
+12. **Competitor diversity**: Include at most 2 bullets per competitor brand in the Competitor Landscape section. If the input has more than 2 results for one company, pick the 2 most informative and skip the rest. Actively spread coverage across different companies — Wise, PayPal, Apple Pay, Google Pay, Wealthsimple Cash, KOHO, Revolut, Neo Financial, Venmo, and others. Do not let any single brand dominate the section.
 
 ---
 
