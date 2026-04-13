@@ -908,9 +908,10 @@ async def fetch_biweekly_mentions() -> str:
     def _fmt(prefix: str, items: list[dict], cap: int, snippet_cap: int) -> list[str]:
         out = []
         for i, m in enumerate(items[:cap], 1):
-            date_str = f" ({m['date']})" if m.get("date") else ""
             snippet = " ".join((m.get("snippet", "") or "").split())[:snippet_cap]
-            out.append(f"[{prefix}{i}] {m.get('source', 'unknown')}{date_str}")
+            out.append(f"[{prefix}{i}] {m.get('source', 'unknown')}")
+            # Explicit Date: field on its own line so the LLM reliably picks it up
+            out.append(f"  Date: {m['date']}" if m.get("date") else "  Date: unknown")
             out.append(f"  Title: {m.get('title', '')[:120]}")
             out.append(f"  Snippet: {snippet}")
             out.append(f"  URL: {m.get('link', '')}")
