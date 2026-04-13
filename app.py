@@ -509,19 +509,91 @@ async def search_twitter(query: str, max_results: int = 5, tbs: str = "qdr:w") -
     return base_results
 
 
+_REDDIT_HEADERS = {
+    "User-Agent": "python:interac.intelligence.bot:v1.0 (by /u/interac_intel_bot)"
+}
+
+
+def _parse_reddit_post(post: dict, cutoff_ts: float) -> dict | None:
+    """Parse a Reddit post dict into our standard format. Returns None if filtered out."""
+    created = post.get("created_utc", 0)
+    if not created or created < cutoff_ts:
+        return None
+    title = (post.get("title", "") or "").strip()
+    selftext = (post.get("selftext", "") or "").strip()
+    if selftext in ("[deleted]", "[removed]"):
+        selftext = ""
+    permalink = post.get("permalink", "")
+    subreddit_name = post.get("subreddit_display_name", post.get("subreddit", ""))
+    post_dt = datetime.fromtimestamp(created, tz=timezone.utc)
+    return {
+        "title": title,
+        "snippet": selftext[:600] if selftext else title,
+        "link": f"https://www.reddit.com{permalink}",
+        "source": f"Reddit/r/{subreddit_name}" if subreddit_name else "Reddit",
+        "date": post_dt.strftime("%B %d, %Y"),
+        "score": post.get("score", 0),
+        "permalink": permalink,
+    }
+
+
+async def _reddit_get(url: str, params: dict) -> dict | None:
+    """GET a Reddit JSON endpoint using httpx (urllib gets 403'd by Reddit's TLS check)."""
+    try:
+        async with httpx.AsyncClient(timeout=15, headers=_REDDIT_HEADERS) as client:
+            r = await client.get(url, params=params)
+        if r.status_code != 200:
+            logger.warning(f"Reddit API {r.status_code} for {url}")
+            return None
+        return r.json()
+    except Exception as e:
+        logger.warning(f"Reddit API failed for {url}: {type(e).__name__}: {e}")
+        return None
+
+
+async def fetch_reddit_comments(permalink: str, max_comments: int = 6) -> list[str]:
+    """Fetch top comments from a post by appending .json to its permalink URL.
+
+    This is the 'add .json to any Reddit URL' trick — gives full post + comments.
+    Only returns comments with score >= 2.
+    """
+    url = f"https://www.reddit.com{permalink}.json"
+    try:
+        async with httpx.AsyncClient(timeout=12, headers=_REDDIT_HEADERS) as client:
+            r = await client.get(url, params={"limit": max_comments, "sort": "top"})
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        # data[0] = post listing, data[1] = comment listing
+        comments = data[1]["data"]["children"]
+        result = []
+        for c in comments[:max_comments]:
+            d = c.get("data", {})
+            body = (d.get("body", "") or "").strip()
+            cscore = d.get("score", 0)
+            if body and body not in ("[deleted]", "[removed]") and cscore >= 2:
+                result.append(body[:350])
+        return result
+    except Exception as e:
+        logger.debug(f"Comment fetch failed for {permalink}: {e}")
+        return []
+
+
 async def search_reddit_posts(
     query: str,
     subreddit: str = "",
     max_results: int = 15,
     days_back: int = 60,
-    min_score: int = 2,
+    min_score: int = 1,
+    enrich_comments: bool = False,
 ) -> list[dict]:
-    """Fetch Reddit posts via the public JSON API.
+    """Search Reddit posts via the public JSON API using httpx.
 
-    Returns posts with exact UTC timestamps, full selftext, and score so we can:
-    - Filter by real date (not DDG's unreliable tbs)
-    - Quality-filter by upvote score
-    - Use full post body as quote material instead of a truncated DDG snippet
+    - Exact UTC timestamps → real dates
+    - Full post selftext → better quote material
+    - Optional comment enrichment: for posts with score >= 5, fetches top comment
+      (the .json trick) and appends it to the snippet so the LLM has community
+      reactions, not just the OP's question
     """
     if subreddit:
         url = f"https://www.reddit.com/r/{subreddit}/search.json"
@@ -536,57 +608,71 @@ async def search_reddit_posts(
             "limit": min(max_results * 2, 25), "type": "link",
         }
 
-    headers = {"User-Agent": "InteracIntelligenceBot/1.0"}
     cutoff_ts = (datetime.now(timezone.utc) - timedelta(days=days_back)).timestamp()
-
-    def _fetch() -> dict:
-        import urllib.request
-        import urllib.parse
-        full_url = url + "?" + urllib.parse.urlencode(params)
-        req = urllib.request.Request(full_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode())
-
-    try:
-        data = await asyncio.to_thread(_fetch)
-    except Exception as e:
-        logger.warning(f"Reddit API failed for '{query[:40]}': {type(e).__name__}: {e}")
+    data = await _reddit_get(url, params)
+    if not data:
         return []
 
     posts = []
     for child in data.get("data", {}).get("children", []):
-        post = child.get("data", {})
-        created = post.get("created_utc", 0)
-        if not created or created < cutoff_ts:
+        parsed = _parse_reddit_post(child.get("data", {}), cutoff_ts)
+        if parsed and parsed["score"] >= min_score:
+            posts.append(parsed)
+
+    posts.sort(key=lambda x: x["score"], reverse=True)
+    posts = posts[:max_results]
+
+    # Enrich top posts with their best comment via the .json permalink trick
+    if enrich_comments:
+        enrichment_tasks = []
+        for p in posts:
+            if p["score"] >= 5 and p.get("permalink"):
+                enrichment_tasks.append((p, fetch_reddit_comments(p["permalink"], max_comments=4)))
+            else:
+                enrichment_tasks.append((p, None))
+
+        for post, coro in enrichment_tasks:
+            if coro is None:
+                continue
+            comments = await coro
+            if comments:
+                # Prepend the best comment to give the LLM community reaction context
+                post["snippet"] = post["snippet"] + "\n\nTop community reply: " + comments[0]
+
+    return posts
+
+
+async def browse_subreddit_new(
+    subreddit: str,
+    keyword: str,
+    days_back: int = 30,
+    limit: int = 100,
+) -> list[dict]:
+    """Browse a subreddit's /new feed and filter by keyword — no search API bias.
+
+    Useful when you want all recent posts mentioning a term, not just what
+    Reddit's search algorithm returns.
+    """
+    url = f"https://www.reddit.com/r/{subreddit}/new.json"
+    cutoff_ts = (datetime.now(timezone.utc) - timedelta(days=days_back)).timestamp()
+    data = await _reddit_get(url, {"limit": limit})
+    if not data:
+        return []
+
+    kw = keyword.lower()
+    posts = []
+    for child in data.get("data", {}).get("children", []):
+        post_data = child.get("data", {})
+        title = (post_data.get("title", "") or "").lower()
+        selftext = (post_data.get("selftext", "") or "").lower()
+        if kw not in title and kw not in selftext:
             continue
-        score = post.get("score", 0)
-        if score < min_score:
-            continue
+        parsed = _parse_reddit_post(post_data, cutoff_ts)
+        if parsed:
+            posts.append(parsed)
 
-        post_dt = datetime.fromtimestamp(created, tz=timezone.utc)
-        date_str = post_dt.strftime("%B %d, %Y")
-
-        title = (post.get("title", "") or "").strip()
-        selftext = (post.get("selftext", "") or "").strip()
-        if selftext in ("[deleted]", "[removed]"):
-            selftext = ""
-        # Full post body gives better quote material than a search snippet
-        snippet = selftext[:600] if selftext else title
-
-        permalink = post.get("permalink", "")
-        subreddit_name = post.get("subreddit_display_name", post.get("subreddit", ""))
-
-        posts.append({
-            "title": title,
-            "snippet": snippet,
-            "link": f"https://www.reddit.com{permalink}",
-            "source": f"Reddit/r/{subreddit_name}" if subreddit_name else "Reddit",
-            "date": date_str,
-            "score": score,
-        })
-
-    posts.sort(key=lambda x: x.get("score", 0), reverse=True)
-    return posts[:max_results]
+    posts.sort(key=lambda x: x["score"], reverse=True)
+    return posts
 
 
 async def _search_diagnostic() -> str:
@@ -618,24 +704,41 @@ async def fetch_biweekly_mentions() -> str:
     etransfer_press: list[dict] = []
     competitor_mentions: list[dict] = []
 
-    # ── 1. Reddit API — e-Transfer community (exact dates, fresh posts) ──
-    # These give us real Reddit voices with timestamps + full text, not stale DDG snippets.
+    sem = asyncio.Semaphore(3)  # Max 3 concurrent Reddit API calls
+
+    async def _search(q: str, sub: str, days: int, score: int = 1, comments: bool = False) -> list[dict]:
+        async with sem:
+            return await search_reddit_posts(
+                q, subreddit=sub, max_results=12, days_back=days,
+                min_score=score, enrich_comments=comments,
+            )
+
+    async def _browse(sub: str, kw: str, days: int) -> list[dict]:
+        async with sem:
+            return await browse_subreddit_new(sub, kw, days_back=days, limit=100)
+
+    # ── 1. Reddit — e-Transfer community ──
+    # Search API for targeted queries + browse /new feed for anything mentioning
+    # e-transfer that search might miss (no search-ranking bias on the browse).
     reddit_et_searches = [
         ("e-transfer", "personalfinancecanada"),
         ("interac e-transfer", "personalfinancecanada"),
         ("e-transfer fraud OR scam", ""),
         ("e-transfer problem OR issue OR delay OR complaint", ""),
         ("e-transfer limit OR hold OR declined OR pending", ""),
+        ("interac e-transfer", "canada"),
+        ("e-transfer", "banking"),
+    ]
+    et_browse = [
+        ("personalfinancecanada", "e-transfer", 45),
+        ("personalfinancecanada", "interac", 45),
+        ("canada", "e-transfer", 30),
     ]
 
-    sem = asyncio.Semaphore(3)  # Max 3 concurrent Reddit API calls
+    et_search_tasks = [_search(q, sub, 60) for q, sub in reddit_et_searches]
+    et_browse_tasks = [_browse(sub, kw, days) for sub, kw, days in et_browse]
+    et_batches = await asyncio.gather(*et_search_tasks, *et_browse_tasks, return_exceptions=True)
 
-    async def _reddit(q: str, sub: str, days: int, score: int = 2) -> list[dict]:
-        async with sem:
-            return await search_reddit_posts(q, subreddit=sub, max_results=12, days_back=days, min_score=score)
-
-    et_tasks = [_reddit(q, sub, 60) for q, sub in reddit_et_searches]
-    et_batches = await asyncio.gather(*et_tasks, return_exceptions=True)
     for batch in et_batches:
         if isinstance(batch, Exception) or not batch:
             continue
@@ -645,8 +748,9 @@ async def fetch_biweekly_mentions() -> str:
                 seen_links.add(link)
                 etransfer_social.append(r)
 
-    # ── 2. Reddit API — competitor community reactions ──
-    # Captures what real Canadians say about Wise, PayPal, Wealthsimple, etc.
+    # ── 2. Reddit — competitor community reactions (with comment enrichment) ──
+    # enrich_comments=True: for posts score>=5, fetches top comment via .json trick
+    # so the LLM gets community reaction, not just the OP's question.
     reddit_comp_searches = [
         ("wise money transfer canada", "personalfinancecanada"),
         ("paypal canada send money", "personalfinancecanada"),
@@ -657,10 +761,18 @@ async def fetch_biweekly_mentions() -> str:
         ("revolut canada", "personalfinancecanada"),
         ("neo financial banking canada", "personalfinancecanada"),
         ("venmo paypal zelle canada", ""),
+        ("digital wallet canada", "personalfinancecanada"),
+    ]
+    comp_browse = [
+        ("personalfinancecanada", "wise", 90),
+        ("personalfinancecanada", "paypal", 90),
+        ("personalfinancecanada", "wealthsimple", 60),
     ]
 
-    comp_tasks = [_reddit(q, sub, 180, score=1) for q, sub in reddit_comp_searches]
-    comp_batches = await asyncio.gather(*comp_tasks, return_exceptions=True)
+    comp_search_tasks = [_search(q, sub, 180, score=1, comments=True) for q, sub in reddit_comp_searches]
+    comp_browse_tasks = [_browse(sub, kw, days) for sub, kw, days in comp_browse]
+    comp_batches = await asyncio.gather(*comp_search_tasks, *comp_browse_tasks, return_exceptions=True)
+
     for batch in comp_batches:
         if isinstance(batch, Exception) or not batch:
             continue
