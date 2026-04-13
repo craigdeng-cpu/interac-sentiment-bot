@@ -782,8 +782,13 @@ async def fetch_biweekly_mentions() -> str:
                 seen_links.add(link)
                 competitor_mentions.append(r)
 
-    # ── 3. DDG — e-Transfer supplement (RFD, X, general web) ──
+    # ── 3. DDG — e-Transfer supplement ──
+    # This is the critical fallback path when Reddit API is blocked on the server.
+    # Subreddit-scoped site: queries (site:reddit.com/r/personalfinancecanada) are
+    # far more reliable in DDG than the broad site:reddit.com domain restriction.
+    # News search added for non-site-restricted queries to get dated press articles.
     for query in etransfer_ddg_queries:
+        # Text search (Reddit, RFD, general web)
         results = await web_search(query, "search", 5, tbs="qdr:m")
         for r in results:
             link = r.get("link", "")
@@ -799,6 +804,22 @@ async def fetch_biweekly_mentions() -> str:
                 etransfer_press.append(r)
 
         if not _has_site_restriction(query):
+            # News search — always includes dates, catches press coverage
+            news_results = await web_search(query, "news", 5, tbs="qdr:m")
+            for r in news_results:
+                link = r.get("link", "")
+                if not link or link in seen_links:
+                    continue
+                seen_links.add(link)
+                channel, source = _classify_channel_and_source(link)
+                r["channel"] = channel
+                r["source"] = source
+                if channel == "people":
+                    etransfer_social.append(r)
+                else:
+                    etransfer_press.append(r)
+
+            # X/Twitter
             x_results = await search_twitter(query, 5, tbs="qdr:m")
             for r in x_results:
                 link = r.get("link", "")

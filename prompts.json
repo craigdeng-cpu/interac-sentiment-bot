@@ -10,21 +10,23 @@
     "biweekly_prompt": "prompts/biweekly_prompt.md"
   },
   "etransfer_queries": [
-    "e-Transfer site:forums.redflagdeals.com",
-    "Interac e-Transfer complaint OR frustrated OR switched Canada",
-    "e-Transfer Canada scam OR fraud news"
+    "e-Transfer complaint OR delay OR problem OR issue site:reddit.com/r/personalfinancecanada",
+    "e-Transfer limit OR hold OR declined OR pending site:reddit.com/r/personalfinancecanada",
+    "Interac e-Transfer fraud OR scam OR broken site:reddit.com/r/personalfinancecanada",
+    "e-Transfer site:reddit.com/r/canada",
+    "Interac e-Transfer Canada problem OR complaint OR frustrated 2025 OR 2026",
+    "e-Transfer site:forums.redflagdeals.com"
   ],
   "competitor_queries": [
-    "Wise money transfer Canada review OR fee",
-    "PayPal Canada send money OR cashout",
-    "Apple Pay Google Pay Canada contactless",
-    "Wealthsimple Cash deposit OR send Canada",
-    "KOHO prepaid Visa Canada",
-    "Revolut Canada banking launch",
-    "Neo Financial Canada high interest",
-    "Venmo Zelle ACH Canada alternative",
-    "digital wallet payments Canada fintech",
-    "Square Stripe payments Canada small business"
+    "Wise money transfer Canada review site:reddit.com/r/personalfinancecanada",
+    "PayPal Canada send money review site:reddit.com/r/personalfinancecanada",
+    "Wealthsimple Cash transfer Canada site:reddit.com/r/personalfinancecanada",
+    "KOHO prepaid card Canada site:reddit.com/r/personalfinancecanada",
+    "best way send money Canada interac alternative site:reddit.com/r/personalfinancecanada",
+    "Apple Pay Google Pay Canada tap payment",
+    "Revolut Neo Financial Canada banking launch",
+    "digital payments fintech Canada 2025 news",
+    "Wise PayPal Canada new feature OR update 2025 OR 2026"
   ],
   "timezone": "US/Eastern"
 }
