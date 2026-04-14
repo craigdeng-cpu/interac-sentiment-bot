@@ -16,7 +16,7 @@ This project is designed to give product/ops stakeholders a lightweight "market 
 
 - Runtime: Python 3.12 (`app.py`)
 - Chat interface: Telegram (`python-telegram-bot`)
-- Search provider: DuckDuckGo via `ddgs` (no Serper dependency)
+- Source scraping: Selenium + headless Chromium (public pages only)
 - LLM analysis: Moonshot Kimi API (`KIMI_API_KEY`)
 - Optional email delivery: SMTP or Resend
 - Deployment target: Railway (or any container host)
@@ -119,6 +119,18 @@ Notes:
 - Port `587` uses STARTTLS, port `465` uses implicit SSL.
 - Email dedup/cooldown state is in-memory (resets on restart/redeploy).
 
+## Selenium scraping notes
+
+- The bot now performs source-first scraping with Selenium for Reddit, forums, X, and news pages.
+- X/Twitter is best-effort only in public mode and may return partial data when anti-bot defenses block rendering.
+- Railway/container runtime must include both Chromium and chromedriver binaries.
+- Time and load controls:
+  - `SCRAPE_TIMEOUT_SECONDS` (default `20`)
+  - `SCRAPE_MAX_PAGES_PER_SOURCE` (default `4`)
+  - `SCRAPE_MAX_RESULTS_PER_QUERY` (default `5`)
+  - `CHROMIUM_BINARY` (default `/usr/bin/chromium`)
+  - `CHROMEDRIVER_PATH` (default `/usr/bin/chromedriver`)
+
 ## Prompt + query configuration
 
 Prompt text lives in markdown files:
@@ -159,6 +171,9 @@ Email rendering is mode-aware:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+# local selenium runtime (macOS example):
+# brew install --cask chromium
+# brew install chromedriver
 export TELEGRAM_TOKEN=...
 export KIMI_API_KEY=...
 python app.py

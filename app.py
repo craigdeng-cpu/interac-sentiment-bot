@@ -19,10 +19,17 @@ from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from collections import defaultdict
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 
 import httpx
 from ddgs import DDGS
+from selenium import webdriver
+from selenium.common.exceptions import WebDriverException, TimeoutException
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 from telegram import Update
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -63,6 +70,16 @@ RESEND_API_URL = os.environ.get("RESEND_API_URL", "https://api.resend.com/emails
 EMAIL_FROM = os.environ.get("EMAIL_FROM", "")
 EMAIL_TO = [x.strip() for x in os.environ.get("EMAIL_TO", "").split(",") if x.strip()]
 EMAIL_SUBJECT_PREFIX = os.environ.get("EMAIL_SUBJECT_PREFIX", "Interac Intelligence")
+SCRAPE_TIMEOUT_SECONDS = int(os.environ.get("SCRAPE_TIMEOUT_SECONDS", "20"))
+SCRAPE_MAX_PAGES_PER_SOURCE = int(os.environ.get("SCRAPE_MAX_PAGES_PER_SOURCE", "4"))
+SCRAPE_MAX_RESULTS_PER_QUERY = int(os.environ.get("SCRAPE_MAX_RESULTS_PER_QUERY", "5"))
+SCRAPE_USER_AGENT = os.environ.get(
+    "SCRAPE_USER_AGENT",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+)
+CHROMIUM_BINARY = os.environ.get("CHROMIUM_BINARY", "/usr/bin/chromium")
+CHROMEDRIVER_PATH = os.environ.get("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
 
 EST = timezone(timedelta(hours=-5))
 
@@ -159,6 +176,236 @@ def load_prompts() -> dict:
 
 
 # ─── Web Scraping ─────────────────────────────────────────────────────────────
+def _safe_driver_quit(driver: webdriver.Chrome | None) -> None:
+    if driver is None:
+        return
+    try:
+        driver.quit()
+    except Exception:
+        pass
+
+
+def build_driver() -> webdriver.Chrome:
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1400,2400")
+    options.add_argument(f"--user-agent={SCRAPE_USER_AGENT}")
+    if CHROMIUM_BINARY:
+        options.binary_location = CHROMIUM_BINARY
+    service = Service(CHROMEDRIVER_PATH) if CHROMEDRIVER_PATH else Service()
+    driver = webdriver.Chrome(service=service, options=options)
+    driver.set_page_load_timeout(SCRAPE_TIMEOUT_SECONDS)
+    return driver
+
+
+def _get_with_retry(driver: webdriver.Chrome, url: str, retries: int = 2) -> bool:
+    for attempt in range(retries + 1):
+        try:
+            driver.get(url)
+            return True
+        except (TimeoutException, WebDriverException) as exc:
+            if attempt >= retries:
+                logger.warning(f"Selenium failed for {url}: {exc}")
+                return False
+    return False
+
+
+def _clean_scraped_text(text: str, max_chars: int = 1400) -> str:
+    cleaned = " ".join((text or "").split())
+    return cleaned[:max_chars]
+
+
+def _query_terms(raw_query: str) -> str:
+    query = re.sub(r"site:[^\s]+", "", raw_query, flags=re.IGNORECASE)
+    query = re.sub(r"\b(OR|AND)\b", " ", query, flags=re.IGNORECASE)
+    return " ".join(query.split())[:120]
+
+
+def _scrape_reddit_source(query: str, max_results: int = 5) -> list[dict]:
+    terms = _query_terms(query)
+    if not terms:
+        return []
+    driver = None
+    items = []
+    try:
+        driver = build_driver()
+        search_url = f"https://old.reddit.com/search/?q={quote_plus(terms)}&sort=new"
+        if not _get_with_retry(driver, search_url):
+            return []
+        WebDriverWait(driver, SCRAPE_TIMEOUT_SECONDS).until(
+            EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.search-result"))
+        )
+        cards = driver.find_elements(By.CSS_SELECTOR, "div.search-result")[:max_results]
+        for card in cards:
+            title_els = card.find_elements(By.CSS_SELECTOR, "a.search-title")
+            if not title_els:
+                continue
+            title = _clean_scraped_text(title_els[0].text, max_chars=180)
+            link = title_els[0].get_attribute("href") or ""
+            snippet_els = card.find_elements(By.CSS_SELECTOR, "div.search-expando")
+            snippet = _clean_scraped_text(snippet_els[0].text if snippet_els else "", max_chars=700)
+            date_els = card.find_elements(By.CSS_SELECTOR, "time")
+            raw_date = date_els[0].get_attribute("datetime") if date_els else ""
+            items.append({
+                "title": title,
+                "snippet": snippet or title,
+                "link": link,
+                "source": "Reddit",
+                "date": _resolve_relative_date(raw_date),
+            })
+    except Exception as exc:
+        logger.warning(f"Reddit Selenium scrape failed: {exc}")
+    finally:
+        _safe_driver_quit(driver)
+    return items
+
+
+def _scrape_forums_source(query: str, max_results: int = 5) -> list[dict]:
+    terms = _query_terms(query)
+    if not terms:
+        return []
+    driver = None
+    items = []
+    try:
+        driver = build_driver()
+        search_url = f"https://forums.redflagdeals.com/search.php?keywords={quote_plus(terms)}"
+        if not _get_with_retry(driver, search_url):
+            return []
+        WebDriverWait(driver, SCRAPE_TIMEOUT_SECONDS).until(
+            EC.presence_of_all_elements_located((By.CSS_SELECTOR, "h3.searchresult-title, a.topictitle"))
+        )
+        links = driver.find_elements(By.CSS_SELECTOR, "h3.searchresult-title a, a.topictitle")[:max_results]
+        for el in links:
+            title = _clean_scraped_text(el.text, max_chars=180)
+            link = el.get_attribute("href") or ""
+            if not title or not link:
+                continue
+            items.append({
+                "title": title,
+                "snippet": title,
+                "link": link,
+                "source": "RedFlagDeals",
+                "date": "",
+            })
+    except Exception as exc:
+        logger.warning(f"Forum Selenium scrape failed: {exc}")
+    finally:
+        _safe_driver_quit(driver)
+    return items
+
+
+def _scrape_x_source(query: str, max_results: int = 5) -> list[dict]:
+    terms = _query_terms(query)
+    if not terms:
+        return []
+    driver = None
+    items = []
+    try:
+        driver = build_driver()
+        search_url = f"https://x.com/search?q={quote_plus(terms)}&src=typed_query&f=live"
+        if not _get_with_retry(driver, search_url):
+            return []
+        WebDriverWait(driver, 8).until(
+            EC.presence_of_all_elements_located((By.CSS_SELECTOR, "article"))
+        )
+        tweets = driver.find_elements(By.CSS_SELECTOR, "article")[:max_results]
+        for tweet in tweets:
+            text_els = tweet.find_elements(By.CSS_SELECTOR, "[data-testid='tweetText']")
+            link_els = tweet.find_elements(By.CSS_SELECTOR, "a[href*='/status/']")
+            if not text_els or not link_els:
+                continue
+            body = _clean_scraped_text(text_els[0].text, max_chars=700)
+            link = link_els[0].get_attribute("href") or ""
+            if not body:
+                continue
+            items.append({
+                "title": body[:120],
+                "snippet": body,
+                "link": link,
+                "source": "X/Twitter",
+                "date": "",
+            })
+    except Exception as exc:
+        logger.info(f"X public scraping unavailable for query '{terms}': {exc}")
+    finally:
+        _safe_driver_quit(driver)
+    return items
+
+
+def _scrape_news_source(query: str, max_results: int = 5) -> list[dict]:
+    terms = _query_terms(query)
+    if not terms:
+        return []
+    driver = None
+    items = []
+    try:
+        driver = build_driver()
+        search_url = f"https://news.google.com/search?q={quote_plus(terms)}&hl=en-CA&gl=CA&ceid=CA%3Aen"
+        if not _get_with_retry(driver, search_url):
+            return []
+        WebDriverWait(driver, SCRAPE_TIMEOUT_SECONDS).until(
+            EC.presence_of_all_elements_located((By.CSS_SELECTOR, "article"))
+        )
+        cards = driver.find_elements(By.CSS_SELECTOR, "article")[:max_results]
+        for card in cards:
+            anchor_els = card.find_elements(By.CSS_SELECTOR, "a[href*='./articles/']")
+            if not anchor_els:
+                continue
+            title = _clean_scraped_text(anchor_els[0].text, max_chars=180)
+            href = anchor_els[0].get_attribute("href") or ""
+            if href.startswith("./"):
+                href = "https://news.google.com" + href[1:]
+            snippet = _clean_scraped_text(card.text, max_chars=700)
+            date_els = card.find_elements(By.CSS_SELECTOR, "time")
+            raw_date = date_els[0].get_attribute("datetime") if date_els else ""
+            items.append({
+                "title": title or snippet[:140],
+                "snippet": snippet,
+                "link": href,
+                "source": "News/Other",
+                "date": _resolve_relative_date(raw_date),
+            })
+    except Exception as exc:
+        logger.warning(f"News Selenium scrape failed: {exc}")
+    finally:
+        _safe_driver_quit(driver)
+    return items
+
+
+async def selenium_source_search(
+    query: str,
+    source: str,
+    max_results: int = 5,
+) -> list[dict]:
+    source_key = source.lower()
+    if source_key == "reddit":
+        fn = _scrape_reddit_source
+    elif source_key == "forums":
+        fn = _scrape_forums_source
+    elif source_key == "twitter":
+        fn = _scrape_x_source
+    elif source_key == "news":
+        fn = _scrape_news_source
+    else:
+        return []
+    results = await asyncio.to_thread(fn, query, min(max_results, SCRAPE_MAX_RESULTS_PER_QUERY))
+    filtered = []
+    for item in results[: SCRAPE_MAX_PAGES_PER_SOURCE * SCRAPE_MAX_RESULTS_PER_QUERY]:
+        snippet = _clean_scraped_text(item.get("snippet", ""))
+        title = _clean_scraped_text(item.get("title", ""), max_chars=180)
+        link = (item.get("link", "") or "").strip()
+        if not link or (len(snippet) < 25 and len(title) < 15):
+            continue
+        item["snippet"] = snippet or title
+        item["title"] = title or snippet[:120]
+        filtered.append(item)
+    logger.info(f"Selenium source={source} query='{query[:40]}' -> {len(filtered)} mentions")
+    return filtered
+
+
 def lookback_hours_to_tbs(lookback_hours: int) -> str:
     # Google-style time filters used by query config.
     if lookback_hours <= 24:
@@ -893,6 +1140,11 @@ async def fetch_biweekly_mentions() -> str:
     config = load_prompts()
     etransfer_ddg_queries = config.get("etransfer_queries", config.get("biweekly_queries", []))
     competitor_ddg_queries = config.get("competitor_queries", [])
+    source_toggles = config.get("sources", {})
+    use_reddit = bool(source_toggles.get("reddit", True))
+    use_forums = bool(source_toggles.get("forums", True))
+    use_twitter = bool(source_toggles.get("twitter", True))
+    use_news = bool(source_toggles.get("news", True))
 
     seen_links: set[str] = set()
     etransfer_social: list[dict] = []
@@ -930,18 +1182,19 @@ async def fetch_biweekly_mentions() -> str:
         ("canada", "e-transfer", 30),
     ]
 
-    et_search_tasks = [_search(q, sub, 60) for q, sub in reddit_et_searches]
-    et_browse_tasks = [_browse(sub, kw, days) for sub, kw, days in et_browse]
-    et_batches = await asyncio.gather(*et_search_tasks, *et_browse_tasks, return_exceptions=True)
+    if use_reddit:
+        et_search_tasks = [_search(q, sub, 60) for q, sub in reddit_et_searches]
+        et_browse_tasks = [_browse(sub, kw, days) for sub, kw, days in et_browse]
+        et_batches = await asyncio.gather(*et_search_tasks, *et_browse_tasks, return_exceptions=True)
 
-    for batch in et_batches:
-        if isinstance(batch, Exception) or not batch:
-            continue
-        for r in batch:
-            link = r.get("link", "")
-            if link and link not in seen_links:
-                seen_links.add(link)
-                etransfer_social.append(r)
+        for batch in et_batches:
+            if isinstance(batch, Exception) or not batch:
+                continue
+            for r in batch:
+                link = r.get("link", "")
+                if link and link not in seen_links:
+                    seen_links.add(link)
+                    etransfer_social.append(r)
 
     # ── 2. Reddit — competitor community reactions (with comment enrichment) ──
     # enrich_comments=True: for posts score>=5, fetches top comment via .json trick
@@ -964,18 +1217,19 @@ async def fetch_biweekly_mentions() -> str:
         ("personalfinancecanada", "wealthsimple", 60),
     ]
 
-    comp_search_tasks = [_search(q, sub, 180, score=1, comments=True) for q, sub in reddit_comp_searches]
-    comp_browse_tasks = [_browse(sub, kw, days) for sub, kw, days in comp_browse]
-    comp_batches = await asyncio.gather(*comp_search_tasks, *comp_browse_tasks, return_exceptions=True)
+    if use_reddit:
+        comp_search_tasks = [_search(q, sub, 180, score=1, comments=True) for q, sub in reddit_comp_searches]
+        comp_browse_tasks = [_browse(sub, kw, days) for sub, kw, days in comp_browse]
+        comp_batches = await asyncio.gather(*comp_search_tasks, *comp_browse_tasks, return_exceptions=True)
 
-    for batch in comp_batches:
-        if isinstance(batch, Exception) or not batch:
-            continue
-        for r in batch:
-            link = r.get("link", "")
-            if link and link not in seen_links:
-                seen_links.add(link)
-                competitor_mentions.append(r)
+        for batch in comp_batches:
+            if isinstance(batch, Exception) or not batch:
+                continue
+            for r in batch:
+                link = r.get("link", "")
+                if link and link not in seen_links:
+                    seen_links.add(link)
+                    competitor_mentions.append(r)
 
     # ── 3. DDG — e-Transfer supplement ──
     # This is the critical fallback path when Reddit API is blocked on the server.
@@ -983,25 +1237,18 @@ async def fetch_biweekly_mentions() -> str:
     # far more reliable in DDG than the broad site:reddit.com domain restriction.
     # News search added for non-site-restricted queries to get dated press articles.
     for query in etransfer_ddg_queries:
-        # Text search (Reddit, RFD, general web)
-        results = await web_search(query, "search", 5, tbs="qdr:m")
-        for r in results:
-            link = r.get("link", "")
-            if not link or link in seen_links:
-                continue
-            seen_links.add(link)
-            channel, source = _classify_channel_and_source(link)
-            r["channel"] = channel
-            r["source"] = source
-            if channel == "people":
-                etransfer_social.append(r)
-            else:
-                etransfer_press.append(r)
+        selenium_batches = []
+        if use_forums:
+            selenium_batches.append(await selenium_source_search(query, "forums", SCRAPE_MAX_RESULTS_PER_QUERY))
+        if use_twitter and not _has_site_restriction(query):
+            selenium_batches.append(await selenium_source_search(query, "twitter", SCRAPE_MAX_RESULTS_PER_QUERY))
+        if use_news and not _has_site_restriction(query):
+            selenium_batches.append(await selenium_source_search(query, "news", SCRAPE_MAX_RESULTS_PER_QUERY))
+        if use_reddit and _has_site_restriction(query):
+            selenium_batches.append(await selenium_source_search(query, "reddit", SCRAPE_MAX_RESULTS_PER_QUERY))
 
-        if not _has_site_restriction(query):
-            # News search — always includes dates, catches press coverage
-            news_results = await web_search(query, "news", 5, tbs="qdr:m")
-            for r in news_results:
+        for results in selenium_batches:
+            for r in results:
                 link = r.get("link", "")
                 if not link or link in seen_links:
                     continue
@@ -1014,21 +1261,19 @@ async def fetch_biweekly_mentions() -> str:
                 else:
                     etransfer_press.append(r)
 
-            # X/Twitter
-            x_results = await search_twitter(query, 5, tbs="qdr:m")
-            for r in x_results:
-                link = r.get("link", "")
-                if not link or link in seen_links:
-                    continue
-                seen_links.add(link)
-                r["channel"] = "people"
-                r["source"] = "X/Twitter"
-                etransfer_social.append(r)
-
     # ── 4. DDG — competitor press/news + X (launches, independent coverage) ──
     for query in competitor_ddg_queries:
-        for search_type, tbs in [("search", "qdr:y"), ("news", "qdr:y")]:
-            results = await web_search(query, search_type, 5, tbs=tbs)
+        selenium_batches = []
+        if use_news:
+            selenium_batches.append(await selenium_source_search(query, "news", SCRAPE_MAX_RESULTS_PER_QUERY))
+        if use_twitter and not _has_site_restriction(query):
+            selenium_batches.append(await selenium_source_search(query, "twitter", SCRAPE_MAX_RESULTS_PER_QUERY))
+        if use_forums and ("forum" in query.lower() or "redflagdeals" in query.lower()):
+            selenium_batches.append(await selenium_source_search(query, "forums", SCRAPE_MAX_RESULTS_PER_QUERY))
+        if use_reddit and _has_site_restriction(query):
+            selenium_batches.append(await selenium_source_search(query, "reddit", SCRAPE_MAX_RESULTS_PER_QUERY))
+
+        for results in selenium_batches:
             for r in results:
                 link = r.get("link", "")
                 if not link or link in seen_links:
@@ -1036,16 +1281,6 @@ async def fetch_biweekly_mentions() -> str:
                 seen_links.add(link)
                 _, source = _classify_channel_and_source(link)
                 r["source"] = source
-                competitor_mentions.append(r)
-
-        if not _has_site_restriction(query):
-            x_results = await search_twitter(query, 5, tbs="qdr:y")
-            for r in x_results:
-                link = r.get("link", "")
-                if not link or link in seen_links:
-                    continue
-                seen_links.add(link)
-                r["source"] = "X/Twitter"
                 competitor_mentions.append(r)
 
     # Layer 3: async HTML meta scraping for any DDG results still missing a date.
