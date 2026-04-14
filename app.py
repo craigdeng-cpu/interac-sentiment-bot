@@ -64,6 +64,7 @@ EMAIL_FROM = os.environ.get("EMAIL_FROM", "")
 EMAIL_TO = [x.strip() for x in os.environ.get("EMAIL_TO", "").split(",") if x.strip()]
 EMAIL_SUBJECT_PREFIX = os.environ.get("EMAIL_SUBJECT_PREFIX", "Interac Intelligence")
 MAX_MENTION_AGE_DAYS = int(os.environ.get("MAX_MENTION_AGE_DAYS", "120"))
+QUALITY_STRICT = os.environ.get("QUALITY_STRICT", "1") == "1"
 
 EST = timezone(timedelta(hours=-5))
 
@@ -719,6 +720,96 @@ def _filter_recent_dated_mentions(
     return kept
 
 
+_ETRANSFER_SIGNAL_TOKENS = [
+    "e-transfer", "etransfer", "interac", "auto-deposit", "autodeposit",
+    "fraud", "scam", "hold", "pending", "declined", "limit", "delay", "reversal",
+]
+_COMPETITOR_BRANDS = [
+    "wise", "paypal", "wealthsimple", "koho", "apple pay", "google pay",
+    "revolut", "neo financial", "venmo", "zelle", "cash app", "square", "stripe",
+]
+_COMPETITOR_EVENT_TOKENS = [
+    "launch", "launched", "rollout", "rolled out", "new feature", "pricing",
+    "fee", "fees", "partnership", "expands", "expansion", "introduces", "update",
+]
+_LOW_SIGNAL_PATTERNS = [
+    "what do you think", "is this legit", "anyone else", "help please", "i'm new",
+]
+
+
+def _mention_quality_score(mention: dict, section: str) -> float:
+    """Score mention quality deterministically before sending to the LLM."""
+    text = " ".join(
+        [
+            mention.get("title", ""),
+            mention.get("snippet", ""),
+        ]
+    ).lower()
+    link = (mention.get("link", "") or "").lower()
+    score = 0.0
+
+    channel, _ = _classify_channel_and_source(link)
+    source_tier = _source_quality_tier(link, channel)
+    if source_tier == "tier1_user_generated":
+        score += 1.5
+    elif source_tier == "tier2_reported":
+        score += 1.0
+
+    if "reddit.com" in link:
+        score += min(float(mention.get("score", 0)), 20.0) / 5.0
+        score += min(float(mention.get("num_comments", 0)), 30.0) / 15.0
+
+    snippet_len = len((mention.get("snippet", "") or "").strip())
+    if snippet_len >= 90:
+        score += 1.0
+    if snippet_len >= 180:
+        score += 0.5
+
+    if any(p in text for p in _LOW_SIGNAL_PATTERNS):
+        score -= 1.5
+    if "?" in text and snippet_len < 120:
+        score -= 0.5
+
+    if section == "etransfer":
+        if any(tok in text for tok in _ETRANSFER_SIGNAL_TOKENS):
+            score += 1.5
+        else:
+            score -= 3.0
+    else:  # competitor
+        has_brand = any(tok in text for tok in _COMPETITOR_BRANDS)
+        if has_brand:
+            score += 1.0
+        else:
+            score -= 2.0
+        if channel == "press" and not any(tok in text for tok in _COMPETITOR_EVENT_TOKENS):
+            score -= 1.5
+        if any(tok in text for tok in _COMPETITOR_EVENT_TOKENS):
+            score += 1.0
+
+    return score
+
+
+def _quality_gate_mentions(
+    mentions: list[dict], *, section: str, threshold: float
+) -> list[dict]:
+    """Keep only quality mentions; preserve ranking by score."""
+    if not QUALITY_STRICT:
+        return mentions
+    kept: list[dict] = []
+    dropped = 0
+    for m in mentions:
+        q = _mention_quality_score(m, section)
+        if q >= threshold:
+            kept.append(m)
+        else:
+            dropped += 1
+    if dropped:
+        logger.info(
+            f"[quality-filter] section={section} kept={len(kept)} dropped={dropped} threshold={threshold}"
+        )
+    return kept
+
+
 async def web_search(
     query: str,
     search_type: str = "search",
@@ -899,6 +990,7 @@ def _parse_reddit_post(post: dict, cutoff_ts: float) -> dict | None:
         "source": f"Reddit/r/{subreddit_name}" if subreddit_name else "Reddit",
         "date": post_dt.strftime("%B %d, %Y"),
         "score": post.get("score", 0),
+        "num_comments": post.get("num_comments", 0),
         "permalink": permalink,
     }
 
@@ -1235,6 +1327,17 @@ async def fetch_biweekly_mentions() -> str:
     )
     competitor_mentions = _filter_recent_dated_mentions(
         competitor_mentions, max_age_days=MAX_MENTION_AGE_DAYS
+    )
+
+    # Deterministic quality gate: remove low-signal posts before LLM analysis.
+    etransfer_social = _quality_gate_mentions(
+        etransfer_social, section="etransfer", threshold=3.0
+    )
+    etransfer_press = _quality_gate_mentions(
+        etransfer_press, section="etransfer", threshold=2.5
+    )
+    competitor_mentions = _quality_gate_mentions(
+        competitor_mentions, section="competitor", threshold=3.5
     )
 
     total = len(etransfer_social) + len(etransfer_press) + len(competitor_mentions)

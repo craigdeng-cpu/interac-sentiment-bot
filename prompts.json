@@ -18,15 +18,14 @@
     "e-Transfer site:forums.redflagdeals.com"
   ],
   "competitor_queries": [
-    "Wise money transfer Canada review site:reddit.com/r/personalfinancecanada",
-    "PayPal Canada send money review site:reddit.com/r/personalfinancecanada",
-    "Wealthsimple Cash transfer Canada site:reddit.com/r/personalfinancecanada",
-    "KOHO prepaid card Canada site:reddit.com/r/personalfinancecanada",
-    "best way send money Canada interac alternative site:reddit.com/r/personalfinancecanada",
-    "Apple Pay Google Pay Canada tap payment",
-    "Revolut Neo Financial Canada banking launch",
-    "digital payments fintech Canada 2025 news",
-    "Wise PayPal Canada new feature OR update 2025 OR 2026"
+    "Wise money transfer Canada fee OR pricing OR new feature site:reddit.com/r/personalfinancecanada",
+    "PayPal Canada send money fee OR hold OR update site:reddit.com/r/personalfinancecanada",
+    "Wealthsimple Cash transfer Canada update OR feature OR issue site:reddit.com/r/personalfinancecanada",
+    "KOHO card Canada update OR fee OR launch site:reddit.com/r/personalfinancecanada",
+    "Apple Pay OR Google Pay Canada launch OR fee OR feature update",
+    "Revolut OR Neo Financial Canada launch OR rollout OR pricing update",
+    "Wise OR PayPal Canada new feature OR pricing change 2025 OR 2026",
+    "digital payments Canada launch OR partnership OR pricing news 2025 OR 2026"
   ],
   "timezone": "US/Eastern"
 }
