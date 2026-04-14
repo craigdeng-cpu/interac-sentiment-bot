@@ -19,7 +19,7 @@ from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from collections import defaultdict
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 from ddgs import DDGS
@@ -69,6 +69,8 @@ EST = timezone(timedelta(hours=-5))
 subscribed_chats: set[int] = set()
 last_report: str = ""
 last_mentions_raw: str = ""
+# Canonical URL (see _canonical_url_for_date_lookup) -> "Month DD, YYYY" from last biweekly fetch
+last_biweekly_url_dates: dict[str, str] = {}
 last_email_sent_at: datetime | None = None
 last_weekly_email_key: str | None = None
 
@@ -639,6 +641,40 @@ async def _enrich_dates_from_meta(
     logger.info(f"[date-enrich-L3] fetched {len(targets)} undated URLs, gained {gained} dates")
 
 
+def _canonical_url_for_date_lookup(url: str) -> str:
+    """Normalize URL for matching mention links to email bullet Source URLs."""
+    u = (url or "").strip().rstrip(".,)")
+    if not u:
+        return ""
+    try:
+        p = urlparse(u)
+    except Exception:
+        return ""
+    host = (p.netloc or "").lower()
+    path = (p.path or "").rstrip("/")
+    query = p.query or ""
+    if "reddit.com" in host:
+        host = "reddit.com"
+        return urlunparse(("https", host, path, "", "", ""))
+    if host.startswith("www."):
+        host = host[4:]
+    return urlunparse(("https", host, path, "", query, ""))
+
+
+def _build_url_date_map_from_mentions(*buckets: list[dict]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for bucket in buckets:
+        for m in bucket:
+            link = (m.get("link") or "").strip()
+            date = (m.get("date") or "").strip()
+            if not link or not date:
+                continue
+            key = _canonical_url_for_date_lookup(link)
+            if key:
+                out.setdefault(key, date)
+    return out
+
+
 async def web_search(
     query: str,
     search_type: str = "search",
@@ -707,6 +743,97 @@ async def search_twitter(query: str, max_results: int = 5, tbs: str = "qdr:w") -
 _REDDIT_HEADERS = {
     "User-Agent": "python:interac.intelligence.bot:v1.0 (by /u/interac_intel_bot)"
 }
+
+_REDDIT_THREAD_PATH = re.compile(r"^/r/[^/]+/comments/[a-z0-9]+", re.I)
+
+
+def _is_reddit_thread_url(url: str) -> bool:
+    try:
+        p = urlparse(url)
+    except Exception:
+        return False
+    if "reddit.com" not in (p.netloc or "").lower():
+        return False
+    return bool(_REDDIT_THREAD_PATH.match(p.path or ""))
+
+
+async def _reddit_json_created_str(url: str, client: httpx.AsyncClient) -> str:
+    """Fetch thread created_utc via Reddit's .json suffix. Returns '' on failure."""
+    base = url.split("#")[0].split("?")[0].rstrip("/")
+    jurl = base if base.lower().endswith(".json") else f"{base}.json"
+    try:
+        r = await client.get(jurl, headers=_REDDIT_HEADERS, timeout=12.0)
+        if r.status_code != 200:
+            return ""
+        data = r.json()
+    except Exception:
+        return ""
+    created = None
+    if isinstance(data, list) and data:
+        children = data[0].get("data", {}).get("children", [])
+        if children:
+            created = children[0].get("data", {}).get("created_utc")
+    if created is None:
+        return ""
+    try:
+        post_dt = datetime.fromtimestamp(float(created), tz=timezone.utc)
+        return post_dt.strftime("%B %d, %Y")
+    except Exception:
+        return ""
+
+
+async def _enrich_dates_from_reddit_json(
+    mentions: list[dict], *, max_fetches: int = 40
+) -> None:
+    """Fill missing mention dates for Reddit thread URLs using the public .json endpoint."""
+    targets: list[tuple[str, str]] = []
+    seen_keys: set[str] = set()
+    for m in mentions:
+        link = (m.get("link") or "").strip()
+        if (m.get("date") or "").strip():
+            continue
+        if not link or not _is_reddit_thread_url(link):
+            continue
+        key = _canonical_url_for_date_lookup(link)
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        targets.append((key, link))
+        if len(targets) >= max_fetches:
+            break
+
+    if not targets:
+        return
+
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        results = await asyncio.gather(
+            *[_reddit_json_created_str(link, client) for _key, link in targets],
+            return_exceptions=True,
+        )
+
+    key_to_date: dict[str, str] = {}
+    for (key, _link), res in zip(targets, results):
+        if isinstance(res, str) and res:
+            key_to_date[key] = res
+
+    if not key_to_date:
+        logger.info(f"[date-enrich-reddit] fetched {len(targets)} undated Reddit URLs, gained 0 dates")
+        return
+
+    for m in mentions:
+        if (m.get("date") or "").strip():
+            continue
+        lk = (m.get("link") or "").strip()
+        if not lk:
+            continue
+        d = key_to_date.get(_canonical_url_for_date_lookup(lk))
+        if d:
+            m["date"] = d
+
+    logger.info(
+        f"[date-enrich-reddit] fetched {len(targets)} undated Reddit URLs, "
+        f"gained {len(key_to_date)} dates"
+    )
 
 
 def _parse_reddit_post(post: dict, cutoff_ts: float) -> dict | None:
@@ -890,6 +1017,7 @@ async def fetch_biweekly_mentions() -> str:
     - DDG (supplement): RFD, X/Twitter, news for things Reddit API can't cover.
     Results split into labelled sections so the LLM assigns them correctly.
     """
+    global last_biweekly_url_dates
     config = load_prompts()
     etransfer_ddg_queries = config.get("etransfer_queries", config.get("biweekly_queries", []))
     competitor_ddg_queries = config.get("competitor_queries", [])
@@ -1048,15 +1176,15 @@ async def fetch_biweekly_mentions() -> str:
                 r["source"] = "X/Twitter"
                 competitor_mentions.append(r)
 
-    # Layer 3: async HTML meta scraping for any DDG results still missing a date.
-    # Reddit mentions already have exact dates; this targets DDG text() results.
-    # Run across all three buckets — Reddit items are skipped automatically
-    # because they already have a non-empty date field.
+    # Date backfill: Reddit .json for undated thread URLs (e.g. DDG-only Reddit hits),
+    # then HTML <head> meta for other undated URLs (cap excludes Reddit threads filled above).
     all_mentions = etransfer_social + etransfer_press + competitor_mentions
+    await _enrich_dates_from_reddit_json(all_mentions, max_fetches=40)
     await _enrich_dates_from_meta(all_mentions, max_fetches=25)
 
     total = len(etransfer_social) + len(etransfer_press) + len(competitor_mentions)
     if total == 0:
+        last_biweekly_url_dates = {}
         return "No mentions found in the past month."
 
     lines = [f"=== INTERAC BIWEEKLY SCAN — {now_est()} ==="]
@@ -1092,6 +1220,9 @@ async def fetch_biweekly_mentions() -> str:
         lines.append("=== COMPETITOR INTELLIGENCE (Wise, PayPal, Apple Pay, Wealthsimple, KOHO, Venmo, Zelle, Revolut, Neo, ACH, others) ===")
         lines += _fmt("C", competitor_mentions, 30, 450)
 
+    last_biweekly_url_dates = _build_url_date_map_from_mentions(
+        etransfer_social, etransfer_press, competitor_mentions
+    )
     return "\n".join(lines)
 
 
@@ -1663,11 +1794,14 @@ def _platform_badge_color(platform: str) -> str:
     return "#1a73e8"  # News/Other
 
 
-def _render_quote_bullets(raw: str, empty_msg: str) -> str:
+def _render_quote_bullets(
+    raw: str, empty_msg: str, url_dates: dict[str, str] | None = None
+) -> str:
     """Render quote bullets as styled cards with platform badge, date, and hyperlink.
 
     Each bullet is expected in the form:
         - "quote text" — Platform, Date. Source: URL
+    When the model omits the date, ``url_dates`` (canonical URL -> date) can fill it in.
     """
     _empty = (
         f"<div style='padding:12px 14px;font-size:13px;color:{EMAIL_MUTED};'>"
@@ -1713,6 +1847,9 @@ def _render_quote_bullets(raw: str, empty_msg: str) -> str:
         else:
             # No comma → attribution is platform only, no date
             date_label = ""
+
+        if not date_label and url:
+            date_label = (url_dates or {}).get(_canonical_url_for_date_lookup(url), "")
 
         # Derive platform badge from URL domain — only community platforms get a badge.
         # This prevents corporate sites (wise.com, paypal.com) from showing as badges.
@@ -1803,7 +1940,9 @@ def _parse_trend_fields(trend_raw: str) -> tuple[str, str, str]:
     return still, quiet, new
 
 
-def _build_biweekly_html(subject: str, body: str) -> str:
+def _build_biweekly_html(
+    subject: str, body: str, url_dates: dict[str, str] | None = None
+) -> str:
     scan_date = _extract_report_field(body, "SCAN DATE")
     etransfer_raw = _extract_section(body, "e-Transfer Chatter:", ["Competitor Landscape:", "Trend vs Last Scan:"])
     competitor_raw = _extract_section(body, "Competitor Landscape:", ["Trend vs Last Scan:"])
@@ -1812,8 +1951,9 @@ def _build_biweekly_html(subject: str, body: str) -> str:
     if not any(s.strip() for s in [etransfer_raw, competitor_raw, trend_raw]):
         return _styled_raw_report_html(subject, body)
 
-    etransfer_html = _render_quote_bullets(etransfer_raw, "Nothing notable this scan.")
-    competitor_html = _render_quote_bullets(competitor_raw, "Nothing notable this scan.")
+    umap = url_dates or {}
+    etransfer_html = _render_quote_bullets(etransfer_raw, "Nothing notable this scan.", umap)
+    competitor_html = _render_quote_bullets(competitor_raw, "Nothing notable this scan.", umap)
 
     still, quiet, new_themes = _parse_trend_fields(trend_raw)
     trend_html = (
@@ -1878,8 +2018,11 @@ def _build_biweekly_html(subject: str, body: str) -> str:
 </html>""".strip()
 
 
-def build_email_bodies(subject: str, body: str) -> tuple[str, str]:
-    return body, _build_biweekly_html(subject, body)
+def build_email_bodies(
+    subject: str, body: str, url_dates: dict[str, str] | None = None
+) -> tuple[str, str]:
+    merged = url_dates if url_dates is not None else last_biweekly_url_dates
+    return body, _build_biweekly_html(subject, body, url_dates=merged)
 
 
 def _record_email_sent(trigger: str, *, now_local: datetime | None = None) -> None:
