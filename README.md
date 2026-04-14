@@ -40,16 +40,17 @@ User commands:
 - `/subscribe` - subscribe this chat to scheduled broadcasts.
 - `/unsubscribe` - stop scheduled broadcasts for this chat.
 - `/status` - runtime/schedule/status snapshot.
-- `/scan` - run immediate daily scan.
+- `/scan` - run immediate biweekly-style scan (polling) or background job (webhook).
 - `/raw` - show raw mention payload from last scan.
 - `/prompt` - show query/source config summary.
 - any plain text message - follow-up question over latest report context.
 
 Admin-only commands (`ADMIN_IDS`):
 
-- `/email` - run fresh daily scan and send email immediately (60s timeout).
+- `/email` - run fresh scan and send email (see timeouts below; webhook runs in background).
 - `/deepscan` - run historical scan + analysis + email (with diagnostics).
 - `/smtpcheck` - validate current email provider config/connectivity.
+- `/fetchdiag` - quick Reddit JSON + Selenium news + DDG probe (no full scan).
 
 ## Scheduled behavior
 
@@ -131,7 +132,14 @@ Notes:
   - `CHROMIUM_BINARY` (default `/usr/bin/chromium`)
   - `CHROMEDRIVER_PATH` (default `/usr/bin/chromedriver`)
 - Scan timeouts (`/scan`, `/email`, scheduled job): `BIWEEKLY_FETCH_TIMEOUT` (default `360` s), `BIWEEKLY_ANALYZE_TIMEOUT` (default `120` s). Raise them on Railway only if you still hit timeouts.
-- Per query, enabled Selenium sources (forum / news / X / reddit) run in parallel.
+- `SCRAPE_MAX_CONCURRENT_BROWSERS` (default `2`) — global cap on concurrent Selenium sessions (avoids OOM on small Railway plans).
+- `FETCH_FALLBACK_DDG` (default `1`) — if Reddit + Selenium still yield **zero** mentions, run DuckDuckGo (`ddgs`) text/news/X supplement like the legacy path.
+- **One Chromium session per query** (forums → X → news → optional Reddit Selenium in sequence) instead of three separate browsers per query.
+- **Empty scan diagnostics**: when nothing is collected, the bot returns a `=== FETCH DIAGNOSTICS ===` block (Reddit task errors, Selenium row counts, whether DDG fallback ran) before the “No mentions found…” line. Use `/fetchdiag` on the host to isolate failures.
+
+### Webhook mode (`WEBHOOK_URL` set)
+
+- Railway and Telegram expect the webhook HTTP handler to finish quickly. `/scan` and `/email` **enqueue work in the background** and reply immediately; results arrive as follow-up messages in the same chat.
 
 ## Prompt + query configuration
 
@@ -190,6 +198,12 @@ By default, bot runs in polling mode. Set `WEBHOOK_URL` to use webhook mode (`/w
 3. Add env vars (at minimum `TELEGRAM_TOKEN`, `KIMI_API_KEY`).
 4. Ensure service port is `3978` (default already handled by app env).
 5. Deploy and verify with Telegram `/status`.
+
+### Staging verification (after deploy)
+
+1. `/fetchdiag` (admin) — expect Reddit HTTP 200, Selenium news ≥ 0 or a clear error, DDG ≥ 1 row typical.
+2. `/scan` — non-empty mention payload or diagnostics explaining all failures.
+3. Railway logs — no Chromium OOM; optional `LAST_FETCH_DIAGNOSTICS` is logged implicitly via returned diagnostic text on empty runs.
 
 ## Known limitations
 
