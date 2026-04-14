@@ -130,6 +130,8 @@ Notes:
   - `SCRAPE_MAX_RESULTS_PER_QUERY` (default `5`)
   - `CHROMIUM_BINARY` (default `/usr/bin/chromium`)
   - `CHROMEDRIVER_PATH` (default `/usr/bin/chromedriver`)
+- Scan timeouts (`/scan`, `/email`, scheduled job): `BIWEEKLY_FETCH_TIMEOUT` (default `360` s), `BIWEEKLY_ANALYZE_TIMEOUT` (default `120` s). Raise them on Railway only if you still hit timeouts.
+- Per query, enabled Selenium sources (forum / news / X / reddit) run in parallel.
 
 ## Prompt + query configuration
 
