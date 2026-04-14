@@ -80,6 +80,9 @@ SCRAPE_USER_AGENT = os.environ.get(
 )
 CHROMIUM_BINARY = os.environ.get("CHROMIUM_BINARY", "/usr/bin/chromium")
 CHROMEDRIVER_PATH = os.environ.get("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
+# Biweekly scan + /scan + /email (override on Railway if Selenium still hits the cap).
+BIWEEKLY_FETCH_TIMEOUT = int(os.environ.get("BIWEEKLY_FETCH_TIMEOUT", "360"))
+BIWEEKLY_ANALYZE_TIMEOUT = int(os.environ.get("BIWEEKLY_ANALYZE_TIMEOUT", "120"))
 
 EST = timezone(timedelta(hours=-5))
 
@@ -404,6 +407,19 @@ async def selenium_source_search(
         filtered.append(item)
     logger.info(f"Selenium source={source} query='{query[:40]}' -> {len(filtered)} mentions")
     return filtered
+
+
+async def _parallel_selenium_searches(coros: list) -> list[dict]:
+    """Run multiple Selenium source scrapes concurrently; failures in one branch do not cancel others."""
+    if not coros:
+        return []
+    merged: list[dict] = []
+    for batch in await asyncio.gather(*coros, return_exceptions=True):
+        if isinstance(batch, list):
+            merged.extend(batch)
+            continue
+        logger.warning(f"Selenium parallel task failed: {type(batch).__name__}: {batch}")
+    return merged
 
 
 def lookback_hours_to_tbs(lookback_hours: int) -> str:
@@ -1237,51 +1253,47 @@ async def fetch_biweekly_mentions() -> str:
     # far more reliable in DDG than the broad site:reddit.com domain restriction.
     # News search added for non-site-restricted queries to get dated press articles.
     for query in etransfer_ddg_queries:
-        selenium_batches = []
+        coros = []
         if use_forums:
-            selenium_batches.append(await selenium_source_search(query, "forums", SCRAPE_MAX_RESULTS_PER_QUERY))
+            coros.append(selenium_source_search(query, "forums", SCRAPE_MAX_RESULTS_PER_QUERY))
         if use_twitter and not _has_site_restriction(query):
-            selenium_batches.append(await selenium_source_search(query, "twitter", SCRAPE_MAX_RESULTS_PER_QUERY))
+            coros.append(selenium_source_search(query, "twitter", SCRAPE_MAX_RESULTS_PER_QUERY))
         if use_news and not _has_site_restriction(query):
-            selenium_batches.append(await selenium_source_search(query, "news", SCRAPE_MAX_RESULTS_PER_QUERY))
+            coros.append(selenium_source_search(query, "news", SCRAPE_MAX_RESULTS_PER_QUERY))
         if use_reddit and _has_site_restriction(query):
-            selenium_batches.append(await selenium_source_search(query, "reddit", SCRAPE_MAX_RESULTS_PER_QUERY))
-
-        for results in selenium_batches:
-            for r in results:
-                link = r.get("link", "")
-                if not link or link in seen_links:
-                    continue
-                seen_links.add(link)
-                channel, source = _classify_channel_and_source(link)
-                r["channel"] = channel
-                r["source"] = source
-                if channel == "people":
-                    etransfer_social.append(r)
-                else:
-                    etransfer_press.append(r)
+            coros.append(selenium_source_search(query, "reddit", SCRAPE_MAX_RESULTS_PER_QUERY))
+        for r in await _parallel_selenium_searches(coros):
+            link = r.get("link", "")
+            if not link or link in seen_links:
+                continue
+            seen_links.add(link)
+            channel, source = _classify_channel_and_source(link)
+            r["channel"] = channel
+            r["source"] = source
+            if channel == "people":
+                etransfer_social.append(r)
+            else:
+                etransfer_press.append(r)
 
     # ── 4. DDG — competitor press/news + X (launches, independent coverage) ──
     for query in competitor_ddg_queries:
-        selenium_batches = []
+        coros = []
         if use_news:
-            selenium_batches.append(await selenium_source_search(query, "news", SCRAPE_MAX_RESULTS_PER_QUERY))
+            coros.append(selenium_source_search(query, "news", SCRAPE_MAX_RESULTS_PER_QUERY))
         if use_twitter and not _has_site_restriction(query):
-            selenium_batches.append(await selenium_source_search(query, "twitter", SCRAPE_MAX_RESULTS_PER_QUERY))
+            coros.append(selenium_source_search(query, "twitter", SCRAPE_MAX_RESULTS_PER_QUERY))
         if use_forums and ("forum" in query.lower() or "redflagdeals" in query.lower()):
-            selenium_batches.append(await selenium_source_search(query, "forums", SCRAPE_MAX_RESULTS_PER_QUERY))
+            coros.append(selenium_source_search(query, "forums", SCRAPE_MAX_RESULTS_PER_QUERY))
         if use_reddit and _has_site_restriction(query):
-            selenium_batches.append(await selenium_source_search(query, "reddit", SCRAPE_MAX_RESULTS_PER_QUERY))
-
-        for results in selenium_batches:
-            for r in results:
-                link = r.get("link", "")
-                if not link or link in seen_links:
-                    continue
-                seen_links.add(link)
-                _, source = _classify_channel_and_source(link)
-                r["source"] = source
-                competitor_mentions.append(r)
+            coros.append(selenium_source_search(query, "reddit", SCRAPE_MAX_RESULTS_PER_QUERY))
+        for r in await _parallel_selenium_searches(coros):
+            link = r.get("link", "")
+            if not link or link in seen_links:
+                continue
+            seen_links.add(link)
+            _, source = _classify_channel_and_source(link)
+            r["source"] = source
+            competitor_mentions.append(r)
 
     # Layer 3: async HTML meta scraping for any DDG results still missing a date.
     # Reddit mentions already have exact dates; this targets DDG text() results.
@@ -1399,7 +1411,15 @@ async def run_biweekly_scan(update: Update) -> None:
         await update.message.reply_text(
             "Running biweekly e-Transfer intelligence scan (Reddit, X, RedFlagDeals, news)..."
         )
-        mentions = await asyncio.wait_for(fetch_biweekly_mentions(), timeout=180)
+        try:
+            mentions = await asyncio.wait_for(
+                fetch_biweekly_mentions(), timeout=BIWEEKLY_FETCH_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            await update.message.reply_text(
+                f"⏱️ Fetch timed out ({BIWEEKLY_FETCH_TIMEOUT}s). Set BIWEEKLY_FETCH_TIMEOUT if needed."
+            )
+            return
         last_mentions_raw = mentions
 
         if mentions.startswith("No mentions"):
@@ -1407,7 +1427,15 @@ async def run_biweekly_scan(update: Update) -> None:
             return
 
         await update.message.reply_text("Mentions collected. Analyzing with Kimi...")
-        report = await asyncio.wait_for(analyze_biweekly(mentions), timeout=120)
+        try:
+            report = await asyncio.wait_for(
+                analyze_biweekly(mentions), timeout=BIWEEKLY_ANALYZE_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            await update.message.reply_text(
+                f"⏱️ Analysis timed out ({BIWEEKLY_ANALYZE_TIMEOUT}s). Set BIWEEKLY_ANALYZE_TIMEOUT if needed."
+            )
+            return
         last_report = report
 
         await send_chunked_message(
@@ -2210,9 +2238,21 @@ async def scheduled_biweekly_broadcast(context: ContextTypes.DEFAULT_TYPE):
     tracked = _track_current_task()
     logger.info(f"[{now_est()}] Running scheduled biweekly scan...")
     try:
-        mentions = await fetch_biweekly_mentions()
+        try:
+            mentions = await asyncio.wait_for(
+                fetch_biweekly_mentions(), timeout=BIWEEKLY_FETCH_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"Scheduled biweekly: fetch timed out ({BIWEEKLY_FETCH_TIMEOUT}s)")
+            return
         last_mentions_raw = mentions
-        report = await analyze_biweekly(mentions)
+        try:
+            report = await asyncio.wait_for(
+                analyze_biweekly(mentions), timeout=BIWEEKLY_ANALYZE_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"Scheduled biweekly: analysis timed out ({BIWEEKLY_ANALYZE_TIMEOUT}s)")
+            return
         last_report = report
 
         message = f"Interac e-Transfer Intelligence — {now_est()}\n\n{report}"
@@ -2281,7 +2321,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_admin = "✅" if update.effective_user.id in ADMIN_IDS else "❌"
     await update.message.reply_text(
         f"✅ Bot running — {now_est()}\n"
-        f"Search provider: DuckDuckGo (ddgs)\n"
+        f"Selenium + Reddit | timeouts fetch {BIWEEKLY_FETCH_TIMEOUT}s / analyze {BIWEEKLY_ANALYZE_TIMEOUT}s\n"
         f"e-Transfer queries: {et_count} | Competitor queries: {comp_count}\n"
         f"Last biweekly scan: {last_scan}\n"
         f"Schedule: daily check at 9am EST, runs every 14 days\n"
@@ -2294,8 +2334,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await run_biweekly_scan(update)
-    except asyncio.TimeoutError:
-        await update.message.reply_text("⏱️ /scan timed out after 300 seconds.")
     except Exception as e:
         logger.error(f"Scan failed: {e}")
         await update.message.reply_text(f"❌ Scan failed: {e}")
@@ -2333,7 +2371,15 @@ async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tracked = _track_current_task()
     await update.message.reply_text("📧 Running fresh biweekly scan and sending email...")
     try:
-        mentions = await asyncio.wait_for(fetch_biweekly_mentions(), timeout=180)
+        try:
+            mentions = await asyncio.wait_for(
+                fetch_biweekly_mentions(), timeout=BIWEEKLY_FETCH_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            await update.message.reply_text(
+                f"⏱️ Fetch timed out ({BIWEEKLY_FETCH_TIMEOUT}s). Set BIWEEKLY_FETCH_TIMEOUT if needed."
+            )
+            return
         last_mentions_raw = mentions
 
         if mentions.startswith("No mentions"):
@@ -2341,7 +2387,15 @@ async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await update.message.reply_text("Mentions collected. Analyzing with Kimi...")
-        report = await asyncio.wait_for(analyze_biweekly(mentions), timeout=120)
+        try:
+            report = await asyncio.wait_for(
+                analyze_biweekly(mentions), timeout=BIWEEKLY_ANALYZE_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            await update.message.reply_text(
+                f"⏱️ Analysis timed out ({BIWEEKLY_ANALYZE_TIMEOUT}s). Set BIWEEKLY_ANALYZE_TIMEOUT if needed."
+            )
+            return
         last_report = report
 
         subject = f"{EMAIL_SUBJECT_PREFIX} — MANUAL REPORT"
@@ -2352,8 +2406,6 @@ async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("✅ Email sent successfully.")
         else:
             await update.message.reply_text(f"❌ Email failed: {send_reason}")
-    except asyncio.TimeoutError:
-        await update.message.reply_text("⏱️ /email timed out after 300 seconds.")
     except Exception as e:
         logger.error(f"/email failed: {e}")
         await update.message.reply_text(f"❌ /email failed: {e}")
