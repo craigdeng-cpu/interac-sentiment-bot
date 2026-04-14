@@ -457,35 +457,32 @@ def _tbs_to_timelimit(tbs: str) -> str | None:
 
 
 def _resolve_relative_date(date_str: str, *, tbs: str = "") -> str:
-    """Convert DDG's relative 'published' strings to approximate absolute dates.
+    """Convert DDG's relative 'published' strings to absolute dates in EST.
 
     DDG text() returns things like '3 weeks ago', '2 months ago', '1 year ago'.
-    The biweekly prompt requires specific dates; relative strings cause the LLM
-    to fall back to 'date unknown'. We approximate from today's date.
-
-    If date_str is empty and tbs is provided, returns an approximate date derived
-    from the search time range (qdr:d/qdr:w → today, qdr:m → "Month YYYY").
+    All dates are formatted in EST so they match the local timezone and never
+    show a future date due to UTC offset.
     Returns the original string unchanged if it already looks like a real date.
+    Returns empty string if no date is available.
     """
     if not date_str:
-        # No date from the source — approximate from the search time window.
-        now = datetime.now(tz=timezone.utc)
-        if tbs in ("qdr:d", "qdr:w", "qdr:m"):
-            return now.strftime("%B %d, %Y")
         return date_str
-    # If it already looks like a real date (contains a digit + year-ish), keep it
+    # If it already looks like a real date (contains a 4-digit year), keep it
     if re.search(r"\d{4}", date_str):
-        # ISO dates like "2025-04-10T14:22:00" → format nicely
+        # ISO dates like "2025-04-10T14:22:00" — convert UTC→EST for display
         m = re.match(r"(\d{4})-(\d{2})-(\d{2})", date_str)
         if m:
             try:
-                dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                dt = datetime(
+                    int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                    tzinfo=timezone.utc,
+                ).astimezone(EST)
                 return dt.strftime("%B %d, %Y")
             except ValueError:
                 pass
         return date_str
-    # Parse relative strings — day/week/month/year
-    now = datetime.now(tz=timezone.utc)
+    # Parse relative strings — day/week/month/year — using EST
+    now = datetime.now(EST)
     m = re.match(r"(\d+)\s+(day|week|month|year)s?\s+ago", date_str.strip(), re.IGNORECASE)
     if m:
         n = int(m.group(1))
@@ -499,9 +496,9 @@ def _resolve_relative_date(date_str: str, *, tbs: str = "") -> str:
         else:  # year
             dt = now - timedelta(days=n * 365)
         return dt.strftime("%B %d, %Y")
-    # "N hours/minutes ago" → treat as today
+    # "N hours/minutes ago" → today in EST
     if re.match(r"\d+\s+(hour|minute)s?\s+ago", date_str.strip(), re.IGNORECASE):
-        return datetime.now(tz=timezone.utc).strftime("%B %d, %Y")
+        return datetime.now(EST).strftime("%B %d, %Y")
     return date_str  # unknown format — keep as-is
 
 
@@ -579,7 +576,7 @@ def _parse_reddit_post(post: dict, cutoff_ts: float) -> dict | None:
         selftext = ""
     permalink = post.get("permalink", "")
     subreddit_name = post.get("subreddit_display_name", post.get("subreddit", ""))
-    post_dt = datetime.fromtimestamp(created, tz=timezone.utc)
+    post_dt = datetime.fromtimestamp(created, tz=EST)
     return {
         "title": title,
         "snippet": selftext[:600] if selftext else title,
