@@ -63,6 +63,7 @@ RESEND_API_URL = os.environ.get("RESEND_API_URL", "https://api.resend.com/emails
 EMAIL_FROM = os.environ.get("EMAIL_FROM", "")
 EMAIL_TO = [x.strip() for x in os.environ.get("EMAIL_TO", "").split(",") if x.strip()]
 EMAIL_SUBJECT_PREFIX = os.environ.get("EMAIL_SUBJECT_PREFIX", "Interac Intelligence")
+MAX_MENTION_AGE_DAYS = int(os.environ.get("MAX_MENTION_AGE_DAYS", "120"))
 
 EST = timezone(timedelta(hours=-5))
 
@@ -571,7 +572,7 @@ async def _fetch_meta_date(url: str, client: httpx.AsyncClient) -> str:
     """Layer 3: scrape HTML <head> for Open Graph / JSON-LD / <time> publication date.
 
     Returns "Month DD, YYYY" string or empty string on failure.
-    Only reads the first 6 KB of the response — enough to cover <head>.
+    Only reads the first 25 KB of the response — enough to cover most <head> blocks.
     """
     try:
         resp = await client.get(
@@ -582,7 +583,7 @@ async def _fetch_meta_date(url: str, client: httpx.AsyncClient) -> str:
         )
         if resp.status_code != 200:
             return ""
-        head_html = resp.text[:6000]
+        head_html = resp.text[:25000]
     except Exception:
         return ""
 
@@ -592,10 +593,13 @@ async def _fetch_meta_date(url: str, client: httpx.AsyncClient) -> str:
         r'<meta[^>]+content=["\']([\d\-T:+Z]+)["\'][^>]+property=["\']article:published_time["\']',
         # Generic pubdate / DC.date meta tags
         r'<meta[^>]+name=["\'](?:pubdate|DC\.date)["\'][^>]+content=["\']([\d\-T:+Z]+)["\']',
+        # Common modern meta date keys
+        r'<meta[^>]+name=["\'](?:date|publish-date|article\.published|parsely-pub-date|sailthru\.date)["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+property=["\'](?:article:modified_time|og:updated_time)["\'][^>]+content=["\']([^"\']+)["\']',
         # JSON-LD datePublished
         r'"datePublished"\s*:\s*"([\d\-T:+Z]+)"',
         # HTML5 <time datetime="...">
-        r'<time[^>]+datetime=["\']([\d\-T:+Z]+)["\']',
+        r'<time[^>]+datetime=["\']([^"\']+)["\']',
     ]
     for pat in patterns:
         m = re.search(pat, head_html, re.IGNORECASE)
@@ -673,6 +677,46 @@ def _build_url_date_map_from_mentions(*buckets: list[dict]) -> dict[str, str]:
             if key:
                 out.setdefault(key, date)
     return out
+
+
+def _parse_display_date_utc(date_str: str) -> datetime | None:
+    """Parse formatted mention date like 'April 14, 2026' into UTC datetime."""
+    value = (date_str or "").strip()
+    if not value or value.lower() == "unknown":
+        return None
+    for fmt in ("%B %d, %Y", "%b %d, %Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return None
+
+
+def _filter_recent_dated_mentions(
+    mentions: list[dict], *, max_age_days: int
+) -> list[dict]:
+    """Keep only mentions with a known date newer than max_age_days."""
+    if max_age_days <= 0:
+        return mentions
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    kept: list[dict] = []
+    dropped_undated = 0
+    dropped_stale = 0
+    for m in mentions:
+        d = _parse_display_date_utc(m.get("date", ""))
+        if d is None:
+            dropped_undated += 1
+            continue
+        if d < cutoff:
+            dropped_stale += 1
+            continue
+        kept.append(m)
+    if dropped_undated or dropped_stale:
+        logger.info(
+            f"[recency-filter] kept={len(kept)} dropped_undated={dropped_undated} "
+            f"dropped_stale={dropped_stale} max_age_days={max_age_days}"
+        )
+    return kept
 
 
 async def web_search(
@@ -1180,7 +1224,18 @@ async def fetch_biweekly_mentions() -> str:
     # then HTML <head> meta for other undated URLs (cap excludes Reddit threads filled above).
     all_mentions = etransfer_social + etransfer_press + competitor_mentions
     await _enrich_dates_from_reddit_json(all_mentions, max_fetches=40)
-    await _enrich_dates_from_meta(all_mentions, max_fetches=25)
+    await _enrich_dates_from_meta(all_mentions, max_fetches=80)
+
+    # Make recency decisions only on dated content to avoid stale/undated drift.
+    etransfer_social = _filter_recent_dated_mentions(
+        etransfer_social, max_age_days=MAX_MENTION_AGE_DAYS
+    )
+    etransfer_press = _filter_recent_dated_mentions(
+        etransfer_press, max_age_days=MAX_MENTION_AGE_DAYS
+    )
+    competitor_mentions = _filter_recent_dated_mentions(
+        competitor_mentions, max_age_days=MAX_MENTION_AGE_DAYS
+    )
 
     total = len(etransfer_social) + len(etransfer_press) + len(competitor_mentions)
     if total == 0:
@@ -1850,6 +1905,8 @@ def _render_quote_bullets(
 
         if not date_label and url:
             date_label = (url_dates or {}).get(_canonical_url_for_date_lookup(url), "")
+        if not date_label and url:
+            date_label = _resolve_relative_date(_extract_date_from_url(url))
 
         # Derive platform badge from URL domain — only community platforms get a badge.
         # This prevents corporate sites (wise.com, paypal.com) from showing as badges.
