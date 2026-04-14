@@ -314,6 +314,62 @@ def _normalize_date_value(raw_date: str) -> str:
     return value[:24]
 
 
+def _extract_date_from_url(url: str) -> str:
+    """Layer 1: extract publication date from common URL path patterns.
+
+    Covers most news sites that embed /YYYY/MM/DD/ in their URL structure
+    (CBC, Globe and Mail, TechCrunch, Reuters, etc.).
+    Returns ISO "YYYY-MM-DD" string or empty string if no date found.
+    """
+    # /YYYY/MM/DD/ path pattern
+    m = re.search(r"/(\d{4})/(\d{1,2})/(\d{1,2})(?:/|$)", url)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 2000 <= y <= 2030 and 1 <= mo <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+    # YYYY-MM-DD or YYYY_MM_DD in URL query string or path segment
+    m = re.search(r"(?<!\d)(\d{4})[_\-](\d{2})[_\-](\d{2})(?!\d)", url)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 2000 <= y <= 2030 and 1 <= mo <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+    return ""
+
+
+def _extract_date_from_snippet(text: str) -> str:
+    """Layer 2: extract publication date from snippet/body text.
+
+    Handles ISO dates and common English date phrases already present in
+    the search snippet (e.g. "Published April 10, 2025" or "2025-03-15").
+    Returns ISO "YYYY-MM-DD" string or empty string if nothing matched.
+    """
+    if not text:
+        return ""
+    # ISO date in text
+    m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
+    if m:
+        return m.group(1)
+    # "Month DD, YYYY" or "Month DD YYYY"
+    _months = (
+        "January|February|March|April|May|June|July|August|"
+        "September|October|November|December|"
+        "Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec"
+    )
+    m = re.search(
+        rf"\b({_months})\s+(\d{{1,2}}),?\s+(\d{{4}})\b", text, re.IGNORECASE
+    )
+    if m:
+        for fmt in ("%B %d %Y", "%b %d %Y"):
+            try:
+                dt = datetime.strptime(
+                    f"{m.group(1)} {m.group(2)} {m.group(3)}", fmt
+                )
+                return dt.strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+    return ""
+
+
 def _extract_keywords(text: str, max_keywords: int = 6) -> list[str]:
     tokens = re.findall(r"[a-z0-9]+", (text or "").lower())
     keywords: list[str] = []
@@ -509,6 +565,80 @@ def _resolve_relative_date(date_str: str, *, tbs: str = "") -> str:
     return date_str  # unknown format — keep as-is
 
 
+async def _fetch_meta_date(url: str, client: httpx.AsyncClient) -> str:
+    """Layer 3: scrape HTML <head> for Open Graph / JSON-LD / <time> publication date.
+
+    Returns "Month DD, YYYY" string or empty string on failure.
+    Only reads the first 6 KB of the response — enough to cover <head>.
+    """
+    try:
+        resp = await client.get(
+            url,
+            follow_redirects=True,
+            timeout=4.0,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; InteracIntelBot/1.0)"},
+        )
+        if resp.status_code != 200:
+            return ""
+        head_html = resp.text[:6000]
+    except Exception:
+        return ""
+
+    patterns = [
+        # Open Graph article:published_time (both attribute orderings)
+        r'<meta[^>]+property=["\']article:published_time["\'][^>]+content=["\']([\d\-T:+Z]+)["\']',
+        r'<meta[^>]+content=["\']([\d\-T:+Z]+)["\'][^>]+property=["\']article:published_time["\']',
+        # Generic pubdate / DC.date meta tags
+        r'<meta[^>]+name=["\'](?:pubdate|DC\.date)["\'][^>]+content=["\']([\d\-T:+Z]+)["\']',
+        # JSON-LD datePublished
+        r'"datePublished"\s*:\s*"([\d\-T:+Z]+)"',
+        # HTML5 <time datetime="...">
+        r'<time[^>]+datetime=["\']([\d\-T:+Z]+)["\']',
+    ]
+    for pat in patterns:
+        m = re.search(pat, head_html, re.IGNORECASE)
+        if m:
+            resolved = _resolve_relative_date(m.group(1))
+            if resolved and not re.match(r"^\d{4}-\d{2}-\d{2}T", resolved):
+                # _resolve_relative_date already formatted it as "Month DD, YYYY"
+                return resolved
+            # ISO timestamp that _resolve_relative_date parsed cleanly
+            if resolved:
+                return resolved
+    return ""
+
+
+async def _enrich_dates_from_meta(
+    mentions: list[dict], max_fetches: int = 20
+) -> None:
+    """Layer 3 batch enrichment: fetch HTML meta dates for undated mentions in-place.
+
+    Skips mentions that already have a date. Caps HTTP requests at max_fetches
+    to bound latency (each request has a 4 s timeout, all run concurrently).
+    """
+    undated = [
+        m for m in mentions
+        if not m.get("date") and m.get("link")
+    ]
+    targets = undated[:max_fetches]
+    if not targets:
+        return
+
+    async with httpx.AsyncClient() as client:
+        results = await asyncio.gather(
+            *[_fetch_meta_date(m["link"], client) for m in targets],
+            return_exceptions=True,
+        )
+
+    gained = 0
+    for mention, result in zip(targets, results):
+        if isinstance(result, str) and result:
+            mention["date"] = result
+            gained += 1
+
+    logger.info(f"[date-enrich-L3] fetched {len(targets)} undated URLs, gained {gained} dates")
+
+
 async def web_search(
     query: str,
     search_type: str = "search",
@@ -525,18 +655,25 @@ async def web_search(
                 raw = list(ddgs.text(query, max_results=max_results, timelimit=timelimit))
         normalized = []
         for item in raw:
+            link = item.get("href", "") or item.get("url", "")
+            # text() uses "published" ("2 weeks ago"); news() uses "date" (ISO).
+            raw_date = item.get("date", "") or item.get("published", "")
+            # Layer 1: try URL path pattern when API field is empty
+            if not raw_date:
+                raw_date = _extract_date_from_url(link)
+            # Layer 2: try snippet text when URL pattern also fails
+            if not raw_date:
+                raw_date = _extract_date_from_snippet(
+                    item.get("body", "") or item.get("snippet", "")
+                )
             normalized.append({
                 "title": item.get("title", ""),
                 "snippet": item.get("body", "") or item.get("snippet", ""),
-                "link": item.get("href", "") or item.get("url", ""),
+                "link": link,
                 "source": item.get("source", search_type),
-                # text() uses "published" ("2 weeks ago"); news() uses "date" (ISO).
-                # _resolve_relative_date converts relative strings to real dates.
+                # _resolve_relative_date converts any date string to "Month DD, YYYY".
                 # Pass tbs so empty dates get an approximate fallback from the search window.
-                "date": _resolve_relative_date(
-                    item.get("date", "") or item.get("published", ""),
-                    tbs=tbs,
-                ),
+                "date": _resolve_relative_date(raw_date, tbs=tbs),
             })
         return normalized
 
@@ -910,6 +1047,13 @@ async def fetch_biweekly_mentions() -> str:
                 seen_links.add(link)
                 r["source"] = "X/Twitter"
                 competitor_mentions.append(r)
+
+    # Layer 3: async HTML meta scraping for any DDG results still missing a date.
+    # Reddit mentions already have exact dates; this targets DDG text() results.
+    # Run across all three buckets — Reddit items are skipped automatically
+    # because they already have a non-empty date field.
+    all_mentions = etransfer_social + etransfer_press + competitor_mentions
+    await _enrich_dates_from_meta(all_mentions, max_fetches=25)
 
     total = len(etransfer_social) + len(etransfer_press) + len(competitor_mentions)
     if total == 0:
