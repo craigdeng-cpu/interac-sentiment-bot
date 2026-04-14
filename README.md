@@ -16,7 +16,7 @@ This project is designed to give product/ops stakeholders a lightweight "market 
 
 - Runtime: Python 3.12 (`app.py`)
 - Chat interface: Telegram (`python-telegram-bot`)
-- Source scraping: Selenium + headless Chromium (public pages only)
+- Search provider: DuckDuckGo via `ddgs` (no Serper dependency)
 - LLM analysis: Moonshot Kimi API (`KIMI_API_KEY`)
 - Optional email delivery: SMTP or Resend
 - Deployment target: Railway (or any container host)
@@ -40,17 +40,16 @@ User commands:
 - `/subscribe` - subscribe this chat to scheduled broadcasts.
 - `/unsubscribe` - stop scheduled broadcasts for this chat.
 - `/status` - runtime/schedule/status snapshot.
-- `/scan` - run immediate biweekly-style scan (polling) or background job (webhook).
+- `/scan` - run immediate daily scan.
 - `/raw` - show raw mention payload from last scan.
 - `/prompt` - show query/source config summary.
 - any plain text message - follow-up question over latest report context.
 
 Admin-only commands (`ADMIN_IDS`):
 
-- `/email` - run fresh scan and send email (see timeouts below; webhook runs in background).
+- `/email` - run fresh daily scan and send email immediately (60s timeout).
 - `/deepscan` - run historical scan + analysis + email (with diagnostics).
 - `/smtpcheck` - validate current email provider config/connectivity.
-- `/fetchdiag` - quick Reddit JSON + Selenium news + DDG probe (no full scan).
 
 ## Scheduled behavior
 
@@ -120,27 +119,6 @@ Notes:
 - Port `587` uses STARTTLS, port `465` uses implicit SSL.
 - Email dedup/cooldown state is in-memory (resets on restart/redeploy).
 
-## Selenium scraping notes
-
-- The bot now performs source-first scraping with Selenium for Reddit, forums, X, and news pages.
-- X/Twitter is best-effort only in public mode and may return partial data when anti-bot defenses block rendering.
-- Railway/container runtime must include both Chromium and chromedriver binaries.
-- Time and load controls:
-  - `SCRAPE_TIMEOUT_SECONDS` (default `20`)
-  - `SCRAPE_MAX_PAGES_PER_SOURCE` (default `4`)
-  - `SCRAPE_MAX_RESULTS_PER_QUERY` (default `5`)
-  - `CHROMIUM_BINARY` (default `/usr/bin/chromium`)
-  - `CHROMEDRIVER_PATH` (default `/usr/bin/chromedriver`)
-- Scan timeouts (`/scan`, `/email`, scheduled job): `BIWEEKLY_FETCH_TIMEOUT` (default `900` s), `BIWEEKLY_ANALYZE_TIMEOUT` (default `120` s). Selenium bundles run concurrently up to `SCRAPE_MAX_CONCURRENT_BROWSERS`; raise `BIWEEKLY_FETCH_TIMEOUT` only if scans still exceed 15 minutes.
-- `SCRAPE_MAX_CONCURRENT_BROWSERS` (default `2`) — global cap on concurrent Selenium sessions (avoids OOM on small Railway plans).
-- `FETCH_FALLBACK_DDG` (default `1`) — if Reddit + Selenium still yield **zero** mentions, run DuckDuckGo (`ddgs`) text/news/X supplement like the legacy path.
-- **One Chromium session per query** (forums → X → news → optional Reddit Selenium in sequence) instead of three separate browsers per query.
-- **Empty scan diagnostics**: when nothing is collected, the bot returns a `=== FETCH DIAGNOSTICS ===` block (Reddit task errors, Selenium row counts, whether DDG fallback ran) before the “No mentions found…” line. Use `/fetchdiag` on the host to isolate failures.
-
-### Webhook mode (`WEBHOOK_URL` set)
-
-- Railway and Telegram expect the webhook HTTP handler to finish quickly. `/scan` and `/email` **enqueue work in the background** and reply immediately; results arrive as follow-up messages in the same chat.
-
 ## Prompt + query configuration
 
 Prompt text lives in markdown files:
@@ -181,9 +159,6 @@ Email rendering is mode-aware:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-# local selenium runtime (macOS example):
-# brew install --cask chromium
-# brew install chromedriver
 export TELEGRAM_TOKEN=...
 export KIMI_API_KEY=...
 python app.py
@@ -198,12 +173,6 @@ By default, bot runs in polling mode. Set `WEBHOOK_URL` to use webhook mode (`/w
 3. Add env vars (at minimum `TELEGRAM_TOKEN`, `KIMI_API_KEY`).
 4. Ensure service port is `3978` (default already handled by app env).
 5. Deploy and verify with Telegram `/status`.
-
-### Staging verification (after deploy)
-
-1. `/fetchdiag` (admin) — expect Reddit HTTP 200, Selenium news ≥ 0 or a clear error, DDG ≥ 1 row typical.
-2. `/scan` — non-empty mention payload or diagnostics explaining all failures.
-3. Railway logs — no Chromium OOM; optional `LAST_FETCH_DIAGNOSTICS` is logged implicitly via returned diagnostic text on empty runs.
 
 ## Known limitations
 

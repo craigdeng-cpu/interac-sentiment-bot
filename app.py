@@ -19,17 +19,10 @@ from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from collections import defaultdict
-from urllib.parse import parse_qs, urlparse, quote_plus
+from urllib.parse import urlparse
 
 import httpx
 from ddgs import DDGS
-from selenium import webdriver
-from selenium.common.exceptions import WebDriverException, TimeoutException
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
 from telegram import Update
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -70,27 +63,8 @@ RESEND_API_URL = os.environ.get("RESEND_API_URL", "https://api.resend.com/emails
 EMAIL_FROM = os.environ.get("EMAIL_FROM", "")
 EMAIL_TO = [x.strip() for x in os.environ.get("EMAIL_TO", "").split(",") if x.strip()]
 EMAIL_SUBJECT_PREFIX = os.environ.get("EMAIL_SUBJECT_PREFIX", "Interac Intelligence")
-SCRAPE_TIMEOUT_SECONDS = int(os.environ.get("SCRAPE_TIMEOUT_SECONDS", "20"))
-SCRAPE_MAX_PAGES_PER_SOURCE = int(os.environ.get("SCRAPE_MAX_PAGES_PER_SOURCE", "4"))
-SCRAPE_MAX_RESULTS_PER_QUERY = int(os.environ.get("SCRAPE_MAX_RESULTS_PER_QUERY", "5"))
-SCRAPE_USER_AGENT = os.environ.get(
-    "SCRAPE_USER_AGENT",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-)
-CHROMIUM_BINARY = os.environ.get("CHROMIUM_BINARY", "/usr/bin/chromium")
-CHROMEDRIVER_PATH = os.environ.get("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
-# Biweekly scan + /scan + /email — many Selenium bundles; 360s is often too low on Railway.
-BIWEEKLY_FETCH_TIMEOUT = int(os.environ.get("BIWEEKLY_FETCH_TIMEOUT", "900"))
-BIWEEKLY_ANALYZE_TIMEOUT = int(os.environ.get("BIWEEKLY_ANALYZE_TIMEOUT", "120"))
-FETCH_FALLBACK_DDG = os.environ.get("FETCH_FALLBACK_DDG", "1") == "1"
-SCRAPE_MAX_CONCURRENT_BROWSERS = max(1, int(os.environ.get("SCRAPE_MAX_CONCURRENT_BROWSERS", "2")))
 
 EST = timezone(timedelta(hours=-5))
-
-NO_MENTIONS_MARKER = "No mentions found in the past month."
-LAST_FETCH_DIAGNOSTICS: dict = {}
-_selenium_browser_sem = asyncio.Semaphore(SCRAPE_MAX_CONCURRENT_BROWSERS)
 
 subscribed_chats: set[int] = set()
 last_report: str = ""
@@ -185,409 +159,6 @@ def load_prompts() -> dict:
 
 
 # ─── Web Scraping ─────────────────────────────────────────────────────────────
-def _safe_driver_quit(driver: webdriver.Chrome | None) -> None:
-    if driver is None:
-        return
-    try:
-        driver.quit()
-    except Exception:
-        pass
-
-
-def build_driver() -> webdriver.Chrome:
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1400,2400")
-    options.add_argument(f"--user-agent={SCRAPE_USER_AGENT}")
-    if CHROMIUM_BINARY:
-        options.binary_location = CHROMIUM_BINARY
-    service = Service(CHROMEDRIVER_PATH) if CHROMEDRIVER_PATH else Service()
-    driver = webdriver.Chrome(service=service, options=options)
-    driver.set_page_load_timeout(SCRAPE_TIMEOUT_SECONDS)
-    return driver
-
-
-def _get_with_retry(driver: webdriver.Chrome, url: str, retries: int = 2) -> bool:
-    for attempt in range(retries + 1):
-        try:
-            driver.get(url)
-            return True
-        except (TimeoutException, WebDriverException) as exc:
-            if attempt >= retries:
-                logger.warning(f"Selenium failed for {url}: {exc}")
-                return False
-    return False
-
-
-def _clean_scraped_text(text: str, max_chars: int = 1400) -> str:
-    cleaned = " ".join((text or "").split())
-    return cleaned[:max_chars]
-
-
-def _query_terms(raw_query: str) -> str:
-    query = re.sub(r"site:[^\s]+", "", raw_query, flags=re.IGNORECASE)
-    query = re.sub(r"\b(OR|AND)\b", " ", query, flags=re.IGNORECASE)
-    return " ".join(query.split())[:120]
-
-
-def _selenium_item_quality_ok(snippet: str, title: str, link: str, source_key: str) -> bool:
-    if not link:
-        return False
-    sk = source_key.lower()
-    if sk == "forums":
-        return len(title) >= 8 or len(snippet) >= 12
-    if sk == "news":
-        return (len(title) >= 5 and (len(snippet) >= 10 or len(title) >= 16)) or len(snippet) >= 40
-    if sk == "twitter":
-        return len(snippet) >= 10 or len(title) >= 8
-    if sk == "reddit":
-        return len(snippet) >= 12 or len(title) >= 10
-    return not (len(snippet) < 25 and len(title) < 15)
-
-
-def _finalize_selenium_items(raw: list[dict]) -> list[dict]:
-    cap = SCRAPE_MAX_PAGES_PER_SOURCE * SCRAPE_MAX_RESULTS_PER_QUERY
-    out: list[dict] = []
-    for item in raw[:cap]:
-        sk = (item.get("_sk") or "news").lower()
-        snippet = _clean_scraped_text(item.get("snippet", ""))
-        title = _clean_scraped_text(item.get("title", ""), max_chars=180)
-        link = (item.get("link", "") or "").strip()
-        if not _selenium_item_quality_ok(snippet, title, link, sk):
-            continue
-        out.append({
-            "title": title or snippet[:120],
-            "snippet": snippet or title,
-            "link": link,
-            "source": item.get("source", "News/Other"),
-            "date": item.get("date", ""),
-        })
-    return out
-
-
-def _extract_forums_from_driver(driver: webdriver.Chrome, query: str, max_results: int) -> list[dict]:
-    items: list[dict] = []
-    terms = _query_terms(query)
-    if not terms:
-        return []
-    search_url = f"https://forums.redflagdeals.com/search.php?keywords={quote_plus(terms)}"
-    if not _get_with_retry(driver, search_url):
-        return []
-    try:
-        WebDriverWait(driver, SCRAPE_TIMEOUT_SECONDS).until(
-            EC.presence_of_all_elements_located((By.CSS_SELECTOR, "h3.searchresult-title, a.topictitle"))
-        )
-    except Exception:
-        return []
-    links = driver.find_elements(By.CSS_SELECTOR, "h3.searchresult-title a, a.topictitle")[:max_results]
-    for el in links:
-        title = _clean_scraped_text(el.text, max_chars=180)
-        link = el.get_attribute("href") or ""
-        if not title or not link:
-            continue
-        items.append({
-            "title": title,
-            "snippet": title,
-            "link": link,
-            "source": "RedFlagDeals",
-            "date": "",
-            "_sk": "forums",
-        })
-    return items
-
-
-def _extract_x_from_driver(driver: webdriver.Chrome, query: str, max_results: int) -> list[dict]:
-    items: list[dict] = []
-    terms = _query_terms(query)
-    if not terms:
-        return []
-    search_url = f"https://x.com/search?q={quote_plus(terms)}&src=typed_query&f=live"
-    if not _get_with_retry(driver, search_url):
-        return []
-    try:
-        WebDriverWait(driver, 8).until(
-            EC.presence_of_all_elements_located((By.CSS_SELECTOR, "article"))
-        )
-    except Exception:
-        return []
-    for tweet in driver.find_elements(By.CSS_SELECTOR, "article")[:max_results]:
-        text_els = tweet.find_elements(By.CSS_SELECTOR, "[data-testid='tweetText']")
-        link_els = tweet.find_elements(By.CSS_SELECTOR, "a[href*='/status/']")
-        if not text_els or not link_els:
-            continue
-        body = _clean_scraped_text(text_els[0].text, max_chars=700)
-        link = link_els[0].get_attribute("href") or ""
-        if not body:
-            continue
-        items.append({
-            "title": body[:120],
-            "snippet": body,
-            "link": link,
-            "source": "X/Twitter",
-            "date": "",
-            "_sk": "twitter",
-        })
-    return items
-
-
-def _unwrap_google_news_href(href: str) -> str:
-    if not href:
-        return ""
-    if "url?q=" in href:
-        try:
-            q = parse_qs(urlparse(href).query).get("q", [""])[0]
-            return q or href
-        except Exception:
-            return href
-    if href.startswith("./"):
-        return "https://news.google.com" + href[1:]
-    return href
-
-
-def _extract_news_from_driver(driver: webdriver.Chrome, query: str, max_results: int) -> list[dict]:
-    items: list[dict] = []
-    terms = _query_terms(query)
-    if not terms:
-        return []
-    search_url = f"https://news.google.com/search?q={quote_plus(terms)}&hl=en-CA&gl=CA&ceid=CA%3Aen"
-    if not _get_with_retry(driver, search_url):
-        return []
-    try:
-        WebDriverWait(driver, SCRAPE_TIMEOUT_SECONDS).until(
-            EC.presence_of_all_elements_located((By.CSS_SELECTOR, "article"))
-        )
-    except Exception:
-        return []
-    for card in driver.find_elements(By.CSS_SELECTOR, "article"):
-        if len(items) >= max_results:
-            break
-        href = ""
-        title = ""
-        anchor_els = card.find_elements(
-            By.CSS_SELECTOR,
-            "a[href*='./articles/'], a[href*='/articles/'], a[href*='url?q=']",
-        )
-        if not anchor_els:
-            for a in card.find_elements(By.TAG_NAME, "a"):
-                h = a.get_attribute("href") or ""
-                if "articles" in h or "./articles" in h:
-                    anchor_els = [a]
-                    break
-        if not anchor_els:
-            continue
-        title = _clean_scraped_text(anchor_els[0].text or "", max_chars=180)
-        href = _unwrap_google_news_href(anchor_els[0].get_attribute("href") or "")
-        snippet = _clean_scraped_text(card.text, max_chars=700)
-        if not href:
-            continue
-        date_els = card.find_elements(By.CSS_SELECTOR, "time")
-        raw_date = date_els[0].get_attribute("datetime") if date_els else ""
-        items.append({
-            "title": title or snippet[:140],
-            "snippet": snippet or title,
-            "link": href,
-            "source": "News/Other",
-            "date": _resolve_relative_date(raw_date),
-            "_sk": "news",
-        })
-    return items
-
-
-def _extract_reddit_selenium_from_driver(driver: webdriver.Chrome, query: str, max_results: int) -> list[dict]:
-    items: list[dict] = []
-    terms = _query_terms(query)
-    if not terms:
-        return []
-    urls = (
-        f"https://old.reddit.com/search/?q={quote_plus(terms)}&sort=new",
-        f"https://old.reddit.com/search?q={quote_plus(terms)}&sort=new",
-        f"https://www.reddit.com/search/?q={quote_plus(terms)}&sort=new&t=year",
-    )
-    for search_url in urls:
-        if not _get_with_retry(driver, search_url):
-            continue
-        try:
-            WebDriverWait(driver, min(SCRAPE_TIMEOUT_SECONDS, 22)).until(
-                EC.presence_of_all_elements_located(
-                    (By.CSS_SELECTOR, "div.search-result, div[data-testid='post-container'] a[href*='/comments/']")
-                )
-            )
-        except Exception:
-            continue
-        cards = driver.find_elements(By.CSS_SELECTOR, "div.search-result")[:max_results]
-        if not cards:
-            links = driver.find_elements(
-                By.CSS_SELECTOR, "a[href*='/r/'][href*='/comments/']"
-            )[: max_results * 2]
-            for a in links:
-                title = _clean_scraped_text(a.text, max_chars=180)
-                link = a.get_attribute("href") or ""
-                if title and link and "/comments/" in link:
-                    items.append({
-                        "title": title,
-                        "snippet": title,
-                        "link": link,
-                        "source": "Reddit",
-                        "date": "",
-                        "_sk": "reddit",
-                    })
-            if items:
-                break
-            continue
-        for card in cards:
-            title_els = card.find_elements(By.CSS_SELECTOR, "a.search-title, a[slot='title'], a.shreddit-post-title")
-            if not title_els:
-                continue
-            title = _clean_scraped_text(title_els[0].text, max_chars=180)
-            link = title_els[0].get_attribute("href") or ""
-            snippet_els = card.find_elements(By.CSS_SELECTOR, "div.search-expando, div[slot='text-body']")
-            snippet = _clean_scraped_text(snippet_els[0].text if snippet_els else "", max_chars=700)
-            date_els = card.find_elements(By.CSS_SELECTOR, "time")
-            raw_date = date_els[0].get_attribute("datetime") if date_els else ""
-            items.append({
-                "title": title,
-                "snippet": snippet or title,
-                "link": link,
-                "source": "Reddit",
-                "date": _resolve_relative_date(raw_date),
-                "_sk": "reddit",
-            })
-        if items:
-            break
-    return items[:max_results]
-
-
-def _scrape_et_bundle_sync(
-    query: str,
-    use_forums: bool,
-    use_twitter: bool,
-    use_news: bool,
-    use_reddit_sel: bool,
-    max_results: int,
-) -> list[dict]:
-    raw: list[dict] = []
-    driver = None
-    try:
-        driver = build_driver()
-        if use_forums:
-            raw.extend(_extract_forums_from_driver(driver, query, max_results))
-        if use_twitter and not _has_site_restriction(query):
-            raw.extend(_extract_x_from_driver(driver, query, max_results))
-        if use_news and not _has_site_restriction(query):
-            raw.extend(_extract_news_from_driver(driver, query, max_results))
-        if use_reddit_sel:
-            raw.extend(_extract_reddit_selenium_from_driver(driver, query, max_results))
-    finally:
-        _safe_driver_quit(driver)
-    return _finalize_selenium_items(raw)
-
-
-def _scrape_comp_bundle_sync(
-    query: str,
-    use_forums: bool,
-    use_twitter: bool,
-    use_news: bool,
-    use_reddit_sel: bool,
-    max_results: int,
-) -> list[dict]:
-    raw: list[dict] = []
-    driver = None
-    try:
-        driver = build_driver()
-        if use_news:
-            raw.extend(_extract_news_from_driver(driver, query, max_results))
-        if use_twitter and not _has_site_restriction(query):
-            raw.extend(_extract_x_from_driver(driver, query, max_results))
-        if use_forums and ("forum" in query.lower() or "redflagdeals" in query.lower()):
-            raw.extend(_extract_forums_from_driver(driver, query, max_results))
-        if use_reddit_sel:
-            raw.extend(_extract_reddit_selenium_from_driver(driver, query, max_results))
-    finally:
-        _safe_driver_quit(driver)
-    return _finalize_selenium_items(raw)
-
-
-def _scrape_reddit_source(query: str, max_results: int = 5) -> list[dict]:
-    driver = None
-    try:
-        driver = build_driver()
-        raw = _extract_reddit_selenium_from_driver(driver, query, max_results)
-        return _finalize_selenium_items(raw)
-    finally:
-        _safe_driver_quit(driver)
-
-
-def _scrape_forums_source(query: str, max_results: int = 5) -> list[dict]:
-    driver = None
-    try:
-        driver = build_driver()
-        raw = _extract_forums_from_driver(driver, query, max_results)
-        return _finalize_selenium_items(raw)
-    finally:
-        _safe_driver_quit(driver)
-
-
-def _scrape_x_source(query: str, max_results: int = 5) -> list[dict]:
-    driver = None
-    try:
-        driver = build_driver()
-        raw = _extract_x_from_driver(driver, query, max_results)
-        return _finalize_selenium_items(raw)
-    finally:
-        _safe_driver_quit(driver)
-
-
-def _scrape_news_source(query: str, max_results: int = 5) -> list[dict]:
-    driver = None
-    try:
-        driver = build_driver()
-        raw = _extract_news_from_driver(driver, query, max_results)
-        return _finalize_selenium_items(raw)
-    finally:
-        _safe_driver_quit(driver)
-
-
-async def selenium_source_search(
-    query: str,
-    source: str,
-    max_results: int = 5,
-) -> list[dict]:
-    source_key = source.lower()
-    if source_key == "reddit":
-        fn = _scrape_reddit_source
-    elif source_key == "forums":
-        fn = _scrape_forums_source
-    elif source_key == "twitter":
-        fn = _scrape_x_source
-    elif source_key == "news":
-        fn = _scrape_news_source
-    else:
-        return []
-    async with _selenium_browser_sem:
-        results = await asyncio.to_thread(fn, query, min(max_results, SCRAPE_MAX_RESULTS_PER_QUERY))
-    logger.info(f"Selenium source={source} query='{query[:40]}' -> {len(results)} mentions")
-    return results
-
-
-async def selenium_et_bundle(query: str, use_forums: bool, use_twitter: bool, use_news: bool, use_reddit_sel: bool) -> list[dict]:
-    mr = SCRAPE_MAX_RESULTS_PER_QUERY
-    async with _selenium_browser_sem:
-        return await asyncio.to_thread(
-            _scrape_et_bundle_sync, query, use_forums, use_twitter, use_news, use_reddit_sel, mr
-        )
-
-
-async def selenium_comp_bundle(query: str, use_forums: bool, use_twitter: bool, use_news: bool, use_reddit_sel: bool) -> list[dict]:
-    mr = SCRAPE_MAX_RESULTS_PER_QUERY
-    async with _selenium_browser_sem:
-        return await asyncio.to_thread(
-            _scrape_comp_bundle_sync, query, use_forums, use_twitter, use_news, use_reddit_sel, mr
-        )
-
-
 def lookback_hours_to_tbs(lookback_hours: int) -> str:
     # Google-style time filters used by query config.
     if lookback_hours <= 24:
@@ -1322,11 +893,6 @@ async def fetch_biweekly_mentions() -> str:
     config = load_prompts()
     etransfer_ddg_queries = config.get("etransfer_queries", config.get("biweekly_queries", []))
     competitor_ddg_queries = config.get("competitor_queries", [])
-    source_toggles = config.get("sources", {})
-    use_reddit = bool(source_toggles.get("reddit", True))
-    use_forums = bool(source_toggles.get("forums", True))
-    use_twitter = bool(source_toggles.get("twitter", True))
-    use_news = bool(source_toggles.get("news", True))
 
     seen_links: set[str] = set()
     etransfer_social: list[dict] = []
@@ -1364,29 +930,18 @@ async def fetch_biweekly_mentions() -> str:
         ("canada", "e-transfer", 30),
     ]
 
-    reddit_et_tasks_run = 0
-    reddit_et_exceptions = 0
-    reddit_et_post_rows = 0
-    after_reddit_et_only = 0
-    after_reddit_comp_only = 0
-    if use_reddit:
-        et_search_tasks = [_search(q, sub, 60) for q, sub in reddit_et_searches]
-        et_browse_tasks = [_browse(sub, kw, days) for sub, kw, days in et_browse]
-        et_batches = await asyncio.gather(*et_search_tasks, *et_browse_tasks, return_exceptions=True)
-        reddit_et_tasks_run = len(et_batches)
-        for batch in et_batches:
-            if isinstance(batch, Exception):
-                reddit_et_exceptions += 1
-                continue
-            if not batch:
-                continue
-            reddit_et_post_rows += len(batch)
-            for r in batch:
-                link = r.get("link", "")
-                if link and link not in seen_links:
-                    seen_links.add(link)
-                    etransfer_social.append(r)
-        after_reddit_et_only = len(etransfer_social)
+    et_search_tasks = [_search(q, sub, 60) for q, sub in reddit_et_searches]
+    et_browse_tasks = [_browse(sub, kw, days) for sub, kw, days in et_browse]
+    et_batches = await asyncio.gather(*et_search_tasks, *et_browse_tasks, return_exceptions=True)
+
+    for batch in et_batches:
+        if isinstance(batch, Exception) or not batch:
+            continue
+        for r in batch:
+            link = r.get("link", "")
+            if link and link not in seen_links:
+                seen_links.add(link)
+                etransfer_social.append(r)
 
     # ── 2. Reddit — competitor community reactions (with comment enrichment) ──
     # enrich_comments=True: for posts score>=5, fetches top comment via .json trick
@@ -1409,53 +964,28 @@ async def fetch_biweekly_mentions() -> str:
         ("personalfinancecanada", "wealthsimple", 60),
     ]
 
-    reddit_comp_tasks_run = 0
-    reddit_comp_exceptions = 0
-    reddit_comp_post_rows = 0
-    if use_reddit:
-        comp_search_tasks = [_search(q, sub, 180, score=1, comments=True) for q, sub in reddit_comp_searches]
-        comp_browse_tasks = [_browse(sub, kw, days) for sub, kw, days in comp_browse]
-        comp_batches = await asyncio.gather(*comp_search_tasks, *comp_browse_tasks, return_exceptions=True)
-        reddit_comp_tasks_run = len(comp_batches)
-        for batch in comp_batches:
-            if isinstance(batch, Exception):
-                reddit_comp_exceptions += 1
-                continue
-            if not batch:
-                continue
-            reddit_comp_post_rows += len(batch)
-            for r in batch:
-                link = r.get("link", "")
-                if link and link not in seen_links:
-                    seen_links.add(link)
-                    competitor_mentions.append(r)
-        after_reddit_comp_only = len(competitor_mentions)
+    comp_search_tasks = [_search(q, sub, 180, score=1, comments=True) for q, sub in reddit_comp_searches]
+    comp_browse_tasks = [_browse(sub, kw, days) for sub, kw, days in comp_browse]
+    comp_batches = await asyncio.gather(*comp_search_tasks, *comp_browse_tasks, return_exceptions=True)
 
-    # ── 3. Selenium (one browser per query round) — e-Transfer supplement ──
-    # Run bundles concurrently; each bundle acquires _selenium_browser_sem so only
-    # SCRAPE_MAX_CONCURRENT_BROWSERS Chromes run at once (queue the rest).
-    selenium_et_query_count = len(etransfer_ddg_queries)
-    selenium_et_rows = 0
-
-    async def _et_bundle_one(q: str) -> list[dict]:
-        return await selenium_et_bundle(
-            q,
-            use_forums,
-            use_twitter,
-            use_news,
-            bool(use_reddit and _has_site_restriction(q)),
-        )
-
-    et_bundle_results = await asyncio.gather(
-        *[_et_bundle_one(q) for q in etransfer_ddg_queries],
-        return_exceptions=True,
-    )
-    for rows in et_bundle_results:
-        if isinstance(rows, Exception):
-            logger.warning(f"Selenium e-Transfer bundle failed: {rows}")
+    for batch in comp_batches:
+        if isinstance(batch, Exception) or not batch:
             continue
-        selenium_et_rows += len(rows)
-        for r in rows:
+        for r in batch:
+            link = r.get("link", "")
+            if link and link not in seen_links:
+                seen_links.add(link)
+                competitor_mentions.append(r)
+
+    # ── 3. DDG — e-Transfer supplement ──
+    # This is the critical fallback path when Reddit API is blocked on the server.
+    # Subreddit-scoped site: queries (site:reddit.com/r/personalfinancecanada) are
+    # far more reliable in DDG than the broad site:reddit.com domain restriction.
+    # News search added for non-site-restricted queries to get dated press articles.
+    for query in etransfer_ddg_queries:
+        # Text search (Reddit, RFD, general web)
+        results = await web_search(query, "search", 5, tbs="qdr:m")
+        for r in results:
             link = r.get("link", "")
             if not link or link in seen_links:
                 continue
@@ -1468,49 +998,14 @@ async def fetch_biweekly_mentions() -> str:
             else:
                 etransfer_press.append(r)
 
-    # ── 4. Selenium — competitor press/news + X ──
-    selenium_comp_query_count = len(competitor_ddg_queries)
-    selenium_comp_rows = 0
-
-    async def _comp_bundle_one(q: str) -> list[dict]:
-        return await selenium_comp_bundle(
-            q,
-            use_forums,
-            use_twitter,
-            use_news,
-            bool(use_reddit and _has_site_restriction(q)),
-        )
-
-    comp_bundle_results = await asyncio.gather(
-        *[_comp_bundle_one(q) for q in competitor_ddg_queries],
-        return_exceptions=True,
-    )
-    for rows in comp_bundle_results:
-        if isinstance(rows, Exception):
-            logger.warning(f"Selenium competitor bundle failed: {rows}")
-            continue
-        selenium_comp_rows += len(rows)
-        for r in rows:
-            link = r.get("link", "")
-            if not link or link in seen_links:
-                continue
-            seen_links.add(link)
-            _, source = _classify_channel_and_source(link)
-            r["source"] = source
-            competitor_mentions.append(r)
-
-    total_before_ddg = len(etransfer_social) + len(etransfer_press) + len(competitor_mentions)
-    ddg_fallback_used = False
-    ddg_rows_added = 0
-    if FETCH_FALLBACK_DDG and total_before_ddg == 0:
-        ddg_fallback_used = True
-        for query in etransfer_ddg_queries:
-            for r in await web_search(query, "search", 5, tbs="qdr:m"):
+        if not _has_site_restriction(query):
+            # News search — always includes dates, catches press coverage
+            news_results = await web_search(query, "news", 5, tbs="qdr:m")
+            for r in news_results:
                 link = r.get("link", "")
                 if not link or link in seen_links:
                     continue
                 seen_links.add(link)
-                ddg_rows_added += 1
                 channel, source = _classify_channel_and_source(link)
                 r["channel"] = channel
                 r["source"] = source
@@ -1518,49 +1013,40 @@ async def fetch_biweekly_mentions() -> str:
                     etransfer_social.append(r)
                 else:
                     etransfer_press.append(r)
-            if not _has_site_restriction(query):
-                for r in await web_search(query, "news", 5, tbs="qdr:m"):
-                    link = r.get("link", "")
-                    if not link or link in seen_links:
-                        continue
-                    seen_links.add(link)
-                    ddg_rows_added += 1
-                    channel, source = _classify_channel_and_source(link)
-                    r["channel"] = channel
-                    r["source"] = source
-                    if channel == "people":
-                        etransfer_social.append(r)
-                    else:
-                        etransfer_press.append(r)
-                for r in await search_twitter(query, 5, tbs="qdr:m"):
-                    link = r.get("link", "")
-                    if not link or link in seen_links:
-                        continue
-                    seen_links.add(link)
-                    ddg_rows_added += 1
-                    r["channel"] = "people"
-                    r["source"] = "X/Twitter"
-                    etransfer_social.append(r)
-        for query in competitor_ddg_queries:
-            for search_type, tbs in [("search", "qdr:y"), ("news", "qdr:y")]:
-                for r in await web_search(query, search_type, 5, tbs=tbs):
-                    link = r.get("link", "")
-                    if not link or link in seen_links:
-                        continue
-                    seen_links.add(link)
-                    ddg_rows_added += 1
-                    _, source = _classify_channel_and_source(link)
-                    r["source"] = source
-                    competitor_mentions.append(r)
-            if not _has_site_restriction(query):
-                for r in await search_twitter(query, 5, tbs="qdr:y"):
-                    link = r.get("link", "")
-                    if not link or link in seen_links:
-                        continue
-                    seen_links.add(link)
-                    ddg_rows_added += 1
-                    r["source"] = "X/Twitter"
-                    competitor_mentions.append(r)
+
+            # X/Twitter
+            x_results = await search_twitter(query, 5, tbs="qdr:m")
+            for r in x_results:
+                link = r.get("link", "")
+                if not link or link in seen_links:
+                    continue
+                seen_links.add(link)
+                r["channel"] = "people"
+                r["source"] = "X/Twitter"
+                etransfer_social.append(r)
+
+    # ── 4. DDG — competitor press/news + X (launches, independent coverage) ──
+    for query in competitor_ddg_queries:
+        for search_type, tbs in [("search", "qdr:y"), ("news", "qdr:y")]:
+            results = await web_search(query, search_type, 5, tbs=tbs)
+            for r in results:
+                link = r.get("link", "")
+                if not link or link in seen_links:
+                    continue
+                seen_links.add(link)
+                _, source = _classify_channel_and_source(link)
+                r["source"] = source
+                competitor_mentions.append(r)
+
+        if not _has_site_restriction(query):
+            x_results = await search_twitter(query, 5, tbs="qdr:y")
+            for r in x_results:
+                link = r.get("link", "")
+                if not link or link in seen_links:
+                    continue
+                seen_links.add(link)
+                r["source"] = "X/Twitter"
+                competitor_mentions.append(r)
 
     # Layer 3: async HTML meta scraping for any DDG results still missing a date.
     # Reddit mentions already have exact dates; this targets DDG text() results.
@@ -1570,56 +1056,8 @@ async def fetch_biweekly_mentions() -> str:
     await _enrich_dates_from_meta(all_mentions, max_fetches=25)
 
     total = len(etransfer_social) + len(etransfer_press) + len(competitor_mentions)
-    global LAST_FETCH_DIAGNOSTICS
-    LAST_FETCH_DIAGNOSTICS = {
-        "reddit_et": {
-            "tasks": reddit_et_tasks_run,
-            "exceptions": reddit_et_exceptions,
-            "post_rows_in_batches": reddit_et_post_rows,
-            "posts_after_reddit_et": after_reddit_et_only,
-        },
-        "reddit_comp": {
-            "tasks": reddit_comp_tasks_run,
-            "exceptions": reddit_comp_exceptions,
-            "post_rows_in_batches": reddit_comp_post_rows,
-            "posts_after_reddit_comp": after_reddit_comp_only,
-        },
-        "selenium": {
-            "et_queries": selenium_et_query_count,
-            "et_rows_returned": selenium_et_rows,
-            "comp_queries": selenium_comp_query_count,
-            "comp_rows_returned": selenium_comp_rows,
-            "browser_concurrency_cap": SCRAPE_MAX_CONCURRENT_BROWSERS,
-        },
-        "ddg_fallback": {
-            "used": ddg_fallback_used,
-            "rows_added": ddg_rows_added,
-            "enabled": FETCH_FALLBACK_DDG,
-        },
-        "totals": {
-            "before_ddg": total_before_ddg,
-            "final": total,
-            "final_social": len(etransfer_social),
-            "final_press": len(etransfer_press),
-            "final_competitor": len(competitor_mentions),
-        },
-    }
     if total == 0:
-        diag_lines = [
-            "=== FETCH DIAGNOSTICS ===",
-            f"Reddit JSON e-Transfer: {reddit_et_tasks_run} tasks, {reddit_et_exceptions} exceptions, "
-            f"{reddit_et_post_rows} raw rows in responses, {after_reddit_et_only} posts after Reddit phase.",
-            f"Reddit JSON competitor: {reddit_comp_tasks_run} tasks, {reddit_comp_exceptions} exceptions, "
-            f"{reddit_comp_post_rows} raw rows, {after_reddit_comp_only} posts after Reddit competitor phase.",
-            f"Selenium: {selenium_et_query_count} e-Transfer query bundles ({selenium_et_rows} rows), "
-            f"{selenium_comp_query_count} competitor bundles ({selenium_comp_rows} rows); "
-            f"max {SCRAPE_MAX_CONCURRENT_BROWSERS} concurrent browsers.",
-            f"DDG fallback: {'ran' if ddg_fallback_used else 'skipped'} (FETCH_FALLBACK_DDG={FETCH_FALLBACK_DDG}); "
-            f"rows added from DDG pass: {ddg_rows_added}.",
-            f"Final buckets: social={len(etransfer_social)} press={len(etransfer_press)} competitor={len(competitor_mentions)}.",
-            NO_MENTIONS_MARKER,
-        ]
-        return "\n".join(diag_lines)
+        return "No mentions found in the past month."
 
     lines = [f"=== INTERAC BIWEEKLY SCAN — {now_est()} ==="]
     lines.append(
@@ -1726,31 +1164,15 @@ async def run_biweekly_scan(update: Update) -> None:
         await update.message.reply_text(
             "Running biweekly e-Transfer intelligence scan (Reddit, X, RedFlagDeals, news)..."
         )
-        try:
-            mentions = await asyncio.wait_for(
-                fetch_biweekly_mentions(), timeout=BIWEEKLY_FETCH_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            await update.message.reply_text(
-                f"⏱️ Fetch timed out ({BIWEEKLY_FETCH_TIMEOUT}s). Set BIWEEKLY_FETCH_TIMEOUT if needed."
-            )
-            return
+        mentions = await asyncio.wait_for(fetch_biweekly_mentions(), timeout=180)
         last_mentions_raw = mentions
 
-        if NO_MENTIONS_MARKER in mentions:
-            await update.message.reply_text(f"No data found this scan.\n\n{mentions[:3800]}")
+        if mentions.startswith("No mentions"):
+            await update.message.reply_text(f"No data found this scan.\n\n{mentions[:500]}")
             return
 
         await update.message.reply_text("Mentions collected. Analyzing with Kimi...")
-        try:
-            report = await asyncio.wait_for(
-                analyze_biweekly(mentions), timeout=BIWEEKLY_ANALYZE_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            await update.message.reply_text(
-                f"⏱️ Analysis timed out ({BIWEEKLY_ANALYZE_TIMEOUT}s). Set BIWEEKLY_ANALYZE_TIMEOUT if needed."
-            )
-            return
+        report = await asyncio.wait_for(analyze_biweekly(mentions), timeout=120)
         last_report = report
 
         await send_chunked_message(
@@ -2531,124 +1953,6 @@ async def send_chunked_message(
         await _reply_with_fallback(prefix + chunk)
 
 
-async def send_chunked_to_chat(
-    bot,
-    chat_id: int,
-    text: str,
-    *,
-    chunk_size: int = 3900,
-) -> None:
-    """Send long text as multiple Telegram messages (webhook / background jobs)."""
-    if len(text) <= chunk_size:
-        await bot.send_message(chat_id=chat_id, text=text)
-        return
-    chunks = []
-    remaining = text
-    while remaining:
-        if len(remaining) <= chunk_size:
-            chunks.append(remaining)
-            break
-        split_at = remaining.rfind("\n\n", 0, chunk_size)
-        if split_at < 0:
-            split_at = remaining.rfind("\n", 0, chunk_size)
-        if split_at < 0:
-            split_at = chunk_size
-        chunks.append(remaining[:split_at].rstrip())
-        remaining = remaining[split_at:].lstrip()
-    total = len(chunks)
-    for idx, chunk in enumerate(chunks, 1):
-        prefix = f"({idx}/{total})\n" if total > 1 else ""
-        await bot.send_message(chat_id=chat_id, text=prefix + chunk)
-
-
-async def reddit_json_health_probe() -> tuple[int, str]:
-    """GET one post from r/personalfinancecanada/new.json — status for /fetchdiag."""
-    try:
-        async with httpx.AsyncClient(timeout=12, headers=_REDDIT_HEADERS) as client:
-            r = await client.get(
-                "https://www.reddit.com/r/personalfinancecanada/new.json",
-                params={"limit": 1},
-            )
-        if r.status_code == 200:
-            return 200, "ok"
-        return r.status_code, (r.text[:120] or "")
-    except Exception as e:
-        return -1, f"{type(e).__name__}: {e}"[:120]
-
-
-async def _background_biweekly_scan(bot, chat_id: int) -> None:
-    global last_report, last_mentions_raw
-    try:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="Running biweekly e-Transfer intelligence scan (Reddit, X, RedFlagDeals, news)...",
-        )
-        mentions = await asyncio.wait_for(
-            fetch_biweekly_mentions(), timeout=BIWEEKLY_FETCH_TIMEOUT
-        )
-        last_mentions_raw = mentions
-        if NO_MENTIONS_MARKER in mentions:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"No data found this scan.\n\n{mentions[:3800]}",
-            )
-            return
-        await bot.send_message(chat_id=chat_id, text="Mentions collected. Analyzing with Kimi...")
-        report = await asyncio.wait_for(
-            analyze_biweekly(mentions), timeout=BIWEEKLY_ANALYZE_TIMEOUT
-        )
-        last_report = report
-        await send_chunked_to_chat(
-            bot,
-            chat_id,
-            f"Interac e-Transfer Intelligence — {now_est()}\n\n{report}",
-        )
-    except asyncio.TimeoutError:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"Timed out (fetch {BIWEEKLY_FETCH_TIMEOUT}s / analyze {BIWEEKLY_ANALYZE_TIMEOUT}s).",
-        )
-    except Exception as e:
-        logger.error(f"Background scan failed: {e}")
-        await bot.send_message(chat_id=chat_id, text=f"Scan failed: {e}")
-
-
-async def _background_biweekly_email(bot, chat_id: int) -> None:
-    global last_report, last_mentions_raw
-    try:
-        mentions = await asyncio.wait_for(
-            fetch_biweekly_mentions(), timeout=BIWEEKLY_FETCH_TIMEOUT
-        )
-        last_mentions_raw = mentions
-        if NO_MENTIONS_MARKER in mentions:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"No data found this scan.\n\n{mentions[:3800]}",
-            )
-            return
-        await bot.send_message(chat_id=chat_id, text="Mentions collected. Analyzing with Kimi...")
-        report = await asyncio.wait_for(
-            analyze_biweekly(mentions), timeout=BIWEEKLY_ANALYZE_TIMEOUT
-        )
-        last_report = report
-        subject = f"{EMAIL_SUBJECT_PREFIX} — MANUAL REPORT"
-        body = f"Interac e-Transfer Intelligence — {now_est()}\n\n{report}"
-        ok, send_reason = send_email(subject, body)
-        if ok:
-            _record_email_sent("on_demand")
-            await bot.send_message(chat_id=chat_id, text="Email sent successfully.")
-        else:
-            await bot.send_message(chat_id=chat_id, text=f"Email failed: {send_reason}")
-    except asyncio.TimeoutError:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"Timed out (fetch {BIWEEKLY_FETCH_TIMEOUT}s / analyze {BIWEEKLY_ANALYZE_TIMEOUT}s).",
-        )
-    except Exception as e:
-        logger.error(f"Background /email failed: {e}")
-        await bot.send_message(chat_id=chat_id, text=f"/email failed: {e}")
-
-
 # ─── Scheduled Broadcast ─────────────────────────────────────────────────────
 async def scheduled_biweekly_broadcast(context: ContextTypes.DEFAULT_TYPE):
     """Daily job that runs the biweekly scan if 14+ days have passed since the last one."""
@@ -2671,24 +1975,9 @@ async def scheduled_biweekly_broadcast(context: ContextTypes.DEFAULT_TYPE):
     tracked = _track_current_task()
     logger.info(f"[{now_est()}] Running scheduled biweekly scan...")
     try:
-        try:
-            mentions = await asyncio.wait_for(
-                fetch_biweekly_mentions(), timeout=BIWEEKLY_FETCH_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"Scheduled biweekly: fetch timed out ({BIWEEKLY_FETCH_TIMEOUT}s)")
-            return
+        mentions = await fetch_biweekly_mentions()
         last_mentions_raw = mentions
-        if NO_MENTIONS_MARKER in mentions:
-            logger.warning("Scheduled biweekly: fetch returned no mentions; skipping Kimi and broadcast.")
-            return
-        try:
-            report = await asyncio.wait_for(
-                analyze_biweekly(mentions), timeout=BIWEEKLY_ANALYZE_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"Scheduled biweekly: analysis timed out ({BIWEEKLY_ANALYZE_TIMEOUT}s)")
-            return
+        report = await analyze_biweekly(mentions)
         last_report = report
 
         message = f"Interac e-Transfer Intelligence — {now_est()}\n\n{report}"
@@ -2733,7 +2022,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /email — Admin: run fresh biweekly scan + send email\n"
         "• /stop — Admin: cancel running jobs\n"
         "• /smtpcheck — Admin: check email config\n"
-        "• /fetchdiag — Admin: Reddit + Selenium + DDG connectivity probe\n"
         "• Any text → Follow-up on latest report",
         parse_mode="Markdown",
     )
@@ -2758,8 +2046,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_admin = "✅" if update.effective_user.id in ADMIN_IDS else "❌"
     await update.message.reply_text(
         f"✅ Bot running — {now_est()}\n"
-        f"Selenium + Reddit | timeouts fetch {BIWEEKLY_FETCH_TIMEOUT}s / analyze {BIWEEKLY_ANALYZE_TIMEOUT}s\n"
-        f"DDG fallback if empty: {FETCH_FALLBACK_DDG} | webhook: {bool(WEBHOOK_URL.strip())}\n"
+        f"Search provider: DuckDuckGo (ddgs)\n"
         f"e-Transfer queries: {et_count} | Competitor queries: {comp_count}\n"
         f"Last biweekly scan: {last_scan}\n"
         f"Schedule: daily check at 9am EST, runs every 14 days\n"
@@ -2771,16 +2058,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        if WEBHOOK_URL.strip():
-            asyncio.create_task(
-                _background_biweekly_scan(context.bot, update.effective_chat.id),
-                name="biweekly_scan_bg",
-            )
-            await update.message.reply_text(
-                "Scan started in background (webhook mode). You will get more messages here when done."
-            )
-            return
         await run_biweekly_scan(update)
+    except asyncio.TimeoutError:
+        await update.message.reply_text("⏱️ /scan timed out after 300 seconds.")
     except Exception as e:
         logger.error(f"Scan failed: {e}")
         await update.message.reply_text(f"❌ Scan failed: {e}")
@@ -2809,30 +2089,6 @@ async def cmd_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_fetchdiag(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("Admin only.")
-        return
-    code, hint = await reddit_json_health_probe()
-    lines = [
-        f"Reddit probe (r/personalfinancecanada/new.json): HTTP {code} {hint}",
-    ]
-    try:
-        news = await selenium_source_search("Interac e-Transfer Canada", "news", 2)
-        lines.append(f"Selenium Google News sample: {len(news)} row(s)")
-    except Exception as e:
-        lines.append(f"Selenium news probe error: {type(e).__name__}: {e}")
-    try:
-        ddg = await web_search("Interac e-Transfer", "search", 2, tbs="qdr:m")
-        lines.append(f"DDG text sample: {len(ddg)} row(s)")
-    except Exception as e:
-        lines.append(f"DDG probe error: {type(e).__name__}: {e}")
-    lines.append(f"WEBHOOK_URL set: {bool(WEBHOOK_URL.strip())}")
-    lines.append(f"FETCH_FALLBACK_DDG: {FETCH_FALLBACK_DDG}")
-    lines.append(f"Selenium browser cap: {SCRAPE_MAX_CONCURRENT_BROWSERS}")
-    await update.message.reply_text("\n".join(lines)[:4000])
-
-
 async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_report, last_mentions_raw
     if update.effective_user.id not in ADMIN_IDS:
@@ -2840,42 +2096,17 @@ async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     tracked = _track_current_task()
+    await update.message.reply_text("📧 Running fresh biweekly scan and sending email...")
     try:
-        if WEBHOOK_URL.strip():
-            asyncio.create_task(
-                _background_biweekly_email(context.bot, update.effective_chat.id),
-                name="biweekly_email_bg",
-            )
-            await update.message.reply_text(
-                "📧 Email job started in background (webhook mode). Watch this chat for status."
-            )
-            return
-        await update.message.reply_text("📧 Running fresh biweekly scan and sending email...")
-        try:
-            mentions = await asyncio.wait_for(
-                fetch_biweekly_mentions(), timeout=BIWEEKLY_FETCH_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            await update.message.reply_text(
-                f"⏱️ Fetch timed out ({BIWEEKLY_FETCH_TIMEOUT}s). Set BIWEEKLY_FETCH_TIMEOUT if needed."
-            )
-            return
+        mentions = await asyncio.wait_for(fetch_biweekly_mentions(), timeout=180)
         last_mentions_raw = mentions
 
-        if NO_MENTIONS_MARKER in mentions:
-            await update.message.reply_text(f"No data found this scan.\n\n{mentions[:3800]}")
+        if mentions.startswith("No mentions"):
+            await update.message.reply_text(f"No data found this scan.\n\n{mentions[:500]}")
             return
 
         await update.message.reply_text("Mentions collected. Analyzing with Kimi...")
-        try:
-            report = await asyncio.wait_for(
-                analyze_biweekly(mentions), timeout=BIWEEKLY_ANALYZE_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            await update.message.reply_text(
-                f"⏱️ Analysis timed out ({BIWEEKLY_ANALYZE_TIMEOUT}s). Set BIWEEKLY_ANALYZE_TIMEOUT if needed."
-            )
-            return
+        report = await asyncio.wait_for(analyze_biweekly(mentions), timeout=120)
         last_report = report
 
         subject = f"{EMAIL_SUBJECT_PREFIX} — MANUAL REPORT"
@@ -2886,6 +2117,8 @@ async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("✅ Email sent successfully.")
         else:
             await update.message.reply_text(f"❌ Email failed: {send_reason}")
+    except asyncio.TimeoutError:
+        await update.message.reply_text("⏱️ /email timed out after 300 seconds.")
     except Exception as e:
         logger.error(f"/email failed: {e}")
         await update.message.reply_text(f"❌ /email failed: {e}")
@@ -2954,7 +2187,6 @@ def main():
     app.add_handler(CommandHandler("email", cmd_email))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("smtpcheck", cmd_smtpcheck))
-    app.add_handler(CommandHandler("fetchdiag", cmd_fetchdiag))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Biweekly scan: runs daily at 9am EST (14:00 UTC) but self-guards to only execute every 14 days.
