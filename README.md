@@ -131,7 +131,7 @@ Notes:
   - `SCRAPE_MAX_RESULTS_PER_QUERY` (default `5`)
   - `CHROMIUM_BINARY` (default `/usr/bin/chromium`)
   - `CHROMEDRIVER_PATH` (default `/usr/bin/chromedriver`)
-- Scan timeouts (`/scan`, `/email`, scheduled job): `BIWEEKLY_FETCH_TIMEOUT` (default `360` s), `BIWEEKLY_ANALYZE_TIMEOUT` (default `120` s). Raise them on Railway only if you still hit timeouts.
+- Scan timeouts (`/scan`, `/email`, scheduled job): `BIWEEKLY_FETCH_TIMEOUT` (default `900` s), `BIWEEKLY_ANALYZE_TIMEOUT` (default `120` s). Selenium bundles run concurrently up to `SCRAPE_MAX_CONCURRENT_BROWSERS`; raise `BIWEEKLY_FETCH_TIMEOUT` only if scans still exceed 15 minutes.
 - `SCRAPE_MAX_CONCURRENT_BROWSERS` (default `2`) — global cap on concurrent Selenium sessions (avoids OOM on small Railway plans).
 - `FETCH_FALLBACK_DDG` (default `1`) — if Reddit + Selenium still yield **zero** mentions, run DuckDuckGo (`ddgs`) text/news/X supplement like the legacy path.
 - **One Chromium session per query** (forums → X → news → optional Reddit Selenium in sequence) instead of three separate browsers per query.

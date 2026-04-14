@@ -80,8 +80,8 @@ SCRAPE_USER_AGENT = os.environ.get(
 )
 CHROMIUM_BINARY = os.environ.get("CHROMIUM_BINARY", "/usr/bin/chromium")
 CHROMEDRIVER_PATH = os.environ.get("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
-# Biweekly scan + /scan + /email (override on Railway if Selenium still hits the cap).
-BIWEEKLY_FETCH_TIMEOUT = int(os.environ.get("BIWEEKLY_FETCH_TIMEOUT", "360"))
+# Biweekly scan + /scan + /email — many Selenium bundles; 360s is often too low on Railway.
+BIWEEKLY_FETCH_TIMEOUT = int(os.environ.get("BIWEEKLY_FETCH_TIMEOUT", "900"))
 BIWEEKLY_ANALYZE_TIMEOUT = int(os.environ.get("BIWEEKLY_ANALYZE_TIMEOUT", "120"))
 FETCH_FALLBACK_DDG = os.environ.get("FETCH_FALLBACK_DDG", "1") == "1"
 SCRAPE_MAX_CONCURRENT_BROWSERS = max(1, int(os.environ.get("SCRAPE_MAX_CONCURRENT_BROWSERS", "2")))
@@ -1432,17 +1432,28 @@ async def fetch_biweekly_mentions() -> str:
         after_reddit_comp_only = len(competitor_mentions)
 
     # ── 3. Selenium (one browser per query round) — e-Transfer supplement ──
-    selenium_et_query_count = 0
+    # Run bundles concurrently; each bundle acquires _selenium_browser_sem so only
+    # SCRAPE_MAX_CONCURRENT_BROWSERS Chromes run at once (queue the rest).
+    selenium_et_query_count = len(etransfer_ddg_queries)
     selenium_et_rows = 0
-    for query in etransfer_ddg_queries:
-        selenium_et_query_count += 1
-        rows = await selenium_et_bundle(
-            query,
+
+    async def _et_bundle_one(q: str) -> list[dict]:
+        return await selenium_et_bundle(
+            q,
             use_forums,
             use_twitter,
             use_news,
-            bool(use_reddit and _has_site_restriction(query)),
+            bool(use_reddit and _has_site_restriction(q)),
         )
+
+    et_bundle_results = await asyncio.gather(
+        *[_et_bundle_one(q) for q in etransfer_ddg_queries],
+        return_exceptions=True,
+    )
+    for rows in et_bundle_results:
+        if isinstance(rows, Exception):
+            logger.warning(f"Selenium e-Transfer bundle failed: {rows}")
+            continue
         selenium_et_rows += len(rows)
         for r in rows:
             link = r.get("link", "")
@@ -1458,17 +1469,26 @@ async def fetch_biweekly_mentions() -> str:
                 etransfer_press.append(r)
 
     # ── 4. Selenium — competitor press/news + X ──
-    selenium_comp_query_count = 0
+    selenium_comp_query_count = len(competitor_ddg_queries)
     selenium_comp_rows = 0
-    for query in competitor_ddg_queries:
-        selenium_comp_query_count += 1
-        rows = await selenium_comp_bundle(
-            query,
+
+    async def _comp_bundle_one(q: str) -> list[dict]:
+        return await selenium_comp_bundle(
+            q,
             use_forums,
             use_twitter,
             use_news,
-            bool(use_reddit and _has_site_restriction(query)),
+            bool(use_reddit and _has_site_restriction(q)),
         )
+
+    comp_bundle_results = await asyncio.gather(
+        *[_comp_bundle_one(q) for q in competitor_ddg_queries],
+        return_exceptions=True,
+    )
+    for rows in comp_bundle_results:
+        if isinstance(rows, Exception):
+            logger.warning(f"Selenium competitor bundle failed: {rows}")
+            continue
         selenium_comp_rows += len(rows)
         for r in rows:
             link = r.get("link", "")
