@@ -457,32 +457,40 @@ def _tbs_to_timelimit(tbs: str) -> str | None:
 
 
 def _resolve_relative_date(date_str: str, *, tbs: str = "") -> str:
-    """Convert DDG's relative 'published' strings to absolute dates in EST.
+    """Normalize DDG date strings to "Month DD, YYYY" format (UTC dates).
 
-    DDG text() returns things like '3 weeks ago', '2 months ago', '1 year ago'.
-    All dates are formatted in EST so they match the local timezone and never
-    show a future date due to UTC offset.
-    Returns the original string unchanged if it already looks like a real date.
+    DDG text() returns relative strings like '3 weeks ago', '2 months ago'.
+    DDG news() returns ISO timestamps or pre-formatted strings.
+    All dates are kept in UTC — the native timezone of Reddit's created_utc
+    and DDG's timestamps — so the displayed date matches when the content
+    was actually published.
     Returns empty string if no date is available.
     """
     if not date_str:
         return date_str
-    # If it already looks like a real date (contains a 4-digit year), keep it
-    if re.search(r"\d{4}", date_str):
-        # ISO dates like "2025-04-10T14:22:00" — convert UTC→EST for display
-        m = re.match(r"(\d{4})-(\d{2})-(\d{2})", date_str)
-        if m:
-            try:
-                dt = datetime(
-                    int(m.group(1)), int(m.group(2)), int(m.group(3)),
-                    tzinfo=timezone.utc,
-                ).astimezone(EST)
-                return dt.strftime("%B %d, %Y")
-            except ValueError:
-                pass
-        return date_str
-    # Parse relative strings — day/week/month/year — using EST
-    now = datetime.now(EST)
+    # ISO dates: "2025-04-10", "2025-04-10T14:22:00+00:00", "2025-04-10 14:22:00"
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", date_str)
+    if m:
+        try:
+            dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), tzinfo=timezone.utc)
+            return dt.strftime("%B %d, %Y")
+        except ValueError:
+            pass
+    # RFC 2822: "Mon, 14 Apr 2026 01:30:00 +0000"
+    try:
+        from email.utils import parsedate_to_datetime as _pdt
+        dt = _pdt(date_str).astimezone(timezone.utc)
+        return dt.strftime("%B %d, %Y")
+    except Exception:
+        pass
+    # Named-month: "April 14, 2026" / "Apr 14, 2026" / "14 Apr 2026"
+    for fmt in ("%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y"):
+        try:
+            return datetime.strptime(date_str.strip(), fmt).strftime("%B %d, %Y")
+        except ValueError:
+            pass
+    # Parse relative strings using UTC now so the computed date matches the source
+    now = datetime.now(timezone.utc)
     m = re.match(r"(\d+)\s+(day|week|month|year)s?\s+ago", date_str.strip(), re.IGNORECASE)
     if m:
         n = int(m.group(1))
@@ -496,9 +504,8 @@ def _resolve_relative_date(date_str: str, *, tbs: str = "") -> str:
         else:  # year
             dt = now - timedelta(days=n * 365)
         return dt.strftime("%B %d, %Y")
-    # "N hours/minutes ago" → today in EST
     if re.match(r"\d+\s+(hour|minute)s?\s+ago", date_str.strip(), re.IGNORECASE):
-        return datetime.now(EST).strftime("%B %d, %Y")
+        return now.strftime("%B %d, %Y")
     return date_str  # unknown format — keep as-is
 
 
@@ -576,7 +583,7 @@ def _parse_reddit_post(post: dict, cutoff_ts: float) -> dict | None:
         selftext = ""
     permalink = post.get("permalink", "")
     subreddit_name = post.get("subreddit_display_name", post.get("subreddit", ""))
-    post_dt = datetime.fromtimestamp(created, tz=EST)
+    post_dt = datetime.fromtimestamp(created, tz=timezone.utc)
     return {
         "title": title,
         "snippet": selftext[:600] if selftext else title,
