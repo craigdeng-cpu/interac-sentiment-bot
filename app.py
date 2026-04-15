@@ -1205,6 +1205,7 @@ async def fetch_biweekly_mentions() -> str:
             link = r.get("link", "")
             if link and link not in seen_links:
                 seen_links.add(link)
+                r["_fetch_method"] = "reddit_json"
                 etransfer_social.append(r)
 
     # ── 2. Reddit — competitor community reactions (with comment enrichment) ──
@@ -1239,6 +1240,7 @@ async def fetch_biweekly_mentions() -> str:
             link = r.get("link", "")
             if link and link not in seen_links:
                 seen_links.add(link)
+                r["_fetch_method"] = "reddit_json"
                 competitor_mentions.append(r)
 
     # ── 3. DDG — e-Transfer supplement ──
@@ -1257,6 +1259,7 @@ async def fetch_biweekly_mentions() -> str:
             channel, source = _classify_channel_and_source(link)
             r["channel"] = channel
             r["source"] = source
+            r["_fetch_method"] = "ddg_text"
             if channel == "people":
                 etransfer_social.append(r)
             else:
@@ -1273,6 +1276,7 @@ async def fetch_biweekly_mentions() -> str:
                 channel, source = _classify_channel_and_source(link)
                 r["channel"] = channel
                 r["source"] = source
+                r["_fetch_method"] = "ddg_news"
                 if channel == "people":
                     etransfer_social.append(r)
                 else:
@@ -1287,6 +1291,7 @@ async def fetch_biweekly_mentions() -> str:
                 seen_links.add(link)
                 r["channel"] = "people"
                 r["source"] = "X/Twitter"
+                r["_fetch_method"] = "ddg_text"
                 etransfer_social.append(r)
 
     # ── 4. DDG — competitor press/news + X (launches, independent coverage) ──
@@ -1300,6 +1305,7 @@ async def fetch_biweekly_mentions() -> str:
                 seen_links.add(link)
                 _, source = _classify_channel_and_source(link)
                 r["source"] = source
+                r["_fetch_method"] = f"ddg_{search_type}"
                 competitor_mentions.append(r)
 
         if not _has_site_restriction(query):
@@ -1310,6 +1316,7 @@ async def fetch_biweekly_mentions() -> str:
                     continue
                 seen_links.add(link)
                 r["source"] = "X/Twitter"
+                r["_fetch_method"] = "ddg_text"
                 competitor_mentions.append(r)
 
     # Date backfill: Reddit .json for undated thread URLs (e.g. DDG-only Reddit hits),
@@ -1329,6 +1336,19 @@ async def fetch_biweekly_mentions() -> str:
         competitor_mentions, max_age_days=MAX_MENTION_AGE_DAYS
     )
 
+    # ── Source breakdown log ──────────────────────────────────────────────────
+    def _src_counts(items: list[dict]) -> str:
+        from collections import Counter
+        c = Counter(m.get("_fetch_method", "unknown") for m in items)
+        return " | ".join(f"{k}={v}" for k, v in sorted(c.items()))
+
+    logger.info(
+        f"[fetch-sources] BEFORE quality gate — "
+        f"etransfer_social={len(etransfer_social)} ({_src_counts(etransfer_social)}) | "
+        f"etransfer_press={len(etransfer_press)} ({_src_counts(etransfer_press)}) | "
+        f"competitor={len(competitor_mentions)} ({_src_counts(competitor_mentions)})"
+    )
+
     # Deterministic quality gate: remove low-signal posts before LLM analysis.
     etransfer_social = _quality_gate_mentions(
         etransfer_social, section="etransfer", threshold=3.0
@@ -1338,6 +1358,13 @@ async def fetch_biweekly_mentions() -> str:
     )
     competitor_mentions = _quality_gate_mentions(
         competitor_mentions, section="competitor", threshold=3.5
+    )
+
+    logger.info(
+        f"[fetch-sources] AFTER quality gate — "
+        f"etransfer_social={len(etransfer_social)} ({_src_counts(etransfer_social)}) | "
+        f"etransfer_press={len(etransfer_press)} ({_src_counts(etransfer_press)}) | "
+        f"competitor={len(competitor_mentions)} ({_src_counts(competitor_mentions)})"
     )
 
     total = len(etransfer_social) + len(etransfer_press) + len(competitor_mentions)
