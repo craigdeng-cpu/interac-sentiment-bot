@@ -2106,23 +2106,12 @@ def _build_biweekly_html(
     scan_date = _extract_report_field(body, "SCAN DATE")
     etransfer_raw = _extract_section(body, "e-Transfer Chatter:", ["Competitor Landscape:", "Trend vs Last Scan:"])
     competitor_raw = _extract_section(body, "Competitor Landscape:", ["Trend vs Last Scan:"])
-    trend_raw = _extract_section(body, "Trend vs Last Scan:", [])
-
-    if not any(s.strip() for s in [etransfer_raw, competitor_raw, trend_raw]):
+    if not any(s.strip() for s in [etransfer_raw, competitor_raw]):
         return _styled_raw_report_html(subject, body)
 
     umap = url_dates or {}
     etransfer_html = _render_quote_bullets(etransfer_raw, "Nothing notable this scan.", umap)
     competitor_html = _render_quote_bullets(competitor_raw, "Nothing notable this scan.", umap)
-
-    still, quiet, new_themes = _parse_trend_fields(trend_raw)
-    trend_html = (
-        f"<table role='presentation' width='100%' cellspacing='0' cellpadding='0'><tr>"
-        + _trend_mini_card("Still active", still, "#027A48")
-        + _trend_mini_card("Went quiet", quiet, "#667085")
-        + _trend_mini_card("New this scan", new_themes, "#175CD3")
-        + "</tr></table>"
-    )
 
     return f"""<!DOCTYPE html>
 <html>
@@ -2160,14 +2149,6 @@ def _build_biweekly_html(
             <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;color:#027A48;margin-bottom:4px;">What's working</div>
             <div style="font-size:16px;font-weight:700;color:{EMAIL_TEXT};margin-bottom:16px;">Competitor Landscape</div>
             {competitor_html}
-          </td>
-        </tr>
-
-        <!-- TREND SECTION -->
-        <tr>
-          <td colspan="2" style="padding:0 28px 28px 28px;border-top:1px solid {EMAIL_BORDER};">
-            <div style="font-size:16px;font-weight:700;color:{EMAIL_TEXT};margin:20px 0 12px 0;">Trend vs Last Scan</div>
-            {trend_html}
           </td>
         </tr>
 
