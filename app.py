@@ -985,7 +985,7 @@ def _parse_reddit_post(post: dict, cutoff_ts: float) -> dict | None:
     post_dt = datetime.fromtimestamp(created, tz=timezone.utc)
     return {
         "title": title,
-        "snippet": selftext[:600] if selftext else title,
+        "snippet": selftext[:900] if selftext else title,
         "link": f"https://www.reddit.com{permalink}",
         "source": f"Reddit/r/{subreddit_name}" if subreddit_name else "Reddit",
         "date": post_dt.strftime("%B %d, %Y"),
@@ -1332,10 +1332,10 @@ async def fetch_biweekly_mentions() -> str:
                 r["_fetch_method"] = "ddg_text"
                 etransfer_social.append(r)
 
-    # ── 4. DDG — competitor social + supplemental ──
-    # Prefer social/reddit results for the comparisons angle; X/Twitter also enriched here.
+    # ── 4. DDG — market pulse: product news + community reactions ──
+    # Use qdr:y so product launches and updates from the past year are captured.
     for query in competitor_ddg_queries:
-        for search_type, tbs in [("search", "qdr:m"), ("news", "qdr:m")]:
+        for search_type, tbs in [("search", "qdr:y"), ("news", "qdr:y")]:
             results = await web_search(query, search_type, 8, tbs=tbs)
             for r in results:
                 link = r.get("link", "")
@@ -1425,7 +1425,7 @@ async def fetch_biweekly_mentions() -> str:
 
     if etransfer_social:
         lines.append("=== e-TRANSFER COMMUNITY (REDDIT, RFD, X) ===")
-        lines += _fmt("S", etransfer_social, 60, 500)
+        lines += _fmt("S", etransfer_social, 60, 750)
 
     if etransfer_press:
         lines.append("=== e-TRANSFER NEWS ===")
@@ -1956,8 +1956,8 @@ def _save_biweekly_memory(themes: dict, scan_date: str) -> None:
 
 def _extract_biweekly_themes(report: str) -> dict:
     """Extract short theme labels from biweekly report sections for memory storage."""
-    etransfer_raw = _extract_section(report, "e-Transfer Chatter:", ["Social Comparisons:", "Trend vs Last Scan:"])
-    competitor_raw = _extract_section(report, "Social Comparisons:", ["Trend vs Last Scan:"])
+    etransfer_raw = _extract_section(report, "e-Transfer Chatter:", ["Market Pulse:", "Trend vs Last Scan:"])
+    competitor_raw = _extract_section(report, "Market Pulse:", ["Trend vs Last Scan:"])
 
     def _bullets_to_themes(section_text: str) -> list[str]:
         themes = []
@@ -1983,8 +1983,8 @@ def _append_biweekly_excel(scan_date: str, report: str) -> None:
     try:
         from openpyxl import Workbook, load_workbook
 
-        etransfer_raw = _extract_section(report, "e-Transfer Chatter:", ["Social Comparisons:", "Trend vs Last Scan:"])
-        competitor_raw = _extract_section(report, "Social Comparisons:", ["Trend vs Last Scan:"])
+        etransfer_raw = _extract_section(report, "e-Transfer Chatter:", ["Market Pulse:", "Trend vs Last Scan:"])
+        competitor_raw = _extract_section(report, "Market Pulse:", ["Trend vs Last Scan:"])
         trend_raw = _extract_section(report, "Trend vs Last Scan:", [])
 
         BIWEEKLY_EXCEL_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1996,7 +1996,7 @@ def _append_biweekly_excel(scan_date: str, report: str) -> None:
             wb = Workbook()
             ws = wb.active
             ws.title = "Biweekly Reports"
-            ws.append(["Scan Date", "e-Transfer Chatter", "Social Comparisons", "Trend vs Last Scan", "Full Report"])
+            ws.append(["Scan Date", "e-Transfer Chatter", "Market Pulse", "Trend vs Last Scan", "Full Report"])
 
         ws.append([
             scan_date,
@@ -2205,8 +2205,8 @@ def _build_biweekly_html(
     subject: str, body: str, url_dates: dict[str, str] | None = None
 ) -> str:
     scan_date = _extract_report_field(body, "SCAN DATE")
-    etransfer_raw = _extract_section(body, "e-Transfer Chatter:", ["Social Comparisons:", "Trend vs Last Scan:"])
-    competitor_raw = _extract_section(body, "Social Comparisons:", ["Trend vs Last Scan:"])
+    etransfer_raw = _extract_section(body, "e-Transfer Chatter:", ["Market Pulse:", "Trend vs Last Scan:"])
+    competitor_raw = _extract_section(body, "Market Pulse:", ["Trend vs Last Scan:"])
     if not any(s.strip() for s in [etransfer_raw, competitor_raw]):
         return _styled_raw_report_html(subject, body)
 
@@ -2245,10 +2245,10 @@ def _build_biweekly_html(
             <div style="font-size:16px;font-weight:700;color:{EMAIL_TEXT};margin-bottom:16px;">e-Transfer Chatter</div>
             {etransfer_html}
           </td>
-          <!-- RIGHT: Social Comparisons -->
+          <!-- RIGHT: Market Pulse -->
           <td width="50%" style="vertical-align:top;padding:22px 28px 22px 14px;">
-            <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;color:#5925DC;margin-bottom:4px;">The conversation</div>
-            <div style="font-size:16px;font-weight:700;color:{EMAIL_TEXT};margin-bottom:16px;">Social Comparisons</div>
+            <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;color:#5925DC;margin-bottom:4px;">Market pulse</div>
+            <div style="font-size:16px;font-weight:700;color:{EMAIL_TEXT};margin-bottom:16px;">Payments Landscape</div>
             {competitor_html}
           </td>
         </tr>

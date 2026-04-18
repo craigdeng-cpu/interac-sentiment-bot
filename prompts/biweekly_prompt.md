@@ -12,9 +12,9 @@ The raw data has three labelled sections — use them strictly as mapped:
 
 - **=== e-TRANSFER COMMUNITY ===** → source material for "e-Transfer Chatter"
 - **=== e-TRANSFER NEWS ===** → additional source material for "e-Transfer Chatter"
-- **=== COMPETITOR INTELLIGENCE ===** → source material for "Social Comparisons"
+- **=== COMPETITOR INTELLIGENCE ===** → source material for "Market Pulse"
 
-Do not use competitor sources for e-Transfer Chatter, and do not use e-Transfer sources for Social Comparisons.
+Do not use competitor sources for e-Transfer Chatter, and do not use e-Transfer sources for Market Pulse.
 
 ---
 
@@ -22,6 +22,7 @@ Do not use competitor sources for e-Transfer Chatter, and do not use e-Transfer 
 
 1. Every entry must use the exact words from the input. Copy verbatim quotes when available.
 2. If no verbatim quote exists, use a short snippet (under 30 words) from the title or snippet field.
+2a. **Choosing what to quote from Reddit posts:** Each entry has a `Title:` (headline) and a `Snippet:` (actual post body). Use whichever is more informative and quotable. If the Snippet contains a richer, more specific story than the title, quote from the Snippet. If the title is already descriptive on its own, using it is fine. Never quote a generic title when the Snippet has more concrete detail — e.g., if the Snippet mentions a specific dollar amount, bank, institution, or personal experience, pull from there instead.
 3. If a section has no relevant data, write exactly: Nothing notable this scan.
 4. Never fabricate trends, comparisons, percentages, or urgency.
 5. Never make recommendations or use strategy language ("should", "need to", "consider").
@@ -32,8 +33,8 @@ Do not use competitor sources for e-Transfer Chatter, and do not use e-Transfer 
    - With date:    `- "quote or snippet" — Platform, Date. Source: URL`
    - Without date: `- "quote or snippet" — Platform. Source: URL`
 10. **Relevance filter for e-Transfer Chatter**: Only include a bullet if the source text explicitly mentions e-Transfer, Interac, auto-deposit, or a specific product behaviour (transfer limits, fees, holds, fraud, delays). Skip results that mention money or banking only in a general way.
-11. **Source quality for Social Comparisons**: Strongly prefer Reddit posts, X/Twitter posts, and forum comments where real people are speaking. Deprioritize or skip content from a company's own website unless it's being quoted by a real user. Press releases and marketing pages are not social comparisons.
-12. **Competitor diversity in Social Comparisons**: Include at most 2 bullets per competitor brand. Actively spread coverage across different alternatives — Wise, PayPal, Apple Pay, Google Pay, Wealthsimple Cash, KOHO, Revolut, Neo Financial, Venmo, and others. Do not let any single brand dominate the section.
+11. **Source quality for Market Pulse**: Prefer Reddit posts, X/Twitter, and independent news for community reactions. Company blog posts or press releases are acceptable only if they describe a concrete product launch, pricing change, acquisition, or new market entry — not generic marketing copy.
+12. **Market Pulse diversity**: Cover the full landscape — Wise, PayPal, Apple Pay, Google Pay, Wealthsimple Cash, KOHO, Revolut, Neo Financial, Venmo, Zelle, Square, Stripe, and any emerging Canadian fintech. Include at most 2 bullets per brand. Do not let any single company dominate the section.
 13. **Quality floor (strict)**: Only include a bullet if it has concrete, product-level evidence (specific user experience, launch/update, pricing/fee detail, or operational behavior). Skip vague questions, generic opinions, and low-information chatter. If fewer than 2 strong items remain for a section, output exactly: Nothing notable this scan.
 
 ---
@@ -47,8 +48,8 @@ SCAN DATE: {timestamp}
 e-Transfer Chatter:
 [Pain points, friction, confusion, fraud, and frustration from real people about e-Transfer. Source only from the e-TRANSFER COMMUNITY and e-TRANSFER NEWS sections. Apply the relevance filter (Rule 10). One bullet per quote or snippet. Format (with date): - "quote or snippet" — Platform, Date. Source: URL. Format (no date): - "quote or snippet" — Platform. Source: URL. If nothing found: Nothing notable this scan.]
 
-Social Comparisons:
-[Source ONLY from the COMPETITOR INTELLIGENCE section. Focus on social posts — Reddit, X/Twitter, forums — where real people discuss alternatives to e-Transfer or compare payment apps. Include: direct comparisons ("I switched from e-transfer to Wise because..."), user experiences with competing apps, community recommendations, and opinions about alternatives. Cover the full range — Wise, PayPal, Apple Pay, Google Pay, Wealthsimple Cash, KOHO, Venmo, Zelle, Revolut, Neo Financial, and others. Distribute across different brands. Do not include press releases or company marketing content. One bullet per mention. Format (with date): - "quote or snippet" — Platform, Date. Source: URL. Format (no date): - "quote or snippet" — Platform. Source: URL. If nothing found: Nothing notable this scan.]
+Market Pulse:
+[Source ONLY from the COMPETITOR INTELLIGENCE section. Cover noteworthy developments in the Canadian digital payments landscape: product launches, new features, pricing changes, acquisitions, partnerships, new market entries, and community reactions to any of the above. Direct comparisons to e-Transfer are also valuable but not required. Include anything a payments product team would want to know about the competitive market. Cover the full range — Wise, PayPal, Apple Pay, Google Pay, Wealthsimple Cash, KOHO, Revolut, Neo Financial, Venmo, Zelle, Square, Stripe, and emerging Canadian fintech. Prefer Reddit/X community reactions and independent news over company marketing pages. One bullet per mention. Format (with date): - "quote or snippet" — Platform, Date. Source: URL. Format (no date): - "quote or snippet" — Platform. Source: URL. If nothing found: Nothing notable this scan.]
 
 Trend vs Last Scan:
 - Still active: [comma-separated short theme labels from PREVIOUS SCAN CONTEXT that appear again in current data, or: none identified]
