@@ -1187,11 +1187,20 @@ async def fetch_biweekly_mentions() -> str:
         ("e-transfer limit OR hold OR declined OR pending", ""),
         ("interac e-transfer", "canada"),
         ("e-transfer", "banking"),
+        ("e-transfer", "ontario"),
+        ("e-transfer", "toronto"),
+        ("interac e-transfer fraud OR scam", "Scams"),
+        ("interac e-transfer", "legaladvicecanada"),
+        ("e-transfer", "frugalcanada"),
+        ("e-transfer help OR problem", "CanadianInvestor"),
     ]
     et_browse = [
         ("personalfinancecanada", "e-transfer", 45),
         ("personalfinancecanada", "interac", 45),
         ("canada", "e-transfer", 30),
+        ("ontario", "e-transfer", 30),
+        ("Scams", "e-transfer", 45),
+        ("frugalcanada", "e-transfer", 60),
     ]
 
     et_search_tasks = [_search(q, sub, 60) for q, sub in reddit_et_searches]
@@ -1222,11 +1231,20 @@ async def fetch_biweekly_mentions() -> str:
         ("neo financial banking canada", "personalfinancecanada"),
         ("venmo paypal zelle canada", ""),
         ("digital wallet canada", "personalfinancecanada"),
+        ("switched from e-transfer", "personalfinancecanada"),
+        ("e-transfer alternative", "personalfinancecanada"),
+        ("wise vs interac OR paypal vs interac", "personalfinancecanada"),
+        ("wise money transfer canada", "canada"),
+        ("revolut canada", "canada"),
+        ("koho OR wealthsimple cash", "canada"),
     ]
     comp_browse = [
         ("personalfinancecanada", "wise", 90),
         ("personalfinancecanada", "paypal", 90),
         ("personalfinancecanada", "wealthsimple", 60),
+        ("personalfinancecanada", "revolut", 90),
+        ("canada", "wise", 60),
+        ("canada", "koho", 60),
     ]
 
     comp_search_tasks = [_search(q, sub, 180, score=1, comments=True) for q, sub in reddit_comp_searches]
@@ -1243,7 +1261,27 @@ async def fetch_biweekly_mentions() -> str:
                 r["_fetch_method"] = "reddit_json"
                 competitor_mentions.append(r)
 
-    # ── 3. DDG — e-Transfer supplement ──
+    # ── 3a. Dedicated X/Twitter e-Transfer searches ──
+    # Run these independently so they aren't limited by the DDG query list.
+    et_twitter_queries = [
+        "interac e-transfer",
+        "e-transfer scam OR fraud",
+        "e-transfer hold OR declined OR pending",
+        "e-transfer complaint OR issue OR broken",
+    ]
+    for tq in et_twitter_queries:
+        x_results = await search_twitter(tq, 8, tbs="qdr:m")
+        for r in x_results:
+            link = r.get("link", "")
+            if not link or link in seen_links:
+                continue
+            seen_links.add(link)
+            r["channel"] = "people"
+            r["source"] = "X/Twitter"
+            r["_fetch_method"] = "ddg_text"
+            etransfer_social.append(r)
+
+    # ── 3b. DDG — e-Transfer supplement ──
     # This is the critical fallback path when Reddit API is blocked on the server.
     # Subreddit-scoped site: queries (site:reddit.com/r/personalfinancecanada) are
     # far more reliable in DDG than the broad site:reddit.com domain restriction.
@@ -1294,27 +1332,30 @@ async def fetch_biweekly_mentions() -> str:
                 r["_fetch_method"] = "ddg_text"
                 etransfer_social.append(r)
 
-    # ── 4. DDG — competitor press/news + X (launches, independent coverage) ──
+    # ── 4. DDG — competitor social + supplemental ──
+    # Prefer social/reddit results for the comparisons angle; X/Twitter also enriched here.
     for query in competitor_ddg_queries:
-        for search_type, tbs in [("search", "qdr:y"), ("news", "qdr:y")]:
-            results = await web_search(query, search_type, 5, tbs=tbs)
+        for search_type, tbs in [("search", "qdr:m"), ("news", "qdr:m")]:
+            results = await web_search(query, search_type, 8, tbs=tbs)
             for r in results:
                 link = r.get("link", "")
                 if not link or link in seen_links:
                     continue
                 seen_links.add(link)
-                _, source = _classify_channel_and_source(link)
+                channel, source = _classify_channel_and_source(link)
+                r["channel"] = channel
                 r["source"] = source
                 r["_fetch_method"] = f"ddg_{search_type}"
                 competitor_mentions.append(r)
 
         if not _has_site_restriction(query):
-            x_results = await search_twitter(query, 5, tbs="qdr:y")
+            x_results = await search_twitter(query, 8, tbs="qdr:m")
             for r in x_results:
                 link = r.get("link", "")
                 if not link or link in seen_links:
                     continue
                 seen_links.add(link)
+                r["channel"] = "people"
                 r["source"] = "X/Twitter"
                 r["_fetch_method"] = "ddg_text"
                 competitor_mentions.append(r)
@@ -1349,19 +1390,8 @@ async def fetch_biweekly_mentions() -> str:
         f"competitor={len(competitor_mentions)} ({_src_counts(competitor_mentions)})"
     )
 
-    # Deterministic quality gate: remove low-signal posts before LLM analysis.
-    etransfer_social = _quality_gate_mentions(
-        etransfer_social, section="etransfer", threshold=3.0
-    )
-    etransfer_press = _quality_gate_mentions(
-        etransfer_press, section="etransfer", threshold=2.5
-    )
-    competitor_mentions = _quality_gate_mentions(
-        competitor_mentions, section="competitor", threshold=3.5
-    )
-
     logger.info(
-        f"[fetch-sources] AFTER quality gate — "
+        f"[fetch-sources] after recency filter (no quality gate — Kimi curates) — "
         f"etransfer_social={len(etransfer_social)} ({_src_counts(etransfer_social)}) | "
         f"etransfer_press={len(etransfer_press)} ({_src_counts(etransfer_press)}) | "
         f"competitor={len(competitor_mentions)} ({_src_counts(competitor_mentions)})"
@@ -1395,15 +1425,15 @@ async def fetch_biweekly_mentions() -> str:
 
     if etransfer_social:
         lines.append("=== e-TRANSFER COMMUNITY (REDDIT, RFD, X) ===")
-        lines += _fmt("S", etransfer_social, 30, 500)
+        lines += _fmt("S", etransfer_social, 60, 500)
 
     if etransfer_press:
         lines.append("=== e-TRANSFER NEWS ===")
-        lines += _fmt("EN", etransfer_press, 8, 300)
+        lines += _fmt("EN", etransfer_press, 15, 300)
 
     if competitor_mentions:
         lines.append("=== COMPETITOR INTELLIGENCE (Wise, PayPal, Apple Pay, Wealthsimple, KOHO, Venmo, Zelle, Revolut, Neo, ACH, others) ===")
-        lines += _fmt("C", competitor_mentions, 30, 450)
+        lines += _fmt("C", competitor_mentions, 60, 450)
 
     last_biweekly_url_dates = _build_url_date_map_from_mentions(
         etransfer_social, etransfer_press, competitor_mentions
@@ -1443,14 +1473,58 @@ async def call_kimi(system_prompt: str, user_content: str) -> str:
         return data["choices"][0]["message"]["content"]
 
 
+async def curate_with_kimi(raw_mentions: str) -> str:
+    """Kimi curation pass: filter raw mentions down to real-people social signal before analysis."""
+    config = load_prompts()
+    prompt = config.get("curation_prompt", "")
+    if not prompt:
+        logger.warning("[curation] curation_prompt not found — skipping curation step")
+        return raw_mentions
+
+    user_content = raw_mentions
+    if len(user_content) > 50000:
+        user_content = user_content[:50000] + "\n\n[... truncated]"
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        response = await client.post(
+            KIMI_API_URL,
+            headers={
+                "Authorization": f"Bearer {KIMI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": KIMI_MODEL,
+                "messages": [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 6000,
+            },
+        )
+        if response.status_code != 200:
+            body = response.text
+            logger.error(f"[curation] Kimi API {response.status_code}: {body[:300]}")
+            return raw_mentions  # graceful fallback: use unfiltered data
+        data = response.json()
+        curated = data["choices"][0]["message"]["content"]
+        logger.info(
+            f"[curation] done — input {len(raw_mentions)} chars → output {len(curated)} chars"
+        )
+        return curated
+
+
 async def analyze_biweekly(mentions_text: str) -> str:
     """Run the universal biweekly scan analysis, inject prior memory for trend tracking."""
+    # Step 1: Kimi curation — filter raw mentions to real-person social signal
+    curated_mentions = await curate_with_kimi(mentions_text)
+
     config = load_prompts()
     prompt = config["biweekly_prompt"].replace("{timestamp}", now_est())
 
     # Inject previous scan context so the LLM can populate Trend vs Last Scan
     prev_memory = _load_biweekly_memory()
-    user_content = mentions_text
+    user_content = curated_mentions
     if prev_memory.get("last_scan_date"):
         etransfer_themes = "; ".join(prev_memory.get("etransfer_themes", [])) or "none on record"
         competitor_themes = "; ".join(prev_memory.get("competitor_themes", [])) or "none on record"
@@ -1487,7 +1561,7 @@ async def run_biweekly_scan(update: Update) -> None:
             await update.message.reply_text(f"No data found this scan.\n\n{mentions[:500]}")
             return
 
-        await update.message.reply_text("Mentions collected. Analyzing with Kimi...")
+        await update.message.reply_text("Mentions collected. Running Kimi curation pass, then analysis...")
         report = await asyncio.wait_for(analyze_biweekly(mentions), timeout=120)
         last_report = report
 
@@ -1882,8 +1956,8 @@ def _save_biweekly_memory(themes: dict, scan_date: str) -> None:
 
 def _extract_biweekly_themes(report: str) -> dict:
     """Extract short theme labels from biweekly report sections for memory storage."""
-    etransfer_raw = _extract_section(report, "e-Transfer Chatter:", ["Competitor Landscape:", "Trend vs Last Scan:"])
-    competitor_raw = _extract_section(report, "Competitor Landscape:", ["Trend vs Last Scan:"])
+    etransfer_raw = _extract_section(report, "e-Transfer Chatter:", ["Social Comparisons:", "Trend vs Last Scan:"])
+    competitor_raw = _extract_section(report, "Social Comparisons:", ["Trend vs Last Scan:"])
 
     def _bullets_to_themes(section_text: str) -> list[str]:
         themes = []
@@ -1909,8 +1983,8 @@ def _append_biweekly_excel(scan_date: str, report: str) -> None:
     try:
         from openpyxl import Workbook, load_workbook
 
-        etransfer_raw = _extract_section(report, "e-Transfer Chatter:", ["Competitor Landscape:", "Trend vs Last Scan:"])
-        competitor_raw = _extract_section(report, "Competitor Landscape:", ["Trend vs Last Scan:"])
+        etransfer_raw = _extract_section(report, "e-Transfer Chatter:", ["Social Comparisons:", "Trend vs Last Scan:"])
+        competitor_raw = _extract_section(report, "Social Comparisons:", ["Trend vs Last Scan:"])
         trend_raw = _extract_section(report, "Trend vs Last Scan:", [])
 
         BIWEEKLY_EXCEL_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1922,7 +1996,7 @@ def _append_biweekly_excel(scan_date: str, report: str) -> None:
             wb = Workbook()
             ws = wb.active
             ws.title = "Biweekly Reports"
-            ws.append(["Scan Date", "e-Transfer Chatter", "Competitor Landscape", "Trend vs Last Scan", "Full Report"])
+            ws.append(["Scan Date", "e-Transfer Chatter", "Social Comparisons", "Trend vs Last Scan", "Full Report"])
 
         ws.append([
             scan_date,
@@ -2131,8 +2205,8 @@ def _build_biweekly_html(
     subject: str, body: str, url_dates: dict[str, str] | None = None
 ) -> str:
     scan_date = _extract_report_field(body, "SCAN DATE")
-    etransfer_raw = _extract_section(body, "e-Transfer Chatter:", ["Competitor Landscape:", "Trend vs Last Scan:"])
-    competitor_raw = _extract_section(body, "Competitor Landscape:", ["Trend vs Last Scan:"])
+    etransfer_raw = _extract_section(body, "e-Transfer Chatter:", ["Social Comparisons:", "Trend vs Last Scan:"])
+    competitor_raw = _extract_section(body, "Social Comparisons:", ["Trend vs Last Scan:"])
     if not any(s.strip() for s in [etransfer_raw, competitor_raw]):
         return _styled_raw_report_html(subject, body)
 
@@ -2171,10 +2245,10 @@ def _build_biweekly_html(
             <div style="font-size:16px;font-weight:700;color:{EMAIL_TEXT};margin-bottom:16px;">e-Transfer Chatter</div>
             {etransfer_html}
           </td>
-          <!-- RIGHT: Competitor Landscape -->
+          <!-- RIGHT: Social Comparisons -->
           <td width="50%" style="vertical-align:top;padding:22px 28px 22px 14px;">
-            <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;color:#027A48;margin-bottom:4px;">What's working</div>
-            <div style="font-size:16px;font-weight:700;color:{EMAIL_TEXT};margin-bottom:16px;">Competitor Landscape</div>
+            <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;color:#5925DC;margin-bottom:4px;">The conversation</div>
+            <div style="font-size:16px;font-weight:700;color:{EMAIL_TEXT};margin-bottom:16px;">Social Comparisons</div>
             {competitor_html}
           </td>
         </tr>
@@ -2416,7 +2490,7 @@ async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"No data found this scan.\n\n{mentions[:500]}")
             return
 
-        await update.message.reply_text("Mentions collected. Analyzing with Kimi...")
+        await update.message.reply_text("Mentions collected. Running Kimi curation pass, then analysis...")
         report = await asyncio.wait_for(analyze_biweekly(mentions), timeout=120)
         last_report = report
 
