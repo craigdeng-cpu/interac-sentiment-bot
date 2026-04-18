@@ -10,11 +10,12 @@ Your job is to write a clean, quote-driven intelligence brief. Use only evidence
 
 The raw data has three labelled sections — use them strictly as mapped:
 
-- **=== e-TRANSFER COMMUNITY ===** → source material for "e-Transfer Chatter"
-- **=== e-TRANSFER NEWS ===** → additional source material for "e-Transfer Chatter"
+- **=== e-TRANSFER COMMUNITY ===** → source material for "e-Transfer Chatter" (social posts only)
+- **=== e-TRANSFER NEWS ===** → source material for "Market Pulse" (not e-Transfer Chatter)
 - **=== COMPETITOR INTELLIGENCE ===** → source material for "Market Pulse"
 
-Do not use competitor sources for e-Transfer Chatter, and do not use e-Transfer sources for Market Pulse.
+e-Transfer Chatter is sourced ONLY from e-TRANSFER COMMUNITY. Do not use NEWS or COMPETITOR sources for it.
+Market Pulse draws from both e-TRANSFER NEWS and COMPETITOR INTELLIGENCE.
 
 ---
 
@@ -46,10 +47,10 @@ Use these exact headers — no changes, no additions.
 SCAN DATE: {timestamp}
 
 e-Transfer Chatter:
-[Pain points, friction, confusion, fraud, and frustration from real people about e-Transfer. Source only from the e-TRANSFER COMMUNITY and e-TRANSFER NEWS sections. Apply the relevance filter (Rule 10). One bullet per quote or snippet. Format (with date): - "quote or snippet" — Platform, Date. Source: URL. Format (no date): - "quote or snippet" — Platform. Source: URL. If nothing found: Nothing notable this scan.]
+[Source ONLY from the e-TRANSFER COMMUNITY section — real people posting on Reddit, X/Twitter, or RedFlagDeals about their personal e-Transfer experiences. Apply the relevance filter (Rule 10). Do NOT use e-TRANSFER NEWS items here. One bullet per quote or snippet. Format (with date): - "quote or snippet" — Platform, Date. Source: URL. Format (no date): - "quote or snippet" — Platform. Source: URL. If nothing found: Nothing notable this scan.]
 
 Market Pulse:
-[Source ONLY from the COMPETITOR INTELLIGENCE section. Cover noteworthy developments in the Canadian digital payments landscape: product launches, new features, pricing changes, acquisitions, partnerships, new market entries, and community reactions to any of the above. Direct comparisons to e-Transfer are also valuable but not required. Include anything a payments product team would want to know about the competitive market. Cover the full range — Wise, PayPal, Apple Pay, Google Pay, Wealthsimple Cash, KOHO, Revolut, Neo Financial, Venmo, Zelle, Square, Stripe, and emerging Canadian fintech. Prefer Reddit/X community reactions and independent news over company marketing pages. One bullet per mention. Format (with date): - "quote or snippet" — Platform, Date. Source: URL. Format (no date): - "quote or snippet" — Platform. Source: URL. If nothing found: Nothing notable this scan.]
+[Source from BOTH e-TRANSFER NEWS and COMPETITOR INTELLIGENCE sections. Cover noteworthy developments in the Canadian digital payments landscape: product launches, new features, pricing changes, acquisitions, partnerships, new market entries, e-Transfer service news, and community reactions to any of the above. Include anything a payments product team would want to know about the competitive market and e-Transfer ecosystem news. Cover the full range — Wise, PayPal, Apple Pay, Google Pay, Wealthsimple Cash, KOHO, Revolut, Neo Financial, Venmo, Zelle, Square, Stripe, emerging Canadian fintech, and e-Transfer service developments. Prefer Reddit/X community reactions and independent news over company marketing pages. One bullet per mention. Format (with date): - "quote or snippet" — Platform, Date. Source: URL. Format (no date): - "quote or snippet" — Platform. Source: URL. If nothing found: Nothing notable this scan.]
 
 Trend vs Last Scan:
 - Still active: [comma-separated short theme labels from PREVIOUS SCAN CONTEXT that appear again in current data, or: none identified]
