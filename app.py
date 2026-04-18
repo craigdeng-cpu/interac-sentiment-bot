@@ -1519,24 +1519,9 @@ async def curate_with_kimi(raw_mentions: str) -> str:
 
 async def analyze_biweekly(mentions_text: str) -> str:
     """Run the universal biweekly scan analysis, inject prior memory for trend tracking."""
-    # Step 1: Kimi curation — curate ONLY the e-TRANSFER COMMUNITY section.
-    # NEWS and COMPETITOR sections bypass curation: NEWS goes to Market Pulse (not left side),
-    # COMPETITOR is product/market intel that shouldn't be filtered for "real-person social" signal.
-    news_marker = "=== e-TRANSFER NEWS"
-    competitor_marker = "=== COMPETITOR INTELLIGENCE"
-
-    community_part = mentions_text
-    passthrough_part = ""
-
-    # Split off everything from NEWS section onward (NEWS + COMPETITOR both bypass curation)
-    for marker in [news_marker, competitor_marker]:
-        if marker in community_part:
-            idx = community_part.index(marker)
-            passthrough_part = community_part[idx:] + ("\n\n" + passthrough_part if passthrough_part else "")
-            community_part = community_part[:idx]
-
-    curated_community = await curate_with_kimi(community_part)
-    curated_mentions = curated_community + ("\n\n" + passthrough_part if passthrough_part else "")
+    # No curation pass — Reddit community fetches are already targeted to the right
+    # subreddits and keywords; analysis Kimi handles final selection via biweekly_prompt rules.
+    curated_mentions = mentions_text
 
     config = load_prompts()
     prompt = config["biweekly_prompt"].replace("{timestamp}", now_est())
