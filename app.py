@@ -17,6 +17,7 @@ from time import monotonic
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from collections import defaultdict
 from urllib.parse import urlparse, urlunparse
@@ -66,7 +67,7 @@ EMAIL_SUBJECT_PREFIX = os.environ.get("EMAIL_SUBJECT_PREFIX", "Interac Intellige
 MAX_MENTION_AGE_DAYS = int(os.environ.get("MAX_MENTION_AGE_DAYS", "120"))
 QUALITY_STRICT = os.environ.get("QUALITY_STRICT", "1") == "1"
 
-EST = timezone(timedelta(hours=-5))
+EASTERN_TZ = ZoneInfo("America/Toronto")
 
 subscribed_chats: set[int] = set()
 last_report: str = ""
@@ -107,7 +108,9 @@ def _cancel_active_tasks(*, exclude: asyncio.Task | None = None) -> int:
 
 
 def now_est() -> str:
-    return datetime.now(EST).strftime("%Y-%m-%d %I:%M %p EST")
+    now = datetime.now(EASTERN_TZ)
+    abbr = "EDT" if now.dst() else "EST"
+    return now.strftime(f"%Y-%m-%d %I:%M %p {abbr}")
 
 
 def check_rate_limit(user_id: int) -> tuple[bool, int]:
@@ -1516,8 +1519,19 @@ async def curate_with_kimi(raw_mentions: str) -> str:
 
 async def analyze_biweekly(mentions_text: str) -> str:
     """Run the universal biweekly scan analysis, inject prior memory for trend tracking."""
-    # Step 1: Kimi curation — filter raw mentions to real-person social signal
-    curated_mentions = await curate_with_kimi(mentions_text)
+    # Step 1: Kimi curation — curate only the e-Transfer sections.
+    # Competitor/market section bypasses curation so product news isn't filtered out.
+    competitor_marker = "=== COMPETITOR INTELLIGENCE"
+    if competitor_marker in mentions_text:
+        split_idx = mentions_text.index(competitor_marker)
+        etransfer_part = mentions_text[:split_idx]
+        competitor_part = mentions_text[split_idx:]
+    else:
+        etransfer_part = mentions_text
+        competitor_part = ""
+
+    curated_etransfer = await curate_with_kimi(etransfer_part)
+    curated_mentions = curated_etransfer + ("\n\n" + competitor_part if competitor_part else "")
 
     config = load_prompts()
     prompt = config["biweekly_prompt"].replace("{timestamp}", now_est())

@@ -35,7 +35,7 @@ Do not use competitor sources for e-Transfer Chatter, and do not use e-Transfer 
 10. **Relevance filter for e-Transfer Chatter**: Only include a bullet if the source text explicitly mentions e-Transfer, Interac, auto-deposit, or a specific product behaviour (transfer limits, fees, holds, fraud, delays). Skip results that mention money or banking only in a general way.
 11. **Source quality for Market Pulse**: Prefer Reddit posts, X/Twitter, and independent news for community reactions. Company blog posts or press releases are acceptable only if they describe a concrete product launch, pricing change, acquisition, or new market entry — not generic marketing copy.
 12. **Market Pulse diversity**: Cover the full landscape — Wise, PayPal, Apple Pay, Google Pay, Wealthsimple Cash, KOHO, Revolut, Neo Financial, Venmo, Zelle, Square, Stripe, and any emerging Canadian fintech. Include at most 2 bullets per brand. Do not let any single company dominate the section.
-13. **Quality floor (strict)**: Only include a bullet if it has concrete, product-level evidence (specific user experience, launch/update, pricing/fee detail, or operational behavior). Skip vague questions, generic opinions, and low-information chatter. If fewer than 2 strong items remain for a section, output exactly: Nothing notable this scan.
+13. **Quality floor**: For e-Transfer Chatter, skip purely vague or off-topic posts. For Market Pulse, include anything substantive about a payment product — a community opinion, a news item, a feature mention, or a user experience all count. If data is thin, include what you have and keep it short. Only output "Nothing notable this scan" if the section truly has zero relevant content.
 
 ---
 

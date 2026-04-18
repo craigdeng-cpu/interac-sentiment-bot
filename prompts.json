@@ -11,20 +11,13 @@
     "curation_prompt": "prompts/curation_prompt.md"
   },
   "etransfer_queries": [
-    "e-Transfer complaint OR delay OR problem OR issue site:reddit.com/r/personalfinancecanada",
-    "e-Transfer limit OR hold OR declined OR pending site:reddit.com/r/personalfinancecanada",
-    "Interac e-Transfer fraud OR scam OR broken site:reddit.com/r/personalfinancecanada",
-    "e-Transfer site:reddit.com/r/canada",
-    "e-Transfer site:reddit.com/r/ontario",
-    "e-Transfer site:reddit.com/r/toronto",
-    "Interac e-Transfer fraud OR scam site:reddit.com/r/Scams",
-    "Interac e-Transfer issue OR help site:reddit.com/r/legaladvicecanada",
-    "e-Transfer site:reddit.com/r/frugalcanada",
-    "Interac e-Transfer Canada problem OR complaint OR frustrated 2025 OR 2026",
-    "e-Transfer site:forums.redflagdeals.com",
-    "interac e-transfer site:x.com",
-    "e-transfer scam OR fraud site:x.com",
-    "e-transfer hold OR declined OR pending site:x.com"
+    "Interac e-Transfer problem OR complaint OR delay Canada",
+    "Interac e-Transfer fraud OR scam Canada",
+    "e-Transfer hold OR declined OR pending Canada",
+    "Interac e-Transfer limit OR issue Canada",
+    "e-Transfer Canada news 2025 OR 2026",
+    "Interac e-Transfer fee OR policy change Canada",
+    "e-Transfer site:forums.redflagdeals.com"
   ],
   "competitor_queries": [
     "PayPal new feature OR launch OR update canada 2025 OR 2026",
