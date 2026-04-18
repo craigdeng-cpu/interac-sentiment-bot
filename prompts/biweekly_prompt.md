@@ -12,9 +12,9 @@ The raw data has three labelled sections — use them strictly as mapped:
 
 - **=== e-TRANSFER COMMUNITY ===** → source material for "e-Transfer Chatter"
 - **=== e-TRANSFER NEWS ===** → additional source material for "e-Transfer Chatter"
-- **=== COMPETITOR INTELLIGENCE ===** → source material for "Competitor Landscape"
+- **=== COMPETITOR INTELLIGENCE ===** → source material for "Social Comparisons"
 
-Do not use competitor sources for e-Transfer Chatter, and do not use e-Transfer sources for Competitor Landscape.
+Do not use competitor sources for e-Transfer Chatter, and do not use e-Transfer sources for Social Comparisons.
 
 ---
 
@@ -32,8 +32,8 @@ Do not use competitor sources for e-Transfer Chatter, and do not use e-Transfer 
    - With date:    `- "quote or snippet" — Platform, Date. Source: URL`
    - Without date: `- "quote or snippet" — Platform. Source: URL`
 10. **Relevance filter for e-Transfer Chatter**: Only include a bullet if the source text explicitly mentions e-Transfer, Interac, auto-deposit, or a specific product behaviour (transfer limits, fees, holds, fraud, delays). Skip results that mention money or banking only in a general way.
-11. **Source quality for Competitor Landscape**: Prefer quotes from Reddit posts or independent news over content from the company's own website. If a source is the company's own blog or marketing page, only include it if it describes a concrete feature, product launch, or pricing change — not generic marketing language.
-12. **Competitor diversity**: Include at most 2 bullets per competitor brand in the Competitor Landscape section. If the input has more than 2 results for one company, pick the 2 most informative and skip the rest. Actively spread coverage across different companies — Wise, PayPal, Apple Pay, Google Pay, Wealthsimple Cash, KOHO, Revolut, Neo Financial, Venmo, and others. Do not let any single brand dominate the section.
+11. **Source quality for Social Comparisons**: Strongly prefer Reddit posts, X/Twitter posts, and forum comments where real people are speaking. Deprioritize or skip content from a company's own website unless it's being quoted by a real user. Press releases and marketing pages are not social comparisons.
+12. **Competitor diversity in Social Comparisons**: Include at most 2 bullets per competitor brand. Actively spread coverage across different alternatives — Wise, PayPal, Apple Pay, Google Pay, Wealthsimple Cash, KOHO, Revolut, Neo Financial, Venmo, and others. Do not let any single brand dominate the section.
 13. **Quality floor (strict)**: Only include a bullet if it has concrete, product-level evidence (specific user experience, launch/update, pricing/fee detail, or operational behavior). Skip vague questions, generic opinions, and low-information chatter. If fewer than 2 strong items remain for a section, output exactly: Nothing notable this scan.
 
 ---
@@ -47,8 +47,8 @@ SCAN DATE: {timestamp}
 e-Transfer Chatter:
 [Pain points, friction, confusion, fraud, and frustration from real people about e-Transfer. Source only from the e-TRANSFER COMMUNITY and e-TRANSFER NEWS sections. Apply the relevance filter (Rule 10). One bullet per quote or snippet. Format (with date): - "quote or snippet" — Platform, Date. Source: URL. Format (no date): - "quote or snippet" — Platform. Source: URL. If nothing found: Nothing notable this scan.]
 
-Competitor Landscape:
-[Source ONLY from the COMPETITOR INTELLIGENCE section. Cover the full range of competitors — Wise, PayPal, Apple Pay, Google Pay, Wealthsimple Cash, KOHO, Venmo, Zelle, ACH, Revolut, Neo Financial, Square, Stripe, or any other digital payment product. Include new features, product launches, positive user experiences, pricing changes, and adoption news. Do not focus on one company — distribute coverage across all relevant mentions. Prefer Reddit community reactions and independent news over company marketing sites. One bullet per mention. Format (with date): - "quote or snippet" — Platform, Date. Source: URL. Format (no date): - "quote or snippet" — Platform. Source: URL. If nothing found: Nothing notable this scan.]
+Social Comparisons:
+[Source ONLY from the COMPETITOR INTELLIGENCE section. Focus on social posts — Reddit, X/Twitter, forums — where real people discuss alternatives to e-Transfer or compare payment apps. Include: direct comparisons ("I switched from e-transfer to Wise because..."), user experiences with competing apps, community recommendations, and opinions about alternatives. Cover the full range — Wise, PayPal, Apple Pay, Google Pay, Wealthsimple Cash, KOHO, Venmo, Zelle, Revolut, Neo Financial, and others. Distribute across different brands. Do not include press releases or company marketing content. One bullet per mention. Format (with date): - "quote or snippet" — Platform, Date. Source: URL. Format (no date): - "quote or snippet" — Platform. Source: URL. If nothing found: Nothing notable this scan.]
 
 Trend vs Last Scan:
 - Still active: [comma-separated short theme labels from PREVIOUS SCAN CONTEXT that appear again in current data, or: none identified]
