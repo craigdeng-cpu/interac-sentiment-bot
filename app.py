@@ -1517,32 +1517,49 @@ async def curate_with_kimi(raw_mentions: str) -> str:
         return curated
 
 
+def _split_mentions_sections(mentions_text: str) -> tuple[str, str]:
+    """Split fetch output into (community_text, market_text).
+    community_text = e-TRANSFER COMMUNITY only (left side).
+    market_text = e-TRANSFER NEWS + COMPETITOR INTELLIGENCE (right side).
+    """
+    news_marker = "=== e-TRANSFER NEWS"
+    comp_marker = "=== COMPETITOR INTELLIGENCE"
+    community_text = mentions_text
+    market_text = ""
+    for marker in [news_marker, comp_marker]:
+        if marker in community_text:
+            idx = community_text.index(marker)
+            market_text = community_text[idx:] + ("\n\n" + market_text if market_text else "")
+            community_text = community_text[:idx]
+    return community_text.strip(), market_text.strip()
+
+
 async def analyze_biweekly(mentions_text: str) -> str:
-    """Run the universal biweekly scan analysis, inject prior memory for trend tracking."""
-    # No curation pass — Reddit community fetches are already targeted to the right
-    # subreddits and keywords; analysis Kimi handles final selection via biweekly_prompt rules.
-    curated_mentions = mentions_text
-
+    """Two independent Kimi calls — one per column — then combine into one report."""
     config = load_prompts()
-    prompt = config["biweekly_prompt"].replace("{timestamp}", now_est())
+    community_text, market_text = _split_mentions_sections(mentions_text)
 
-    # Inject previous scan context so the LLM can populate Trend vs Last Scan
-    prev_memory = _load_biweekly_memory()
-    user_content = curated_mentions
-    if prev_memory.get("last_scan_date"):
-        etransfer_themes = "; ".join(prev_memory.get("etransfer_themes", [])) or "none on record"
-        competitor_themes = "; ".join(prev_memory.get("competitor_themes", [])) or "none on record"
-        user_content += (
-            f"\n\n--- PREVIOUS SCAN CONTEXT (for Trend vs Last Scan section) ---\n"
-            f"Last scan date: {prev_memory['last_scan_date']}\n"
-            f"e-Transfer themes from last scan: {etransfer_themes}\n"
-            f"Competitor themes from last scan: {competitor_themes}\n"
-        )
+    chatter_prompt = config.get("etransfer_chatter_prompt", "")
+    market_prompt = config.get("market_pulse_prompt", "")
 
-    report = await call_kimi(prompt, user_content)
+    # Run both Kimi calls in parallel
+    chatter_task = asyncio.create_task(call_kimi(chatter_prompt, community_text)) if chatter_prompt else None
+    market_task = asyncio.create_task(call_kimi(market_prompt, market_text)) if market_prompt and market_text else None
 
-    # Persist memory and Excel after a successful analysis
+    chatter_bullets = await chatter_task if chatter_task else "Nothing notable this scan."
+    market_bullets = await market_task if market_task else "Nothing notable this scan."
+
     scan_date = now_est()
+    report = (
+        f"SCAN DATE: {scan_date}\n\n"
+        f"e-Transfer Chatter:\n{chatter_bullets.strip()}\n\n"
+        f"Market Pulse:\n{market_bullets.strip()}\n\n"
+        f"Trend vs Last Scan:\n"
+        f"- Still active: none identified\n"
+        f"- Went quiet: none identified\n"
+        f"- New this scan: none identified"
+    )
+
     themes = _extract_biweekly_themes(report)
     _save_biweekly_memory(themes, scan_date)
     _append_biweekly_excel(scan_date, report)
