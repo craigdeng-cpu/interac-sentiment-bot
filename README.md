@@ -1,5 +1,12 @@
 # Interac e-Transfer Intelligence Bot
 
+<p align="center">
+  <strong><a href="https://youtu.be/AN_Qa8JEs7I">Demo video — watch on YouTube</a></strong><br/>
+  <a href="https://youtu.be/AN_Qa8JEs7I">https://youtu.be/AN_Qa8JEs7I</a>
+</p>
+
+---
+
 Telegram bot that scans Reddit, X/Twitter, RedFlagDeals, and news for public sentiment and market signals around Interac e-Transfer and competing Canadian payment products. Runs a biweekly scan and delivers a two-column HTML email digest to stakeholders.
 
 ## What it does
