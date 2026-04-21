@@ -1,63 +1,97 @@
-# Interac Intelligence Bot
+# Interac e-Transfer Intelligence Bot
 
-Telegram bot for monitoring public sentiment and product signals related to Interac (e-Transfer, debit, competitors, customer complaints), with optional scheduled email digests and alerts.
+Telegram bot that scans Reddit, X/Twitter, RedFlagDeals, and news for public sentiment and market signals around Interac e-Transfer and competing Canadian payment products. Runs a biweekly scan and delivers a two-column HTML email digest to stakeholders.
 
-## Project goal
+## What it does
 
-This project is designed to give product/ops stakeholders a lightweight "market pulse":
+- Fetches public mentions via Reddit JSON API and DuckDuckGo (web, news, X/Twitter)
+- Routes results into two analysis tracks: community chatter and market intelligence
+- Runs two parallel Kimi AI calls to produce focused output for each track
+- Renders a styled two-column HTML email and sends it via SMTP or Resend
+- Also posts plain-text reports to subscribed Telegram chats
 
-- Pull fresh public mentions from web/news/social-style sources.
-- Summarize sentiment and key findings with Kimi.
-- Push updates automatically to subscribed Telegram chats.
-- Send email digests/alerts when configured.
-- Run historical deep dives across multiple time windows (`/deepscan`) for trend discovery.
-
-## Current architecture
+## Architecture
 
 - Runtime: Python 3.12 (`app.py`)
 - Chat interface: Telegram (`python-telegram-bot`)
-- Search provider: DuckDuckGo via `ddgs` (no Serper dependency)
-- LLM analysis: Moonshot Kimi API (`KIMI_API_KEY`)
-- Optional email delivery: SMTP or Resend
-- Deployment target: Railway (or any container host)
+- Search: DuckDuckGo (`ddgs`) + Reddit JSON API
+- LLM: Moonshot Kimi API (`KIMI_API_KEY`)
+- Email: SMTP or Resend
+- Deployment: Railway (any container host)
+- Timezone: `zoneinfo.ZoneInfo("America/Toronto")` — DST-aware
 
 ## Repository map
 
-- `app.py` - main application, handlers, schedulers, search, analysis, email rendering/sending.
-- `prompts.json` - runtime config for queries, thresholds, lookback, and prompt file paths.
-- `prompts/analysis_prompt.md` - daily scan analysis prompt.
-- `prompts/followup_prompt.md` - follow-up Q&A prompt (chat replies to plain text messages).
-- `prompts/historical_prompt.md` - historical deep scan prompt.
-- `requirements.txt` - Python dependencies.
-- `Dockerfile` / `Procfile` - deployment entrypoints.
-- `manifest.json` - legacy Teams manifest artifact (not used by current Telegram runtime).
+```
+app.py                          main application (handlers, fetch, analysis, email)
+prompts.json                    query lists, source toggles, prompt file paths
+prompts/
+  etransfer_chatter_prompt.md   left-column prompt: community chatter (Reddit/X/forums)
+  market_pulse_prompt.md        right-column prompt: competitor and ecosystem news
+  biweekly_prompt.md            legacy combined prompt (registered but not used in main scan)
+  curation_prompt.md            curation pass prompt (written but currently bypassed)
+  followup_prompt.md            Q&A follow-up prompt (plain text messages in Telegram)
+  prompt_recipe.md              prompt-engineering notes and rationale
+requirements.txt
+Dockerfile / Procfile
+```
 
 ## Commands
 
-User commands:
+Public:
 
-- `/start` or `/help` - command overview and auto-subscribe current chat.
-- `/subscribe` - subscribe this chat to scheduled broadcasts.
-- `/unsubscribe` - stop scheduled broadcasts for this chat.
-- `/status` - runtime/schedule/status snapshot.
-- `/scan` - run immediate daily scan.
-- `/raw` - show raw mention payload from last scan.
-- `/prompt` - show query/source config summary.
-- any plain text message - follow-up question over latest report context.
+| Command | What it does |
+|---|---|
+| `/start` or `/help` | Command overview + auto-subscribe |
+| `/subscribe` | Subscribe this chat to biweekly broadcasts |
+| `/unsubscribe` | Stop scheduled broadcasts |
+| `/status` | Runtime/schedule/config snapshot |
+| `/scan` | Run biweekly scan immediately |
+| `/raw` | Show raw mention payload from last scan |
+| `/prompt` | Show query/source config summary |
+| plain text | Follow-up question against latest report context |
 
-Admin-only commands (`ADMIN_IDS`):
+Admin only (`ADMIN_IDS`):
 
-- `/email` - run fresh daily scan and send email immediately (60s timeout).
-- `/deepscan` - run historical scan + analysis + email (with diagnostics).
-- `/smtpcheck` - validate current email provider config/connectivity.
+| Command | What it does |
+|---|---|
+| `/email` | Run biweekly scan and send email now |
+| `/smtpcheck` | Validate email provider config/connectivity |
+| `/stop` | Cancel active running tasks |
 
-## Scheduled behavior
+## Data pipeline
 
-Defined in `app.py` job queue:
+```
+fetch_biweekly_mentions()
+  ├── Reddit JSON API (r/personalfinancecanada, r/canada, r/ontario, etc.)
+  │     etransfer_queries + competitor_queries
+  ├── DDG text + news + X/Twitter per query
+  │     (unrestricted queries only — site: queries skip news/Twitter)
+  └── Results routed by _classify_channel_and_source() into:
+        === e-TRANSFER COMMUNITY ===   (Reddit/forum social posts)
+        === e-TRANSFER NEWS ===        (press, news articles)
+        === COMPETITOR INTELLIGENCE === (competitor mentions)
 
-- Daily sentiment scans at 6am, 10am, 2pm, 6pm EST.
-- Weekly email digest at `EMAIL_WEEKLY_DAY` + `EMAIL_WEEKLY_HOUR` (EST).
-  - Implemented via daily trigger + in-function guard for compatibility.
+_split_mentions_sections()
+  ├── community_text  → etransfer_chatter_prompt.md  → Kimi call A
+  └── market_text     → market_pulse_prompt.md        → Kimi call B
+       (both run in parallel via asyncio.create_task)
+
+analyze_biweekly() assembles report:
+  SCAN DATE / e-Transfer Chatter / Market Pulse / Trend vs Last Scan
+```
+
+## Email layout
+
+1200px wide, table-based, inline CSS, webmail-safe.
+
+| Area | Detail |
+|---|---|
+| Header | Navy `#0f1f47` + 4px gold `#fdb913` border, scan timestamp |
+| Left column | "PAIN POINTS" eyebrow `#c4320a`, "e-Transfer Chatter" — real user quotes from Reddit/forums |
+| Right column | "MARKET PULSE" eyebrow `#5925DC`, "Payments Landscape" — product news, launches, competitive updates |
+| Quote card | Left border in platform color, quote text 13px, meta row: badge pill + date + source domain link |
+| Platform badges | Reddit `#FF4500`, X/Twitter `#1a1a1a`, news `#1a73e8` — community sources only |
 
 ## Configuration
 
@@ -68,7 +102,7 @@ TELEGRAM_TOKEN=<telegram bot token>
 KIMI_API_KEY=<moonshot kimi api key>
 ```
 
-### Common optional environment variables
+### Common optional
 
 ```bash
 KIMI_API_URL=https://api.moonshot.ai/v1/chat/completions
@@ -79,79 +113,46 @@ ADMIN_IDS=123456789,987654321
 DAILY_LIMIT=5
 ```
 
-### Email configuration (optional)
-
-Core toggles:
+### Email
 
 ```bash
 EMAIL_ENABLED=1
 EMAIL_PROVIDER=smtp            # smtp | resend
-EMAIL_SEND_MODE=alert          # alert | weekly | always | weekly,alert
-EMAIL_ALERT_DEDUP=1
-EMAIL_COOLDOWN_MINUTES=0
+EMAIL_SEND_MODE=weekly         # alert | weekly | always | weekly,alert
 EMAIL_WEEKLY_DAY=monday
 EMAIL_WEEKLY_HOUR=9
-ALERT_HIGH_THRESHOLD=85
 EMAIL_FROM=you@example.com
 EMAIL_TO=you@example.com,team@example.com
 EMAIL_SUBJECT_PREFIX=Interac Intelligence
 ```
 
-SMTP provider:
-
+SMTP:
 ```bash
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
 SMTP_USERNAME=you@gmail.com
-SMTP_PASSWORD=<app-password>
+SMTP_PASSWORD=<app-password>   # Gmail requires App Password
 ```
 
-Resend provider:
-
+Resend:
 ```bash
 RESEND_API_KEY=re_xxxxxxxxx
 RESEND_API_URL=https://api.resend.com/emails
 ```
 
-Notes:
+### `prompts.json` keys
 
-- Gmail requires an App Password (not normal account password).
-- Port `587` uses STARTTLS, port `465` uses implicit SSL.
-- Email dedup/cooldown state is in-memory (resets on restart/redeploy).
+```json
+{
+  "sources":          { "reddit": true, "news": true, "forums": true, "twitter": true },
+  "prompt_files":     { "etransfer_chatter_prompt": "...", "market_pulse_prompt": "...", ... },
+  "etransfer_queries": [ ... ],   // unrestricted — DDG fires text + news + Twitter per query
+  "competitor_queries": [ ... ],  // product launches, pricing, fintech Canada
+  "timezone":         "US/Eastern"
+}
+```
 
-## Prompt + query configuration
-
-Prompt text lives in markdown files:
-
-- `prompts/analysis_prompt.md`
-- `prompts/followup_prompt.md`
-- `prompts/historical_prompt.md`
-
-Operational config lives in `prompts.json`:
-
-- `data_queries` - daily scan query groups
-- `historical_queries` - `/deepscan` query groups/time windows
-- `sources` - source toggles (`reddit`, `news`, `forums`, `twitter`)
-- `alert_threshold` - low sentiment threshold
-- `lookback_hours` - daily scan recency
-- result caps (`max_mentions_per_source`, `historical_max_mentions_per_source`)
-
-## Daily vs historical reports
-
-- Daily scan (`/scan` + scheduled job):
-  - fast monitoring view
-  - sentiment score extraction (`SENTIMENT SCORE`)
-  - alert/spike logic tied to thresholds
-- Historical scan (`/deepscan`):
-  - grouped into RECENT, MEDIUM, OLDER windows
-  - designed for recurring-theme and longer-horizon insight
-  - includes pre-analysis search diagnostic and raw mention counts
-
-Email rendering is mode-aware:
-
-- Daily reports -> daily template
-- Historical reports -> historical template
-- If parsing markers are missing -> styled raw-report fallback
+Note: queries with `site:` restrictions skip DDG news and Twitter follow-ups. Keep `etransfer_queries` unrestricted for full source coverage. Reddit content is handled separately by the Reddit API step.
 
 ## Local run
 
@@ -164,29 +165,19 @@ export KIMI_API_KEY=...
 python app.py
 ```
 
-By default, bot runs in polling mode. Set `WEBHOOK_URL` to use webhook mode (`/webhook` path).
+Set `WEBHOOK_URL` to use webhook mode instead of polling.
 
 ## Railway deploy
 
 1. Push repo to GitHub.
-2. In Railway: New Project -> Deploy from GitHub.
+2. Railway: New Project → Deploy from GitHub.
 3. Add env vars (at minimum `TELEGRAM_TOKEN`, `KIMI_API_KEY`).
-4. Ensure service port is `3978` (default already handled by app env).
-5. Deploy and verify with Telegram `/status`.
+4. Default port is `3978`.
+5. Verify with Telegram `/status`.
 
 ## Known limitations
 
-- Subscription state, latest report context, rate-limit counters, and email dedup state are in-memory only.
-- No persistence layer yet (Redis/Postgres recommended for production durability).
-- `manifest.json` is legacy metadata; current runtime is Telegram-first.
-
-## Troubleshooting
-
-- `/deepscan` says search provider failed:
-  - run again and inspect diagnostic line in Telegram response.
-- Emails not sending:
-  - run `/smtpcheck` and verify provider-specific env vars.
-- No useful findings:
-  - tune `prompts/historical_prompt.md` and `historical_queries` in `prompts.json`.
-- Bot responds but no scheduled pushes:
-  - ensure the chat used `/subscribe`.
+- Subscription state, last report, and rate-limit counters are in-memory (reset on restart).
+- No persistence layer (Redis/Postgres recommended for production durability).
+- DDG search quality depends on upstream indexing — X/Twitter results can be sparse.
+- `manifest.json` is a legacy Teams artifact and is not used.
