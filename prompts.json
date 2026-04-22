@@ -19,7 +19,11 @@
     "Interac e-Transfer limit OR issue Canada",
     "e-Transfer Canada news 2025 OR 2026",
     "Interac e-Transfer fee OR policy change Canada",
-    "e-Transfer site:forums.redflagdeals.com"
+    "e-Transfer site:forums.redflagdeals.com",
+    "Interac e-Transfer site:reddit.com/r/personalfinancecanada",
+    "e-transfer fraud OR scam OR stolen site:reddit.com",
+    "e-transfer declined OR hold OR pending site:reddit.com/r/personalfinancecanada",
+    "interac e-transfer issue OR problem site:reddit.com/r/canada"
   ],
   "competitor_queries": [
     "PayPal new feature OR launch OR update canada 2025 OR 2026",

@@ -967,19 +967,26 @@ async def _search_twitter_io(query: str, max_results: int = 10) -> list[dict]:
 
         if not text or not url:
             continue
-        # Skip very short tweets — no context
-        if len(text) < 60:
+        # Skip short tweets — not enough context to be useful
+        if len(text) < 80:
             continue
         # Skip promotional content
         if _PROMO_RE.search(text):
             continue
-        # Skip zero-engagement tweets with no personal voice — likely bots or noise
+
         likes = tweet.get("likeCount") or 0
         retweets = tweet.get("retweetCount") or 0
         views = tweet.get("viewCount") or 0
-        has_engagement = (likes + retweets) > 0 or views >= 500
-        has_personal_voice = bool(_PRONOUN_RE.search(text))
-        if not has_engagement and not has_personal_voice:
+
+        # Require at least ONE strong signal — must be more than a passing mention:
+        # (a) real engagement (3+ likes/retweets — filters bots and zero-reach posts)
+        # (b) a dollar amount — signals a real personal financial experience
+        # (c) a pain/signal word — fraud, scam, declined, hold, etc.
+        has_real_engagement = (likes + retweets) >= 3
+        has_dollar = bool(_DOLLAR_AMOUNT_RE.search(text))
+        has_signal_word = any(tok in text.lower() for tok in _ETRANSFER_SIGNAL_TOKENS
+                              if tok not in ("e-transfer", "etransfer", "interac"))
+        if not (has_real_engagement or has_dollar or has_signal_word):
             continue
 
         results.append({

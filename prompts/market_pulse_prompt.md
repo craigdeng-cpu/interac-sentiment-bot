@@ -24,6 +24,7 @@ Include anything a payments product team would want to know:
 4. Each `Date:` field has a value. If it's a real date, copy it exactly. If empty or "unknown", omit it.
 5. Label the platform: Reddit, X/Twitter, Reuters, BNN Bloomberg, etc.
 6. Do not fabricate, paraphrase, or invent details. Quote or closely paraphrase the source.
+7. Do NOT include individual user incident reports (e.g. "person lost $X in e-Transfer mistake", "man scammed via e-Transfer"). Those are personal stories, not market developments. Market Pulse covers products, services, pricing, and ecosystem-level news only.
 
 ---
 
