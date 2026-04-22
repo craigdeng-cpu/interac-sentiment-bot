@@ -66,6 +66,8 @@ EMAIL_TO = [x.strip() for x in os.environ.get("EMAIL_TO", "").split(",") if x.st
 EMAIL_SUBJECT_PREFIX = os.environ.get("EMAIL_SUBJECT_PREFIX", "Interac Intelligence")
 MAX_MENTION_AGE_DAYS = int(os.environ.get("MAX_MENTION_AGE_DAYS", "120"))
 QUALITY_STRICT = os.environ.get("QUALITY_STRICT", "1") == "1"
+TWITTERAPI_IO_KEY = os.environ.get("TWITTERAPI_IO_KEY", "")
+TWITTERAPI_IO_URL = "https://api.twitterapi.io/twitter/tweet/advanced_search"
 
 EASTERN_TZ = ZoneInfo("America/Toronto")
 
@@ -863,8 +865,48 @@ async def web_search(
     return results
 
 
+async def _search_twitter_io(query: str, max_results: int = 10) -> list[dict]:
+    """Search X/Twitter via twitterapi.io. Returns [] if key not set or on error."""
+    if not TWITTERAPI_IO_KEY:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                TWITTERAPI_IO_URL,
+                params={"query": query, "queryType": "Latest"},
+                headers={"x-api-key": TWITTERAPI_IO_KEY},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        logger.warning(f"[twitterapi.io] request failed for '{query}': {e}")
+        return []
+
+    results = []
+    for tweet in (data.get("tweets") or [])[:max_results]:
+        text = (tweet.get("text") or "").strip()
+        url = (tweet.get("url") or "").strip()
+        created_at = (tweet.get("createdAt") or "").strip()
+        author = tweet.get("author") or {}
+        username = author.get("userName") or author.get("name") or ""
+        if not text or not url:
+            continue
+        results.append({
+            "title": f"Tweet by @{username}" if username else "Tweet",
+            "snippet": text,
+            "link": url,
+            "date": _resolve_relative_date(created_at) if created_at else "",
+            "source": "X/Twitter",
+        })
+    return results
+
+
 async def search_twitter(query: str, max_results: int = 5, tbs: str = "qdr:w") -> list[dict]:
-    """Search X/Twitter via DDG. Skips if query already has a site: restriction."""
+    """Search X/Twitter. Uses twitterapi.io if key is set, otherwise falls back to DDG."""
+    # Prefer real Twitter API when available
+    if TWITTERAPI_IO_KEY:
+        return await _search_twitter_io(query, max_results=max_results)
+    # DDG fallback — skips if query already has a site: restriction
     if _has_site_restriction(query):
         return []
     base_results = await web_search(
@@ -2452,6 +2494,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_admin = "✅" if update.effective_user.id in ADMIN_IDS else "❌"
     resend_key_hint = f"✅ set ({RESEND_API_KEY[:6]}...)" if RESEND_API_KEY else "❌ missing"
     kimi_key_hint = f"✅ set ({KIMI_API_KEY[:6]}...)" if KIMI_API_KEY else "❌ missing"
+    twitter_key_hint = f"✅ twitterapi.io ({TWITTERAPI_IO_KEY[:6]}...)" if TWITTERAPI_IO_KEY else "⚠️ DDG fallback"
     await update.message.reply_text(
         f"✅ Bot running — {now_est()}\n"
         f"Search provider: DuckDuckGo (ddgs)\n"
@@ -2462,6 +2505,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Email provider: {EMAIL_PROVIDER}\n"
         f"Resend key: {resend_key_hint}\n"
         f"Kimi key: {kimi_key_hint}\n"
+        f"Twitter: {twitter_key_hint}\n"
         f"Email from: {EMAIL_FROM or '❌ missing'}\n"
         f"Email to: {EMAIL_TO or '❌ missing'}\n"
         f"Admin: {is_admin}\n"
