@@ -47,7 +47,7 @@ Include an item if it reports a **concrete market development** relevant to digi
 3. For `Date`: copy the date exactly if it's a real date. If the field is empty or says "unknown", omit the date entirely.
 4. For `Source`: use the URL from the `URL:` field.
 5. For platform label: use the source name from the first line of each item (e.g., Reddit, X/Twitter, Reuters, BNN Bloomberg).
-6. Spread across source types — mix news articles, Reddit posts, and X/Twitter content. Do not let any single source type take more than half the bullets.
+6. **Source mix — you decide.** Mix news articles, Reddit posts, and X/Twitter reactions. Do not let any single source type take more than half the bullets. Reddit and Twitter reactions to competitor products are as valuable as news articles — a Reddit thread of Canadians switching to Wise is market intelligence. Include social posts when they carry real signal.
 7. Maximum 2 bullets per brand/company.
 
 ---

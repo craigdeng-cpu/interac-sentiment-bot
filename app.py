@@ -1589,24 +1589,48 @@ async def fetch_biweekly_mentions() -> str:
     def _is_twitter(m: dict) -> bool:
         return m.get("source") == "X/Twitter"
 
-    # Pure quality sort — no artificial source caps. Best items win regardless of platform.
-    # Score each platform's mentions independently first (for logging visibility), then merge.
-    reddit_scored  = [(m, _mention_quality_score(m, "etransfer")) for m in etransfer_social if _is_reddit(m)]
-    twitter_scored = [(m, _mention_quality_score(m, "etransfer")) for m in etransfer_social if _is_twitter(m)]
-    other_scored   = [(m, _mention_quality_score(m, "etransfer")) for m in etransfer_social
-                      if not _is_reddit(m) and not _is_twitter(m)]
+    # Quality-first sort with soft platform floor.
+    # Step 1: score everything, sort by quality, take top 35.
+    # Step 2: if Reddit or Twitter has fewer than PLATFORM_FLOOR posts in the top 35,
+    #         pull in the best remaining posts from that platform to reach the floor.
+    # This ensures Kimi always has both platforms to evaluate — Kimi then decides
+    # which posts actually make the final bullets.
+    PLATFORM_FLOOR = 3  # minimum posts per platform sent to Kimi
+
+    reddit_scored  = sorted(
+        [(m, _mention_quality_score(m, "etransfer")) for m in etransfer_social if _is_reddit(m)],
+        key=lambda x: x[1], reverse=True,
+    )
+    twitter_scored = sorted(
+        [(m, _mention_quality_score(m, "etransfer")) for m in etransfer_social if _is_twitter(m)],
+        key=lambda x: x[1], reverse=True,
+    )
+    other_scored   = sorted(
+        [(m, _mention_quality_score(m, "etransfer")) for m in etransfer_social
+         if not _is_reddit(m) and not _is_twitter(m)],
+        key=lambda x: x[1], reverse=True,
+    )
 
     all_scored = reddit_scored + twitter_scored + other_scored
     all_scored.sort(key=lambda x: x[1], reverse=True)
-    etransfer_social = [m for m, _ in all_scored[:40]]
+    top_pool = [m for m, _ in all_scored[:35]]
+    top_pool_set = set(id(m) for m in top_pool)
+
+    # Soft floor: guarantee each platform reaches PLATFORM_FLOOR in what Kimi sees
+    for platform_pool in (reddit_scored, twitter_scored):
+        in_pool = sum(1 for m in top_pool if id(m) in set(id(p) for p, _ in platform_pool))
+        if in_pool < PLATFORM_FLOOR:
+            needed = PLATFORM_FLOOR - in_pool
+            extras = [m for m, _ in platform_pool if id(m) not in top_pool_set][:needed]
+            top_pool += extras
+            top_pool_set.update(id(m) for m in extras)
+
+    etransfer_social = top_pool
 
     logger.info(
-        f"[quality-sort] reddit={len(reddit_scored)} "
-        f"twitter={len(twitter_scored)} "
-        f"other={len(other_scored)} "
-        f"→ top-40 kept={len(etransfer_social)} "
-        f"(platform breakdown in top-40: "
-        f"reddit={sum(1 for m in etransfer_social if _is_reddit(m))}, "
+        f"[quality-sort] scored: reddit={len(reddit_scored)} twitter={len(twitter_scored)} other={len(other_scored)} "
+        f"→ pool={len(etransfer_social)} "
+        f"(reddit={sum(1 for m in etransfer_social if _is_reddit(m))}, "
         f"twitter={sum(1 for m in etransfer_social if _is_twitter(m))}, "
         f"other={sum(1 for m in etransfer_social if not _is_reddit(m) and not _is_twitter(m))})"
     )

@@ -46,7 +46,7 @@ Include a post if it contains a **specific personal experience** with e-Transfer
 3. For `Date`: copy the date exactly if it's a real date (e.g., "April 3, 2026"). If the field is empty or says "unknown", omit the date entirely.
 4. For `Source`: use the URL from the `URL:` field.
 5. For platform label: use the source name from the first line of each item (e.g., Reddit, X/Twitter, RedFlagDeals).
-6. Spread across platforms where quality posts exist on multiple platforms.
+6. **Platform mix — you decide.** You will receive posts from Reddit, X/Twitter, and forums. Prioritize the best posts regardless of platform. If Reddit has exceptional content this scan, let it dominate. If a Twitter post is more insightful than a Reddit post on the same theme, pick the Twitter post. However — do not ignore a platform entirely unless its posts genuinely add nothing. If you have at least one strong post from X/Twitter and at least one from Reddit, include both. Quality beats diversity, but diversity is the tiebreaker.
 
 ---
 
