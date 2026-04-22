@@ -34,4 +34,4 @@ Output bullets only — no section headers, no introduction, no commentary.
 Format with date:    - "quote or snippet" — Platform, Date. Source: URL
 Format without date: - "quote or snippet" — Platform. Source: URL
 
-Aim for 4–6 bullets. If fewer items exist, include what you have. Only write "Nothing notable this scan." if there is truly nothing relevant.
+Aim for 6–8 bullets. Cast a wide net — include product news, community reactions, pricing updates, partnerships, and ecosystem developments. If the data supports more, include up to 10. Only write "Nothing notable this scan." if there is truly nothing relevant.

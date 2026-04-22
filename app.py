@@ -754,6 +754,11 @@ _ETRANSFER_SIGNAL_TOKENS = [
     "e-transfer", "etransfer", "interac", "auto-deposit", "autodeposit",
     "fraud", "scam", "hold", "pending", "declined", "limit", "delay", "reversal",
 ]
+_CANADIAN_BANK_NAMES = [
+    "td bank", "rbc", "scotiabank", "bmo", "cibc", "national bank",
+    "tangerine", "eq bank", "simplii", "desjardins", "hsbc canada",
+]
+_DOLLAR_AMOUNT_RE = re.compile(r"\$\s*\d[\d,]*")
 _COMPETITOR_BRANDS = [
     "wise", "paypal", "wealthsimple", "koho", "apple pay", "google pay",
     "revolut", "neo financial", "venmo", "zelle", "cash app", "square", "stripe",
@@ -768,7 +773,12 @@ _LOW_SIGNAL_PATTERNS = [
 
 
 def _mention_quality_score(mention: dict, section: str) -> float:
-    """Score mention quality deterministically before sending to the LLM."""
+    """Score mention quality using platform-specific signals, normalized to a common scale.
+
+    Reddit:  upvotes (capped 500) + comments (capped 100) → 0–4 pts
+    Twitter: (likes + retweets×2 + replies) (capped 1000) → 0–4 pts
+    Both:    snippet length, keyword signals, dollar amounts, bank names
+    """
     text = " ".join(
         [
             mention.get("title", ""),
@@ -785,14 +795,43 @@ def _mention_quality_score(mention: dict, section: str) -> float:
     elif source_tier == "tier2_reported":
         score += 1.0
 
+    # ── Platform-specific engagement signals (normalized to 0–4 pts each) ──
     if "reddit.com" in link:
-        score += min(float(mention.get("score", 0)), 20.0) / 5.0
-        score += min(float(mention.get("num_comments", 0)), 30.0) / 15.0
+        # Upvotes: community validation. Cap at 500 (most viral posts).
+        upvotes = min(float(mention.get("score", 0)), 500.0)
+        score += (upvotes / 500.0) * 3.0
+        # Comments: depth of discussion. Cap at 100.
+        comments = min(float(mention.get("num_comments", 0)), 100.0)
+        score += (comments / 100.0) * 1.0
 
+    elif mention.get("source") == "X/Twitter":
+        # Likes + retweets (2× weight — retweet = active amplification) + replies.
+        # Cap at 1000 total weighted engagement.
+        likes = mention.get("_likes") or mention.get("_engagement") or 0
+        retweets = mention.get("_retweets") or 0
+        replies = mention.get("_replies") or 0
+        weighted = min(float(likes + retweets * 2 + replies), 1000.0)
+        score += (weighted / 1000.0) * 3.0
+        # Views: weak signal (passive), only helps if very high (>10k)
+        views = mention.get("_views") or 0
+        if views >= 10000:
+            score += 0.5
+        elif views >= 1000:
+            score += 0.2
+
+    # ── Content quality signals (platform-neutral) ──
     snippet_len = len((mention.get("snippet", "") or "").strip())
     if snippet_len >= 90:
         score += 1.0
-    if snippet_len >= 180:
+    if snippet_len >= 200:
+        score += 0.5
+
+    # Dollar amounts signal a real personal experience (e.g. "my $2,400 transfer")
+    if _DOLLAR_AMOUNT_RE.search(text):
+        score += 1.0
+
+    # Canadian bank names signal relevant context
+    if any(bank in text for bank in _CANADIAN_BANK_NAMES):
         score += 0.5
 
     if any(p in text for p in _LOW_SIGNAL_PATTERNS):
@@ -907,21 +946,53 @@ async def _search_twitter_io(query: str, max_results: int = 10) -> list[dict]:
         logger.warning(f"[twitterapi.io] request failed for '{query}': {e}")
         return []
 
+    _PROMO_RE = re.compile(
+        r"\b(sign up|download|click here|visit us|check out|get started|"
+        r"use code|promo|discount|affiliate|refer a friend|sign-up bonus)\b",
+        re.IGNORECASE,
+    )
+    _PRONOUN_RE = re.compile(
+        r"\b(i|my|me|we|our|i've|i'm|i'd|i'll|we've|we're)\b", re.IGNORECASE
+    )
+
     results = []
-    for tweet in (data.get("tweets") or [])[:max_results]:
+    for tweet in (data.get("tweets") or []):
+        if len(results) >= max_results:
+            break
         text = (tweet.get("text") or "").strip()
         url = (tweet.get("url") or "").strip()
         created_at = (tweet.get("createdAt") or "").strip()
         author = tweet.get("author") or {}
         username = author.get("userName") or author.get("name") or ""
+
         if not text or not url:
             continue
+        # Skip very short tweets — no context
+        if len(text) < 60:
+            continue
+        # Skip promotional content
+        if _PROMO_RE.search(text):
+            continue
+        # Skip zero-engagement tweets with no personal voice — likely bots or noise
+        likes = tweet.get("likeCount") or 0
+        retweets = tweet.get("retweetCount") or 0
+        views = tweet.get("viewCount") or 0
+        has_engagement = (likes + retweets) > 0 or views >= 500
+        has_personal_voice = bool(_PRONOUN_RE.search(text))
+        if not has_engagement and not has_personal_voice:
+            continue
+
         results.append({
             "title": f"Tweet by @{username}" if username else "Tweet",
             "snippet": text,
             "link": url,
             "date": _resolve_relative_date(created_at) if created_at else "",
             "source": "X/Twitter",
+            "_likes": likes,
+            "_retweets": retweets,
+            "_replies": tweet.get("replyCount") or 0,
+            "_views": tweet.get("viewCount") or 0,
+            "_engagement": likes + retweets,  # kept for backwards compat
         })
     return results
 
@@ -1407,7 +1478,7 @@ async def fetch_biweekly_mentions() -> str:
     # Use qdr:y so product launches and updates from the past year are captured.
     for query in competitor_ddg_queries:
         for search_type, tbs in [("search", "qdr:y"), ("news", "qdr:y")]:
-            results = await web_search(query, search_type, 8, tbs=tbs)
+            results = await web_search(query, search_type, 12, tbs=tbs)
             for r in results:
                 link = r.get("link", "")
                 if not link or link in seen_links or _is_blocked_domain(link):
@@ -1436,6 +1507,13 @@ async def fetch_biweekly_mentions() -> str:
     all_mentions = etransfer_social + etransfer_press + competitor_mentions
     await _enrich_dates_from_reddit_json(all_mentions, max_fetches=40)
     await _enrich_dates_from_meta(all_mentions, max_fetches=80)
+
+    # Sort social pool by unified quality score — platform-neutral, signal-driven.
+    # Reddit upvotes/comments and Twitter likes/retweets/replies are each normalized
+    # to the same 0–4 pt range so neither platform dominates on raw volume alone.
+    etransfer_social.sort(
+        key=lambda m: _mention_quality_score(m, "etransfer"), reverse=True
+    )
 
     # Make recency decisions only on dated content to avoid stale/undated drift.
     etransfer_social = _filter_recent_dated_mentions(
