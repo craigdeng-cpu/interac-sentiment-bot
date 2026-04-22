@@ -2450,6 +2450,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     memory = _load_biweekly_memory()
     last_scan = memory.get("last_scan_date", "never")
     is_admin = "✅" if update.effective_user.id in ADMIN_IDS else "❌"
+    resend_key_hint = f"✅ set ({RESEND_API_KEY[:6]}...)" if RESEND_API_KEY else "❌ missing"
+    kimi_key_hint = f"✅ set ({KIMI_API_KEY[:6]}...)" if KIMI_API_KEY else "❌ missing"
     await update.message.reply_text(
         f"✅ Bot running — {now_est()}\n"
         f"Search provider: DuckDuckGo (ddgs)\n"
@@ -2457,6 +2459,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Last biweekly scan: {last_scan}\n"
         f"Schedule: daily check at 9am EST, runs every 14 days\n"
         f"Subscribed chats: {len(subscribed_chats)}\n"
+        f"Email provider: {EMAIL_PROVIDER}\n"
+        f"Resend key: {resend_key_hint}\n"
+        f"Kimi key: {kimi_key_hint}\n"
+        f"Email from: {EMAIL_FROM or '❌ missing'}\n"
+        f"Email to: {EMAIL_TO or '❌ missing'}\n"
         f"Admin: {is_admin}\n"
         f"Your ID: `{update.effective_user.id}`"
     )
