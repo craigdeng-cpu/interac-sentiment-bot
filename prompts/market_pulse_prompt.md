@@ -25,6 +25,8 @@ Include anything a payments product team would want to know:
 5. Label the platform: Reddit, X/Twitter, Reuters, BNN Bloomberg, etc.
 6. Do not fabricate, paraphrase, or invent details. Quote or closely paraphrase the source.
 7. Do NOT include individual user incident reports (e.g. "person lost $X in e-Transfer mistake", "man scammed via e-Transfer"). Those are personal stories, not market developments. Market Pulse covers products, services, pricing, and ecosystem-level news only.
+8. Do NOT include generic explainer content describing what a product is (e.g. "Interac e-Transfer is a safe and secure way to send money", "no need for cash or cheques"). Only include items reporting on a change, event, launch, or market development.
+9. Spread across different source types — include a mix of news articles, Reddit community reactions, and X/Twitter posts where available. Do not let any single source type dominate.
 
 ---
 

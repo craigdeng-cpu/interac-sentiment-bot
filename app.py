@@ -217,6 +217,39 @@ def _is_blocked_domain(url: str) -> bool:
     return any(kw in domain for kw in _BLOCKED_DOMAIN_KEYWORDS)
 
 
+# ── Market pulse quality filters ──────────────────────────────────────────────
+# Low-quality SEO blogs that explain what products are rather than reporting
+# on market developments. Filtered from press and competitor buckets only.
+_MARKET_LOW_QUALITY_DOMAINS: set[str] = {
+    "moonrockcanada.net", "newcomersetup.ca", "briefglance.com",
+    "howtosavemoney.ca", "frugalflyer.ca", "milesopedia.com",
+    "mybanktracker.com", "savvynewcanadians.com", "hardbacon.ca",
+}
+
+# Explainer content — generic "what is X" SEO articles, not market news.
+_EXPLAINER_RE = re.compile(
+    r"(what is (interac|e-transfer|e transfer|wise|paypal|wealthsimple)|"
+    r"safe and secure way to (send|transfer)|"
+    r"send money (electronically|instantly|directly) (to|from)|"
+    r"no need for (cash|cheques|checks)|"
+    r"how (to|does) (send|use|work).{0,30}(e-transfer|interac|etransfer))",
+    re.IGNORECASE,
+)
+
+
+def _is_low_quality_market_content(mention: dict) -> bool:
+    """Return True for SEO explainer content that has no market intelligence value."""
+    url = mention.get("link") or ""
+    try:
+        domain = re.sub(r"^www\.", "", urlparse(url).netloc.lower())
+    except Exception:
+        domain = ""
+    if domain in _MARKET_LOW_QUALITY_DOMAINS:
+        return True
+    text = f"{mention.get('title', '')} {mention.get('snippet', '')}".strip()
+    return bool(_EXPLAINER_RE.search(text))
+
+
 def _classify_channel_and_source(link: str) -> tuple[str, str]:
     url = (link or "").lower()
     if "reddit.com" in url:
@@ -967,8 +1000,8 @@ async def _search_twitter_io(query: str, max_results: int = 10) -> list[dict]:
 
         if not text or not url:
             continue
-        # Skip short tweets — not enough context to be useful
-        if len(text) < 80:
+        # Skip very short tweets — no context
+        if len(text) < 60:
             continue
         # Skip promotional content
         if _PROMO_RE.search(text):
@@ -976,17 +1009,15 @@ async def _search_twitter_io(query: str, max_results: int = 10) -> list[dict]:
 
         likes = tweet.get("likeCount") or 0
         retweets = tweet.get("retweetCount") or 0
-        views = tweet.get("viewCount") or 0
 
-        # Require at least ONE strong signal — must be more than a passing mention:
-        # (a) real engagement (3+ likes/retweets — filters bots and zero-reach posts)
-        # (b) a dollar amount — signals a real personal financial experience
-        # (c) a pain/signal word — fraud, scam, declined, hold, etc.
-        has_real_engagement = (likes + retweets) >= 3
+        # Require at least ONE signal — filters pure noise with no relevance:
+        # (a) any engagement (≥1 like or retweet)
+        # (b) a dollar amount
+        # (c) any e-Transfer signal word including "e-transfer"/"interac" itself
+        has_engagement = (likes + retweets) >= 1
         has_dollar = bool(_DOLLAR_AMOUNT_RE.search(text))
-        has_signal_word = any(tok in text.lower() for tok in _ETRANSFER_SIGNAL_TOKENS
-                              if tok not in ("e-transfer", "etransfer", "interac"))
-        if not (has_real_engagement or has_dollar or has_signal_word):
+        has_signal_word = any(tok in text.lower() for tok in _ETRANSFER_SIGNAL_TOKENS)
+        if not (has_engagement or has_dollar or has_signal_word):
             continue
 
         results.append({
@@ -1466,7 +1497,7 @@ async def fetch_biweekly_mentions() -> str:
                 r["_fetch_method"] = "ddg_news"
                 if channel == "people":
                     etransfer_social.append(r)
-                else:
+                elif not _is_low_quality_market_content(r):
                     etransfer_press.append(r)
 
             # X/Twitter — cap at 3 per query to keep Reddit competitive in the pool
@@ -1489,6 +1520,8 @@ async def fetch_biweekly_mentions() -> str:
             for r in results:
                 link = r.get("link", "")
                 if not link or link in seen_links or _is_blocked_domain(link):
+                    continue
+                if _is_low_quality_market_content(r):
                     continue
                 seen_links.add(link)
                 channel, source = _classify_channel_and_source(link)
@@ -1531,12 +1564,14 @@ async def fetch_biweekly_mentions() -> str:
     other_social   = sorted([m for m in etransfer_social if not _is_reddit(m) and not _is_twitter(m)],
                             key=lambda m: _mention_quality_score(m, "etransfer"), reverse=True)
 
-    # Each source contributes up to its cap independently — Twitter growth
-    # never reduces Reddit's slot count.
-    etransfer_social = reddit_social[:25] + other_social[:15] + twitter_social[:20]
+    # Merge with independent caps — each source gets its own guaranteed slot budget.
+    # Reddit and Twitter are capped equally so neither dominates.
+    etransfer_social = reddit_social[:15] + other_social[:10] + twitter_social[:15]
     logger.info(
-        f"[social-buckets] reddit={len(reddit_social)} other={len(other_social)} "
-        f"twitter={len(twitter_social)} → merged={len(etransfer_social)}"
+        f"[social-buckets] reddit={len(reddit_social)}(cap 15) "
+        f"other={len(other_social)}(cap 10) "
+        f"twitter={len(twitter_social)}(cap 15) "
+        f"→ merged={len(etransfer_social)}"
     )
 
     # Make recency decisions only on dated content to avoid stale/undated drift.
