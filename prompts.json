@@ -37,14 +37,17 @@
     "Neo Financial new product OR feature OR update 2025 OR 2026",
     "fintech canada launch OR acquisition OR partnership 2025 OR 2026",
     "digital payments canada new OR update OR launch 2025 OR 2026",
-    "Venmo OR Zelle canada expansion OR launch 2025 OR 2026",
-    "Square OR Stripe canada new product OR update 2025 OR 2026",
+    "Venmo OR Zelle new feature OR update 2025 OR 2026",
+    "Square OR Stripe new product OR update 2025 OR 2026",
+    "Cash App new feature OR update 2025 OR 2026",
     "money transfer canada app new site:reddit.com/r/personalfinancecanada",
-    "PayPal OR Wise OR Wealthsimple update site:x.com",
-    "fintech canada news site:x.com",
+    "PayPal OR Wise OR Wealthsimple OR KOHO update site:reddit.com",
     "switched from e-transfer site:reddit.com",
     "e-transfer alternative canada site:reddit.com/r/personalfinancecanada",
-    "wise vs interac OR paypal vs interac site:reddit.com"
+    "wise vs interac OR paypal vs interac site:reddit.com",
+    "Revolut OR Wise OR Cash App review canada site:reddit.com",
+    "fintech payments news 2025 OR 2026",
+    "peer to peer payment app launch OR update 2025 OR 2026"
   ],
   "timezone": "US/Eastern"
 }

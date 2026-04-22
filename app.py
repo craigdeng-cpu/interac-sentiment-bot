@@ -792,6 +792,29 @@ _CANADIAN_BANK_NAMES = [
     "tangerine", "eq bank", "simplii", "desjardins", "hsbc canada",
 ]
 _DOLLAR_AMOUNT_RE = re.compile(r"\$\s*\d[\d,]*")
+
+# Insight-signal words — indicate a real observation, comparison, or experience
+# rather than a generic statement. These boost the quality score.
+_INSIGHT_SIGNAL_TOKENS = [
+    "switched", "switching", "instead of", "better than", "worse than",
+    "compared to", "prefer", "moved to", "stopped using", "started using",
+    "annoying", "frustrated", "surprised", "realized", "just happened",
+    "required", "prompted", "blocked me", "rejected", "wouldn't let",
+    "finally", "used to", "no longer", "can't believe", "disappointed",
+    "love that", "hate that", "wish", "should", "needs to",
+]
+
+# Low-insight patterns — posts where e-transfer / payment is mentioned only
+# in passing with no real observation or experience attached.
+_LOW_INSIGHT_RE = re.compile(
+    r"(equivalent (to|of) (interac|e-transfer)|"
+    r"they (don't|dont|do not) (have|use) (interac|e-transfer)|"
+    r"(interac|e-transfer) (or|and) (cash|cheque|check|credit card)|"
+    r"payable.{0,30}(interac|e-transfer)|"  # "payable via e-transfer" — incidental
+    r"(prize|reward|payment).{0,40}(interac|e-transfer))",  # contest/prize mentions
+    re.IGNORECASE,
+)
+
 _COMPETITOR_BRANDS = [
     "wise", "paypal", "wealthsimple", "koho", "apple pay", "google pay",
     "revolut", "neo financial", "venmo", "zelle", "cash app", "square", "stripe",
@@ -877,6 +900,12 @@ def _mention_quality_score(mention: dict, section: str) -> float:
             score += 1.5
         else:
             score -= 3.0
+        # Insight quality: reward posts with real user experience signals
+        if any(tok in text for tok in _INSIGHT_SIGNAL_TOKENS):
+            score += 1.0
+        # Penalise low-insight patterns (passing references, prize mentions, etc.)
+        if _LOW_INSIGHT_RE.search(text):
+            score -= 2.0
     else:  # competitor
         has_brand = any(tok in text for tok in _COMPETITOR_BRANDS)
         if has_brand:
@@ -887,6 +916,9 @@ def _mention_quality_score(mention: dict, section: str) -> float:
             score -= 1.5
         if any(tok in text for tok in _COMPETITOR_EVENT_TOKENS):
             score += 1.0
+        # Insight quality: reward comparison/switch posts in competitor section too
+        if any(tok in text for tok in _INSIGHT_SIGNAL_TOKENS):
+            score += 0.5
 
     return score
 
@@ -1557,21 +1589,26 @@ async def fetch_biweekly_mentions() -> str:
     def _is_twitter(m: dict) -> bool:
         return m.get("source") == "X/Twitter"
 
-    reddit_social  = sorted([m for m in etransfer_social if _is_reddit(m)],
-                            key=lambda m: _mention_quality_score(m, "etransfer"), reverse=True)
-    twitter_social = sorted([m for m in etransfer_social if _is_twitter(m)],
-                            key=lambda m: _mention_quality_score(m, "etransfer"), reverse=True)
-    other_social   = sorted([m for m in etransfer_social if not _is_reddit(m) and not _is_twitter(m)],
-                            key=lambda m: _mention_quality_score(m, "etransfer"), reverse=True)
+    # Pure quality sort — no artificial source caps. Best items win regardless of platform.
+    # Score each platform's mentions independently first (for logging visibility), then merge.
+    reddit_scored  = [(m, _mention_quality_score(m, "etransfer")) for m in etransfer_social if _is_reddit(m)]
+    twitter_scored = [(m, _mention_quality_score(m, "etransfer")) for m in etransfer_social if _is_twitter(m)]
+    other_scored   = [(m, _mention_quality_score(m, "etransfer")) for m in etransfer_social
+                      if not _is_reddit(m) and not _is_twitter(m)]
 
-    # Merge with independent caps — each source gets its own guaranteed slot budget.
-    # Reddit and Twitter are capped equally so neither dominates.
-    etransfer_social = reddit_social[:15] + other_social[:10] + twitter_social[:15]
+    all_scored = reddit_scored + twitter_scored + other_scored
+    all_scored.sort(key=lambda x: x[1], reverse=True)
+    etransfer_social = [m for m, _ in all_scored[:40]]
+
     logger.info(
-        f"[social-buckets] reddit={len(reddit_social)}(cap 15) "
-        f"other={len(other_social)}(cap 10) "
-        f"twitter={len(twitter_social)}(cap 15) "
-        f"→ merged={len(etransfer_social)}"
+        f"[quality-sort] reddit={len(reddit_scored)} "
+        f"twitter={len(twitter_scored)} "
+        f"other={len(other_scored)} "
+        f"→ top-40 kept={len(etransfer_social)} "
+        f"(platform breakdown in top-40: "
+        f"reddit={sum(1 for m in etransfer_social if _is_reddit(m))}, "
+        f"twitter={sum(1 for m in etransfer_social if _is_twitter(m))}, "
+        f"other={sum(1 for m in etransfer_social if not _is_reddit(m) and not _is_twitter(m))})"
     )
 
     # Make recency decisions only on dated content to avoid stale/undated drift.
