@@ -1515,11 +1515,28 @@ async def fetch_biweekly_mentions() -> str:
     await _enrich_dates_from_reddit_json(all_mentions, max_fetches=40)
     await _enrich_dates_from_meta(all_mentions, max_fetches=80)
 
-    # Sort social pool by unified quality score — platform-neutral, signal-driven.
-    # Reddit upvotes/comments and Twitter likes/retweets/replies are each normalized
-    # to the same 0–4 pt range so neither platform dominates on raw volume alone.
-    etransfer_social.sort(
-        key=lambda m: _mention_quality_score(m, "etransfer"), reverse=True
+    # Isolate Reddit and Twitter into separate buckets, sort each by quality,
+    # then merge with independent caps. This prevents Twitter volume from
+    # crowding out Reddit regardless of how many Twitter results are returned.
+    def _is_reddit(m: dict) -> bool:
+        return "reddit.com" in (m.get("link") or "").lower() or m.get("source") == "Reddit"
+
+    def _is_twitter(m: dict) -> bool:
+        return m.get("source") == "X/Twitter"
+
+    reddit_social  = sorted([m for m in etransfer_social if _is_reddit(m)],
+                            key=lambda m: _mention_quality_score(m, "etransfer"), reverse=True)
+    twitter_social = sorted([m for m in etransfer_social if _is_twitter(m)],
+                            key=lambda m: _mention_quality_score(m, "etransfer"), reverse=True)
+    other_social   = sorted([m for m in etransfer_social if not _is_reddit(m) and not _is_twitter(m)],
+                            key=lambda m: _mention_quality_score(m, "etransfer"), reverse=True)
+
+    # Each source contributes up to its cap independently — Twitter growth
+    # never reduces Reddit's slot count.
+    etransfer_social = reddit_social[:25] + other_social[:15] + twitter_social[:20]
+    logger.info(
+        f"[social-buckets] reddit={len(reddit_social)} other={len(other_social)} "
+        f"twitter={len(twitter_social)} → merged={len(etransfer_social)}"
     )
 
     # Make recency decisions only on dated content to avoid stale/undated drift.
