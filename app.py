@@ -2060,6 +2060,98 @@ def send_email(subject: str, body: str) -> tuple[bool, str]:
     return _send_email_smtp(subject, body)
 
 
+# ─── Preflight Checks ────────────────────────────────────────────────────────
+
+def _check_resend() -> tuple[bool, str]:
+    """Verify Resend API key is valid AND the sending domain is verified on this account."""
+    if not EMAIL_ENABLED:
+        return False, "Email is disabled (EMAIL_ENABLED not set)"
+    if not RESEND_API_KEY:
+        return False, "RESEND_API_KEY is not set"
+    if not EMAIL_FROM:
+        return False, "EMAIL_FROM is not set"
+    try:
+        r = httpx.get(
+            "https://api.resend.com/domains",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
+            timeout=15,
+        )
+        if r.status_code == 401:
+            return False, "Resend API key is invalid or rejected (401)"
+        if r.status_code != 200:
+            return False, f"Resend API returned {r.status_code}: {r.text[:200]}"
+        from_domain = EMAIL_FROM.split("@")[-1]
+        domains = r.json().get("data", [])
+        verified = any(
+            d.get("name") == from_domain and d.get("status") == "verified"
+            for d in domains
+        )
+        if not verified:
+            found = [d.get("name") for d in domains] or ["none"]
+            return (
+                False,
+                f"Domain '{from_domain}' is not verified on this Resend account.\n"
+                f"Domains verified on this account: {', '.join(found)}.\n"
+                f"Fix: either verify '{from_domain}' at resend.com/domains, or switch "
+                f"RESEND_API_KEY to the account where '{from_domain}' is already verified.",
+            )
+        return True, f"Resend OK — '{from_domain}' verified, key accepted"
+    except Exception as e:
+        return False, f"Resend unreachable: {e}"
+
+
+async def _check_kimi() -> tuple[bool, str]:
+    """Verify Kimi API key and model are functional with a 1-token probe."""
+    if not KIMI_API_KEY:
+        return False, "KIMI_API_KEY is not set"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(
+                KIMI_API_URL,
+                headers={"Authorization": f"Bearer {KIMI_API_KEY}", "Content-Type": "application/json"},
+                json={"model": KIMI_MODEL, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
+            )
+            if r.status_code == 401:
+                return False, "Kimi API key is invalid or rejected (401)"
+            if r.status_code == 404:
+                return False, f"Kimi model '{KIMI_MODEL}' not found (404) — update KIMI_MODEL in Railway"
+            if r.status_code != 200:
+                return False, f"Kimi API returned {r.status_code}: {r.text[:200]}"
+            return True, f"Kimi OK — model '{KIMI_MODEL}' responding"
+    except Exception as e:
+        return False, f"Kimi unreachable: {e}"
+
+
+async def preflight_check(check_email: bool = True) -> tuple[bool, str]:
+    """Run API health checks before starting a scan. Returns (ok, message).
+
+    check_email=True  → also validates Resend (used by /email)
+    check_email=False → Kimi only (used by /scan)
+    """
+    kimi_ok, kimi_msg = await _check_kimi()
+    resend_ok, resend_msg = (True, "skipped") if not check_email else _check_resend()
+
+    lines = []
+    all_ok = True
+
+    if not kimi_ok:
+        lines.append(f"❌ Kimi: {kimi_msg}")
+        all_ok = False
+    else:
+        lines.append(f"✅ {kimi_msg}")
+
+    if check_email:
+        if not resend_ok:
+            lines.append(f"❌ Resend: {resend_msg}")
+            all_ok = False
+        else:
+            lines.append(f"✅ {resend_msg}")
+
+    return all_ok, "\n".join(lines)
+
+
+# ─── End Preflight ────────────────────────────────────────────────────────────
+
 def _extract_report_field(report: str, field_name: str) -> str:
     pattern = rf"^{re.escape(field_name)}\s*:\s*(.+)$"
     m = re.search(pattern, report, flags=re.IGNORECASE | re.MULTILINE)
@@ -2714,6 +2806,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ok, msg = await preflight_check(check_email=False)
+    if not ok:
+        await update.message.reply_text(f"❌ Preflight failed — scan aborted:\n\n{msg}")
+        return
     try:
         await run_biweekly_scan(update)
     except asyncio.TimeoutError:
@@ -2751,6 +2847,13 @@ async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Admin only.")
         return
+
+    await update.message.reply_text("🔍 Running preflight checks...")
+    ok, msg = await preflight_check(check_email=True)
+    if not ok:
+        await update.message.reply_text(f"❌ Preflight failed — scan aborted:\n\n{msg}")
+        return
+    await update.message.reply_text(f"✅ Preflight passed:\n{msg}\n\nStarting scan...")
 
     tracked = _track_current_task()
     await update.message.reply_text("📧 Running fresh biweekly scan and sending email...")
