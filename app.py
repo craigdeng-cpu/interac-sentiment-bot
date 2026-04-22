@@ -191,6 +191,31 @@ def _has_site_restriction(query: str) -> bool:
 
 _search_errors: list[str] = []
 
+# ── Spam / low-quality domain blocklist ───────────────────────────────────────
+# Blocks casino affiliates, gambling sites, and known spam domains that rank
+# for "e-Transfer" because Canadians use it for online gambling deposits.
+_BLOCKED_DOMAINS: set[str] = {
+    "bodog.com", "bovada.lv", "betway.com", "888casino.com", "jackpot.com",
+    "casumo.com", "casinorewards.ca", "enmarie.com", "mesnmw.org",
+    "spinpalace.com", "playojo.ca", "betmgm.ca", "draftkings.com",
+    "fanduel.com", "pointsbet.ca", "proline.ca", "bet365.com",
+}
+_BLOCKED_DOMAIN_KEYWORDS: tuple[str, ...] = (
+    "casino", "gambling", "betting", "poker", "slots", "wagering",
+    "sportsbook", "sportsbetting", "onlinegambling",
+)
+
+
+def _is_blocked_domain(url: str) -> bool:
+    """Return True if the URL belongs to a spam/casino/gambling domain."""
+    try:
+        domain = re.sub(r"^www\.", "", urlparse(url).netloc.lower())
+    except Exception:
+        return False
+    if domain in _BLOCKED_DOMAINS:
+        return True
+    return any(kw in domain for kw in _BLOCKED_DOMAIN_KEYWORDS)
+
 
 def _classify_channel_and_source(link: str) -> tuple[str, str]:
     url = (link or "").lower()
@@ -1315,10 +1340,11 @@ async def fetch_biweekly_mentions() -> str:
         "e-transfer complaint OR issue OR broken",
     ]
     for tq in et_twitter_queries:
-        x_results = await search_twitter(tq, 8, tbs="qdr:m")
+        # Cap at 4 per query (down from 8) — prevents Twitter flooding the social pool
+        x_results = await search_twitter(tq, 4, tbs="qdr:m")
         for r in x_results:
             link = r.get("link", "")
-            if not link or link in seen_links:
+            if not link or link in seen_links or _is_blocked_domain(link):
                 continue
             seen_links.add(link)
             r["channel"] = "people"
@@ -1336,7 +1362,7 @@ async def fetch_biweekly_mentions() -> str:
         results = await web_search(query, "search", 5, tbs="qdr:m")
         for r in results:
             link = r.get("link", "")
-            if not link or link in seen_links:
+            if not link or link in seen_links or _is_blocked_domain(link):
                 continue
             seen_links.add(link)
             channel, source = _classify_channel_and_source(link)
@@ -1353,7 +1379,7 @@ async def fetch_biweekly_mentions() -> str:
             news_results = await web_search(query, "news", 5, tbs="qdr:m")
             for r in news_results:
                 link = r.get("link", "")
-                if not link or link in seen_links:
+                if not link or link in seen_links or _is_blocked_domain(link):
                     continue
                 seen_links.add(link)
                 channel, source = _classify_channel_and_source(link)
@@ -1365,11 +1391,11 @@ async def fetch_biweekly_mentions() -> str:
                 else:
                     etransfer_press.append(r)
 
-            # X/Twitter
-            x_results = await search_twitter(query, 5, tbs="qdr:m")
+            # X/Twitter — cap at 3 per query to keep Reddit competitive in the pool
+            x_results = await search_twitter(query, 3, tbs="qdr:m")
             for r in x_results:
                 link = r.get("link", "")
-                if not link or link in seen_links:
+                if not link or link in seen_links or _is_blocked_domain(link):
                     continue
                 seen_links.add(link)
                 r["channel"] = "people"
@@ -1384,7 +1410,7 @@ async def fetch_biweekly_mentions() -> str:
             results = await web_search(query, search_type, 8, tbs=tbs)
             for r in results:
                 link = r.get("link", "")
-                if not link or link in seen_links:
+                if not link or link in seen_links or _is_blocked_domain(link):
                     continue
                 seen_links.add(link)
                 channel, source = _classify_channel_and_source(link)
@@ -1394,10 +1420,10 @@ async def fetch_biweekly_mentions() -> str:
                 competitor_mentions.append(r)
 
         if not _has_site_restriction(query):
-            x_results = await search_twitter(query, 8, tbs="qdr:m")
+            x_results = await search_twitter(query, 5, tbs="qdr:m")
             for r in x_results:
                 link = r.get("link", "")
-                if not link or link in seen_links:
+                if not link or link in seen_links or _is_blocked_domain(link):
                     continue
                 seen_links.add(link)
                 r["channel"] = "people"
