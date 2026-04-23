@@ -1909,10 +1909,11 @@ async def fetch_biweekly_mentions() -> str:
 
 # ─── Kimi K2.5 Analysis ──────────────────────────────────────────────────────
 async def call_kimi(system_prompt: str, user_content: str) -> str:
-    # 8192 token limit total. System prompt ~500 tokens, output ~800 tokens.
-    # Budget ~6000 tokens (~18k chars) for user content. Cap at 15k for safety.
-    if len(user_content) > 15000:
-        user_content = user_content[:15000] + "\n\n[... truncated]"
+    # moonshot-v1-8k: 8192 token total limit.
+    # System ~500t + output 2000t = 2500t budget used. Leaves ~5600t for input.
+    # At ~3 chars/token: 5600 * 3 = 16800 chars. Cap at 10000 to be safe.
+    if len(user_content) > 10000:
+        user_content = user_content[:10000] + "\n\n[... truncated]"
 
     async with httpx.AsyncClient(timeout=90) as client:
         response = await client.post(
@@ -2083,8 +2084,8 @@ async def curate_with_kimi(raw_mentions: str) -> str:
         return raw_mentions
 
     user_content = raw_mentions
-    if len(user_content) > 50000:
-        user_content = user_content[:50000] + "\n\n[... truncated]"
+    if len(user_content) > 10000:
+        user_content = user_content[:10000] + "\n\n[... truncated]"
 
     async with httpx.AsyncClient(timeout=120) as client:
         response = await client.post(
@@ -2100,7 +2101,7 @@ async def curate_with_kimi(raw_mentions: str) -> str:
                     {"role": "user", "content": user_content},
                 ],
                 "temperature": 0.3,
-                "max_tokens": 6000,
+                "max_tokens": 1500,
             },
         )
         if response.status_code != 200:
