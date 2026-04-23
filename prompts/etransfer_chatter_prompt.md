@@ -46,7 +46,13 @@ Include a post if it contains a **specific personal experience** with e-Transfer
 3. For `Date`: copy the date exactly if it's a real date (e.g., "April 3, 2026"). If the field is empty or says "unknown", omit the date entirely.
 4. For `Source`: use the URL from the `URL:` field.
 5. For platform label: use the source name from the first line of each item (e.g., Reddit, X/Twitter, RedFlagDeals).
-6. **Platform mix — mandatory if available.** You will receive posts from Reddit, X/Twitter, and forums. If the input contains BOTH Reddit posts AND X/Twitter posts, your output MUST include at least 1 from each platform. This is non-negotiable. Quality matters (pick the strongest from each platform), but you must represent both sources if both exist in the input. If only one platform has passable content, output that platform only.
+6. **Platform distribution — mandatory targets when sources available:**
+   - **2–3 Reddit bullets** (if Reddit posts exist in input)
+   - **2–3 X/Twitter bullets** (if Twitter posts exist in input)
+   - **1 RedFlagDeals or forum bullet** (if available and strong)
+   - Total target: **5–7 bullets**
+
+   If one platform has only 1 strong post and another has 5, include that 1 strong Reddit post AND 3–4 Twitter posts — never skip a platform because another has more options. The output must reflect the mix present in the input.
 
 ---
 
@@ -87,4 +93,9 @@ Every bullet MUST contain at least one of:
 
 **Three strong bullets beat six weak ones.** If fewer than 3 posts meet this bar, output `Nothing notable this scan.`
 
-**MANDATORY SOURCE RULE:** If the input contains both Reddit and X/Twitter posts, at least one bullet MUST be from Reddit and at least one MUST be from X/Twitter, even if other sources are stronger. This ensures both communities are represented in the output. Do not output Reddit-only or Twitter-only results when both platforms are present in the input.
+**MANDATORY SOURCE DISTRIBUTION:**
+- If input has Reddit posts that meet the quality bar: output MUST include **at least 2 Reddit bullets** (or all Reddit posts if fewer than 2 qualify)
+- If input has X/Twitter posts that meet the quality bar: output MUST include **at least 2 X/Twitter bullets** (or all if fewer than 2 qualify)
+- If only one platform survives the quality filter: output that platform only
+
+This rule overrides "three strong bullets beat six weak ones" when both platforms have qualifying content — a mixed output with 2+2 beats a single-platform output with 4.

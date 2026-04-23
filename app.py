@@ -1518,18 +1518,32 @@ async def fetch_biweekly_mentions() -> str:
             r["_fetch_method"] = "ddg_text"
             etransfer_social.append(r)
 
-    # ── Tiered fetch: decide whether to run DDG ──
-    # If Reddit API + Twitter provided enough content, skip slow DDG calls.
-    # Otherwise, DDG is the fallback for Railway IP blocking.
-    et_social_threshold = 15  # minimum items from Reddit/Twitter before skipping DDG
-    comp_threshold = 5         # minimum items from Reddit before skipping DDG
-    skip_ddg = len(etransfer_social) >= et_social_threshold and len(competitor_mentions) >= comp_threshold
-    if skip_ddg:
-        logger.info(
-            f"[tiered-fetch] skipping DDG: "
-            f"etransfer_social={len(etransfer_social)}>={et_social_threshold}, "
-            f"competitor={len(competitor_mentions)}>={comp_threshold}"
-        )
+    # ── Platform helpers (defined here so tiered-fetch can use them) ──────────
+    def _is_reddit(m: dict) -> bool:
+        return "reddit.com" in (m.get("link") or "").lower() or m.get("source") == "Reddit"
+
+    def _is_twitter(m: dict) -> bool:
+        return m.get("source") == "X/Twitter"
+
+    # ── Tiered fetch: decide whether to run DDG ──────────────────────────────
+    # Require BOTH platforms to have content before skipping DDG.
+    # If Reddit API is blocked on Railway, reddit_count=0 → DDG always runs,
+    # restoring site:reddit.com fallback queries.
+    reddit_count_pre  = sum(1 for m in etransfer_social if _is_reddit(m))
+    twitter_count_pre = sum(1 for m in etransfer_social if _is_twitter(m))
+    comp_threshold    = 5
+    reddit_min        = 8
+    twitter_min       = 8
+
+    skip_ddg = (
+        reddit_count_pre  >= reddit_min
+        and twitter_count_pre >= twitter_min
+        and len(competitor_mentions) >= comp_threshold
+    )
+    logger.info(
+        f"[tiered-fetch] reddit={reddit_count_pre} twitter={twitter_count_pre} "
+        f"competitor={len(competitor_mentions)} skip_ddg={skip_ddg}"
+    )
 
     # ── 3b. DDG — e-Transfer supplement ──
     # This is the critical fallback path when Reddit API is blocked on the server.
@@ -1607,15 +1621,6 @@ async def fetch_biweekly_mentions() -> str:
     all_mentions = etransfer_social + etransfer_press + competitor_mentions
     await _enrich_dates_from_reddit_json(all_mentions, max_fetches=40)
     await _enrich_dates_from_meta(all_mentions, max_fetches=80)
-
-    # Isolate Reddit and Twitter into separate buckets, sort each by quality,
-    # then merge with independent caps. This prevents Twitter volume from
-    # crowding out Reddit regardless of how many Twitter results are returned.
-    def _is_reddit(m: dict) -> bool:
-        return "reddit.com" in (m.get("link") or "").lower() or m.get("source") == "Reddit"
-
-    def _is_twitter(m: dict) -> bool:
-        return m.get("source") == "X/Twitter"
 
     # Score by quality, then stratify by platform to ensure both Reddit and Twitter
     # get representational slots before Kimi filter. Prevents Reddit volume from crowding
