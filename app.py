@@ -1702,19 +1702,21 @@ async def fetch_biweekly_mentions() -> str:
     reddit_after = _platform_count(etransfer_social, _is_reddit)
     twitter_after = _platform_count(etransfer_social, _is_twitter)
 
-    if reddit_after == 0 and twitter_after >= 3:
-        # Twitter is dominating; pull best Reddit items from pre-filter pool
-        reddit_rescue = [m for m in etransfer_social_prefilter if _is_reddit(m)][:2]
+    if reddit_after < 2 and twitter_after >= 3:
+        # Twitter dominates; ensure minimum Reddit representation (floor of 3)
+        needed = 3 - reddit_after
+        reddit_rescue = [m for m in etransfer_social_prefilter if _is_reddit(m)][:needed]
         if reddit_rescue:
             etransfer_social = etransfer_social + reddit_rescue
-            logger.info(f"[diversity-floor] rescued {len(reddit_rescue)} Reddit items")
+            logger.info(f"[diversity-floor] rescued {len(reddit_rescue)} Reddit items to floor of 3")
 
-    if twitter_after == 0 and reddit_after >= 3:
-        # Reddit is dominating; pull best Twitter items from pre-filter pool
-        twitter_rescue = [m for m in etransfer_social_prefilter if _is_twitter(m)][:2]
+    if twitter_after < 2 and reddit_after >= 3:
+        # Reddit dominates; ensure minimum Twitter representation (floor of 3)
+        needed = 3 - twitter_after
+        twitter_rescue = [m for m in etransfer_social_prefilter if _is_twitter(m)][:needed]
         if twitter_rescue:
             etransfer_social = etransfer_social + twitter_rescue
-            logger.info(f"[diversity-floor] rescued {len(twitter_rescue)} Twitter items")
+            logger.info(f"[diversity-floor] rescued {len(twitter_rescue)} Twitter items to floor of 3")
 
     # ── Market Pulse floor ──────────────────────────────────────────────────────
     # If competitor mentions drop below 3 after Kimi filter, pull highest-scoring
