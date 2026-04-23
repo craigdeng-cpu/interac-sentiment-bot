@@ -1113,10 +1113,13 @@ async def search_twitter(query: str, max_results: int = 5, tbs: str = "qdr:w") -
     return base_results
 
 
-async def search_google_news(query: str, max_results: int = 10) -> list[dict]:
-    """Fetch Google News RSS (CA-geo). Returns normalized mention dicts with reliable dates."""
+async def search_google_news(query: str, max_results: int = 10, days_back: int = 30) -> list[dict]:
+    """Fetch Google News RSS (CA-geo). Returns normalized mention dicts with reliable dates.
+    days_back: inject after:YYYY-MM-DD into query to limit to recent articles."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    dated_query = f"{query} after:{cutoff}"
     url = (
-        f"https://news.google.com/rss/search?q={quote(query)}"
+        f"https://news.google.com/rss/search?q={quote(dated_query)}"
         f"&hl=en-CA&gl=CA&ceid=CA:en"
     )
     try:
@@ -1939,8 +1942,9 @@ Example: "TD held my $2,400 e-Transfer for 5 days, their agent blamed Interac."
 **4 — Strong (include):** Personal experience OR a concrete market development with specific detail. Clear insight.
 Example: "Switched from e-Transfer to Wise for anything over $1k — saves $40 per transfer."
 
-**3 — Borderline (include):** Has some specific content — a named product, a specific comparison, or a real user question with context.
+**3 — Borderline (include):** Has some specific content — a named product, a specific comparison, or a real user question with context. MUST have either personal experience ("I", "my", "we") OR a concrete event/development. Pure editorial opinion or analysis — even if it contains industry statistics — is NOT score 3.
 Example: "Does anyone else's bank charge for Interac e-Transfer now?"
+NOT score 3: "Interac is a monopoly, they charge $0.20/tx" — this is opinion/analysis, score 2.
 
 **2 — Weak (EXCLUDE):** Generic mention, no personal experience, no concrete detail. IMPORTANT: Opinion or editorial content that contains statistics or industry data (e.g. "Interac is a monopoly, they charge $0.20/tx and processed 2 billion transactions") scores 2, NOT 3 — it is analysis/opinion, not a personal user experience. Planning or future-tense posts ("I plan to make a transfer today") score 2.
 Example: "e-Transfer is convenient for sending money."
