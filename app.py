@@ -1809,12 +1809,21 @@ async def fetch_biweekly_mentions() -> str:
     # Save pre-filter pool to allow diversity floor afterwards.
     etransfer_social_prefilter = list(etransfer_social)
     competitor_mentions_prefilter = list(competitor_mentions)
-    logger.info("[value-filter] running Kimi value filter on 3 buckets in parallel...")
-    etransfer_social, etransfer_press, competitor_mentions = await asyncio.gather(
-        kimi_filter_by_value(etransfer_social, min_score=3),
+    # DDG-sourced Reddit posts are shorter/less specific — lower threshold to 2
+    # so the diversity floor has real candidates to pull from.
+    _ddg_reddit = [m for m in etransfer_social if m.get("_fetch_method") == "ddg_reddit_fallback"]
+    _regular_et = [m for m in etransfer_social if m.get("_fetch_method") != "ddg_reddit_fallback"]
+    logger.info(
+        f"[value-filter] etransfer_social split — ddg_reddit={len(_ddg_reddit)} (min_score=2) | regular={len(_regular_et)} (min_score=3)"
+    )
+    logger.info("[value-filter] running Kimi value filter on 4 buckets in parallel...")
+    _ddg_reddit_filtered, _regular_et_filtered, etransfer_press, competitor_mentions = await asyncio.gather(
+        kimi_filter_by_value(_ddg_reddit, min_score=2),
+        kimi_filter_by_value(_regular_et, min_score=3),
         kimi_filter_by_value(etransfer_press, min_score=3),
         kimi_filter_by_value(competitor_mentions, min_score=3),
     )
+    etransfer_social = _regular_et_filtered + _ddg_reddit_filtered
     logger.info(
         f"[fetch-sources] after Kimi value filter — "
         f"etransfer_social={len(etransfer_social)} | "
