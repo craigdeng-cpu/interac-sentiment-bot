@@ -1571,6 +1571,7 @@ async def fetch_biweekly_mentions() -> str:
 
     # ── 4. DDG — market pulse: product news + community reactions ──
     # Use qdr:y so product launches and updates from the past year are captured.
+    # Skip Twitter searches for competitors (latency cost > value for right column).
     for query in competitor_ddg_queries:
         for search_type, tbs in [("search", "qdr:y"), ("news", "qdr:y")]:
             results = await web_search(query, search_type, 12, tbs=tbs)
@@ -1585,18 +1586,6 @@ async def fetch_biweekly_mentions() -> str:
                 r["channel"] = channel
                 r["source"] = source
                 r["_fetch_method"] = f"ddg_{search_type}"
-                competitor_mentions.append(r)
-
-        if not _has_site_restriction(query):
-            x_results = await search_twitter(query, 5, tbs="qdr:m")
-            for r in x_results:
-                link = r.get("link", "")
-                if not link or link in seen_links or _is_blocked_domain(link):
-                    continue
-                seen_links.add(link)
-                r["channel"] = "people"
-                r["source"] = "X/Twitter"
-                r["_fetch_method"] = "ddg_text"
                 competitor_mentions.append(r)
 
     # Date backfill: Reddit .json for undated thread URLs (e.g. DDG-only Reddit hits),
@@ -1627,9 +1616,9 @@ async def fetch_biweekly_mentions() -> str:
     twitter_scored = [(m, s) for m, s in all_scored if _is_twitter(m)]
     other_scored = [(m, s) for m, s in all_scored if not _is_reddit(m) and not _is_twitter(m)]
 
-    reddit_pool = [m for m, _ in reddit_scored[:25]]
-    twitter_pool = [m for m, _ in twitter_scored[:15]]
-    other_pool = [m for m, _ in other_scored[:10]]
+    reddit_pool = [m for m, _ in reddit_scored[:17]]
+    twitter_pool = [m for m, _ in twitter_scored[:11]]
+    other_pool = [m for m, _ in other_scored[:7]]
 
     etransfer_social = reddit_pool + twitter_pool + other_pool
 

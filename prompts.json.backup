@@ -1,0 +1,63 @@
+{
+  "sources": {
+    "reddit": true,
+    "news": true,
+    "forums": true,
+    "twitter": true
+  },
+  "prompt_files": {
+    "followup_prompt": "prompts/followup_prompt.md",
+    "biweekly_prompt": "prompts/biweekly_prompt.md",
+    "curation_prompt": "prompts/curation_prompt.md",
+    "etransfer_chatter_prompt": "prompts/etransfer_chatter_prompt.md",
+    "market_pulse_prompt": "prompts/market_pulse_prompt.md"
+  },
+  "etransfer_queries": [
+    "Interac e-Transfer problem OR complaint OR delay Canada",
+    "Interac e-Transfer fraud OR scam Canada",
+    "e-Transfer hold OR declined OR pending Canada",
+    "Interac e-Transfer limit OR issue Canada",
+    "e-Transfer Canada news 2025 OR 2026",
+    "Interac e-Transfer fee OR policy change Canada",
+    "e-Transfer site:forums.redflagdeals.com",
+    "Interac e-Transfer site:reddit.com/r/personalfinancecanada",
+    "e-transfer fraud OR scam OR stolen site:reddit.com",
+    "e-transfer declined OR hold OR pending site:reddit.com/r/personalfinancecanada",
+    "interac e-transfer issue OR problem site:reddit.com/r/canada",
+    "e-transfer held OR pending OR stuck site:reddit.com",
+    "TD OR RBC OR CIBC OR BMO OR Scotiabank e-transfer site:reddit.com",
+    "e-transfer limit too low site:reddit.com/r/personalfinancecanada",
+    "interac auto-deposit site:reddit.com",
+    "got scammed e-transfer site:reddit.com",
+    "e-transfer site:reddit.com/r/askTO",
+    "e-transfer site:reddit.com/r/ontario",
+    "interac e-transfer frustrating OR annoying site:reddit.com",
+    "bank held my e-transfer site:reddit.com",
+    "e-transfer vs wise OR paypal site:reddit.com/r/personalfinancecanada"
+  ],
+  "competitor_queries": [
+    "PayPal new feature OR launch OR update canada 2025 OR 2026",
+    "PayPal canada news site:reddit.com/r/personalfinancecanada",
+    "Wise new feature OR pricing OR update canada 2025 OR 2026",
+    "Wise money transfer canada site:reddit.com/r/personalfinancecanada",
+    "Wealthsimple new feature OR launch OR cash 2025 OR 2026",
+    "KOHO new feature OR update OR launch canada 2025 OR 2026",
+    "Apple Pay OR Google Pay canada new feature OR launch 2025 OR 2026",
+    "Revolut canada launch OR expansion OR update 2025 OR 2026",
+    "Neo Financial new product OR feature OR update 2025 OR 2026",
+    "fintech canada launch OR acquisition OR partnership 2025 OR 2026",
+    "digital payments canada new OR update OR launch 2025 OR 2026",
+    "Venmo OR Zelle new feature OR update 2025 OR 2026",
+    "Square OR Stripe new product OR update 2025 OR 2026",
+    "Cash App new feature OR update 2025 OR 2026",
+    "money transfer canada app new site:reddit.com/r/personalfinancecanada",
+    "PayPal OR Wise OR Wealthsimple OR KOHO update site:reddit.com",
+    "switched from e-transfer site:reddit.com",
+    "e-transfer alternative canada site:reddit.com/r/personalfinancecanada",
+    "wise vs interac OR paypal vs interac site:reddit.com",
+    "Revolut OR Wise OR Cash App review canada site:reddit.com",
+    "fintech payments news 2025 OR 2026",
+    "peer to peer payment app launch OR update 2025 OR 2026"
+  ],
+  "timezone": "US/Eastern"
+}
