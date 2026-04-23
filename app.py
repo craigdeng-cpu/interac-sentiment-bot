@@ -1834,11 +1834,13 @@ async def kimi_filter_by_value(mentions: list[dict], min_score: int = 3) -> list
         return mentions
 
     user_content = _build_value_filter_input(mentions)
-    if len(user_content) > 30000:
-        user_content = user_content[:30000]
+    if len(user_content) > 18000:
+        user_content = user_content[:18000]
 
+    # Output is "N|score|reason" per item — ~40 chars × 50 items ≈ 600 tokens.
+    # Cap at 1200 max_tokens: enough headroom, much faster than 3000.
     try:
-        async with httpx.AsyncClient(timeout=90) as client:
+        async with httpx.AsyncClient(timeout=45) as client:
             r = await client.post(
                 KIMI_API_URL,
                 headers={"Authorization": f"Bearer {KIMI_API_KEY}", "Content-Type": "application/json"},
@@ -1849,7 +1851,7 @@ async def kimi_filter_by_value(mentions: list[dict], min_score: int = 3) -> list
                         {"role": "user", "content": user_content},
                     ],
                     "temperature": 0.1,
-                    "max_tokens": 3000,
+                    "max_tokens": 1200,
                 },
             )
             if r.status_code != 200:
@@ -1979,7 +1981,7 @@ async def run_biweekly_scan(update: Update) -> None:
         await update.message.reply_text(
             "Running biweekly e-Transfer intelligence scan (Reddit, X, RedFlagDeals, news)..."
         )
-        mentions = await asyncio.wait_for(fetch_biweekly_mentions(), timeout=180)
+        mentions = await asyncio.wait_for(fetch_biweekly_mentions(), timeout=300)
         last_mentions_raw = mentions
 
         if mentions.startswith("No mentions"):
@@ -1987,7 +1989,7 @@ async def run_biweekly_scan(update: Update) -> None:
             return
 
         await update.message.reply_text("Mentions collected. Running Kimi curation pass, then analysis...")
-        report = await asyncio.wait_for(analyze_biweekly(mentions), timeout=120)
+        report = await asyncio.wait_for(analyze_biweekly(mentions), timeout=180)
         last_report = report
 
         await send_chunked_message(
@@ -2975,7 +2977,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await run_biweekly_scan(update)
     except asyncio.TimeoutError:
-        await update.message.reply_text("⏱️ /scan timed out after 300 seconds.")
+        await update.message.reply_text("⏱️ /scan timed out after 480 seconds.")
     except Exception as e:
         logger.error(f"Scan failed: {e}")
         await update.message.reply_text(f"❌ Scan failed: {e}")
@@ -3020,7 +3022,7 @@ async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tracked = _track_current_task()
     await update.message.reply_text("📧 Running fresh biweekly scan and sending email...")
     try:
-        mentions = await asyncio.wait_for(fetch_biweekly_mentions(), timeout=180)
+        mentions = await asyncio.wait_for(fetch_biweekly_mentions(), timeout=300)
         last_mentions_raw = mentions
 
         if mentions.startswith("No mentions"):
@@ -3028,7 +3030,7 @@ async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await update.message.reply_text("Mentions collected. Running Kimi curation pass, then analysis...")
-        report = await asyncio.wait_for(analyze_biweekly(mentions), timeout=120)
+        report = await asyncio.wait_for(analyze_biweekly(mentions), timeout=180)
         last_report = report
 
         subject = f"{EMAIL_SUBJECT_PREFIX} — MANUAL REPORT"
@@ -3040,7 +3042,7 @@ async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(f"❌ Email failed: {send_reason}")
     except asyncio.TimeoutError:
-        await update.message.reply_text("⏱️ /email timed out after 300 seconds.")
+        await update.message.reply_text("⏱️ /email timed out after 480 seconds.")
     except Exception as e:
         logger.error(f"/email failed: {e}")
         await update.message.reply_text(f"❌ /email failed: {e}")
