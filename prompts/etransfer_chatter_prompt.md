@@ -46,7 +46,7 @@ Include a post if it contains a **specific personal experience** with e-Transfer
 3. For `Date`: copy the date exactly if it's a real date (e.g., "April 3, 2026"). If the field is empty or says "unknown", omit the date entirely.
 4. For `Source`: use the URL from the `URL:` field.
 5. For platform label: use the source name from the first line of each item (e.g., Reddit, X/Twitter, RedFlagDeals).
-6. **Platform mix — you decide.** You will receive posts from Reddit, X/Twitter, and forums. Prioritize the best posts regardless of platform. If Reddit has exceptional content this scan, let it dominate. If a Twitter post is more insightful than a Reddit post on the same theme, pick the Twitter post. However — do not ignore a platform entirely unless its posts genuinely add nothing. If you have at least one strong post from X/Twitter and at least one from Reddit, include both. Quality beats diversity, but diversity is the tiebreaker.
+6. **Platform mix — mandatory if available.** You will receive posts from Reddit, X/Twitter, and forums. If the input contains BOTH Reddit posts AND X/Twitter posts, your output MUST include at least 1 from each platform. This is non-negotiable. Quality matters (pick the strongest from each platform), but you must represent both sources if both exist in the input. If only one platform has passable content, output that platform only.
 
 ---
 
@@ -86,3 +86,5 @@ Every bullet MUST contain at least one of:
 - Passing references where e-Transfer is incidental
 
 **Three strong bullets beat six weak ones.** If fewer than 3 posts meet this bar, output `Nothing notable this scan.`
+
+**MANDATORY SOURCE RULE:** If the input contains both Reddit and X/Twitter posts, at least one bullet MUST be from Reddit and at least one MUST be from X/Twitter, even if other sources are stronger. This ensures both communities are represented in the output. Do not output Reddit-only or Twitter-only results when both platforms are present in the input.
