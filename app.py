@@ -1013,12 +1013,21 @@ async def _search_twitter_io(query: str, max_results: int = 10) -> list[dict]:
 
     _PROMO_RE = re.compile(
         r"\b(sign up|download|click here|visit us|check out|get started|"
-        r"use code|promo|discount|affiliate|refer a friend|sign-up bonus)\b",
+        r"use code|promo|discount|affiliate|refer a friend|sign-up bonus|"
+        r"join us|follow us|learn more|limited time|giveaway|contest|"
+        r"prize|winner|enter to win)\b",
+        re.IGNORECASE,
+    )
+    _CRYPTO_JUNK_RE = re.compile(
+        r"\b(stablecoin|on-chain|off-ramp|web3|nft|defi|staking|"
+        r"\$[A-Z]{3,6}\b|@daimo|@cadcstablecoin|loonfinance|crypto bridge|"
+        r"smart contract|blockchain)\b",
         re.IGNORECASE,
     )
     _PRONOUN_RE = re.compile(
         r"\b(i|my|me|we|our|i've|i'm|i'd|i'll|we've|we're)\b", re.IGNORECASE
     )
+    _MENTION_RE = re.compile(r"@\w+")
 
     results = []
     for tweet in (data.get("tweets") or []):
@@ -1032,24 +1041,35 @@ async def _search_twitter_io(query: str, max_results: int = 10) -> list[dict]:
 
         if not text or not url:
             continue
-        # Skip very short tweets — no context
-        if len(text) < 60:
+        # Skip short tweets — no room for insight
+        if len(text) < 100:
             continue
         # Skip promotional content
         if _PROMO_RE.search(text):
+            continue
+        # Skip crypto/web3 tangents — they mention e-Transfer but aren't about user experience
+        if _CRYPTO_JUNK_RE.search(text):
+            continue
+        # Skip tweets with too many @mentions (bot/promotional/ecosystem posts)
+        if len(_MENTION_RE.findall(text)) > 2:
             continue
 
         likes = tweet.get("likeCount") or 0
         retweets = tweet.get("retweetCount") or 0
 
-        # Require at least ONE signal — filters pure noise with no relevance:
-        # (a) any engagement (≥1 like or retweet)
-        # (b) a dollar amount
-        # (c) any e-Transfer signal word including "e-transfer"/"interac" itself
-        has_engagement = (likes + retweets) >= 1
+        # HARDER bar: must have engagement AND at least one insight signal.
+        # Old bar was too permissive — "Yes Interac e transfer... No fees 🇨🇦"
+        # passed because it had 1 like and the word "Interac".
+        has_engagement = (likes + retweets) >= 2
+        has_pronoun = bool(_PRONOUN_RE.search(text))
         has_dollar = bool(_DOLLAR_AMOUNT_RE.search(text))
-        has_signal_word = any(tok in text.lower() for tok in _ETRANSFER_SIGNAL_TOKENS)
-        if not (has_engagement or has_dollar or has_signal_word):
+        has_bank = any(bank in text.lower() for bank in _CANADIAN_BANK_NAMES)
+        has_question = "?" in text
+        has_insight_token = any(tok in text.lower() for tok in _INSIGHT_SIGNAL_TOKENS)
+
+        # Must have engagement PLUS at least one concrete-experience signal.
+        concrete_signals = sum([has_pronoun, has_dollar, has_bank, has_question, has_insight_token])
+        if not has_engagement or concrete_signals < 1:
             continue
 
         results.append({
@@ -1589,50 +1609,21 @@ async def fetch_biweekly_mentions() -> str:
     def _is_twitter(m: dict) -> bool:
         return m.get("source") == "X/Twitter"
 
-    # Quality-first sort with soft platform floor.
-    # Step 1: score everything, sort by quality, take top 35.
-    # Step 2: if Reddit or Twitter has fewer than PLATFORM_FLOOR posts in the top 35,
-    #         pull in the best remaining posts from that platform to reach the floor.
-    # This ensures Kimi always has both platforms to evaluate — Kimi then decides
-    # which posts actually make the final bullets.
-    PLATFORM_FLOOR = 3  # minimum posts per platform sent to Kimi
-
-    reddit_scored  = sorted(
-        [(m, _mention_quality_score(m, "etransfer")) for m in etransfer_social if _is_reddit(m)],
+    # Pure quality sort — no platform floor. If Twitter has nothing good,
+    # Twitter is absent. Quality beats forced diversity. Kimi value filter
+    # (run later) provides the real quality gate.
+    all_scored = sorted(
+        [(m, _mention_quality_score(m, "etransfer")) for m in etransfer_social],
         key=lambda x: x[1], reverse=True,
     )
-    twitter_scored = sorted(
-        [(m, _mention_quality_score(m, "etransfer")) for m in etransfer_social if _is_twitter(m)],
-        key=lambda x: x[1], reverse=True,
-    )
-    other_scored   = sorted(
-        [(m, _mention_quality_score(m, "etransfer")) for m in etransfer_social
-         if not _is_reddit(m) and not _is_twitter(m)],
-        key=lambda x: x[1], reverse=True,
-    )
+    etransfer_social = [m for m, _ in all_scored[:50]]  # wider pool for Kimi filter
 
-    all_scored = reddit_scored + twitter_scored + other_scored
-    all_scored.sort(key=lambda x: x[1], reverse=True)
-    top_pool = [m for m, _ in all_scored[:35]]
-    top_pool_set = set(id(m) for m in top_pool)
-
-    # Soft floor: guarantee each platform reaches PLATFORM_FLOOR in what Kimi sees
-    for platform_pool in (reddit_scored, twitter_scored):
-        in_pool = sum(1 for m in top_pool if id(m) in set(id(p) for p, _ in platform_pool))
-        if in_pool < PLATFORM_FLOOR:
-            needed = PLATFORM_FLOOR - in_pool
-            extras = [m for m, _ in platform_pool if id(m) not in top_pool_set][:needed]
-            top_pool += extras
-            top_pool_set.update(id(m) for m in extras)
-
-    etransfer_social = top_pool
-
+    reddit_count  = sum(1 for m in etransfer_social if _is_reddit(m))
+    twitter_count = sum(1 for m in etransfer_social if _is_twitter(m))
+    other_count   = len(etransfer_social) - reddit_count - twitter_count
     logger.info(
-        f"[quality-sort] scored: reddit={len(reddit_scored)} twitter={len(twitter_scored)} other={len(other_scored)} "
-        f"→ pool={len(etransfer_social)} "
-        f"(reddit={sum(1 for m in etransfer_social if _is_reddit(m))}, "
-        f"twitter={sum(1 for m in etransfer_social if _is_twitter(m))}, "
-        f"other={sum(1 for m in etransfer_social if not _is_reddit(m) and not _is_twitter(m))})"
+        f"[quality-sort] pool={len(etransfer_social)} "
+        f"(reddit={reddit_count}, twitter={twitter_count}, other={other_count})"
     )
 
     # Make recency decisions only on dated content to avoid stale/undated drift.
@@ -1660,10 +1651,27 @@ async def fetch_biweekly_mentions() -> str:
     )
 
     logger.info(
-        f"[fetch-sources] after recency filter (no quality gate — Kimi curates) — "
+        f"[fetch-sources] after recency filter — "
         f"etransfer_social={len(etransfer_social)} ({_src_counts(etransfer_social)}) | "
         f"etransfer_press={len(etransfer_press)} ({_src_counts(etransfer_press)}) | "
         f"competitor={len(competitor_mentions)} ({_src_counts(competitor_mentions)})"
+    )
+
+    # ── Kimi value filter: the real quality gate ─────────────────────────────
+    # Runs Kimi over every mention and scores it 1–5 on insight value.
+    # Anything scoring <3 is dropped before the final generation prompt sees it.
+    # This is what catches "Yes Interac e-Transfer. No fees 🇨🇦" regex can't.
+    logger.info("[value-filter] running Kimi value filter on 3 buckets in parallel...")
+    etransfer_social, etransfer_press, competitor_mentions = await asyncio.gather(
+        kimi_filter_by_value(etransfer_social, min_score=3),
+        kimi_filter_by_value(etransfer_press, min_score=3),
+        kimi_filter_by_value(competitor_mentions, min_score=3),
+    )
+    logger.info(
+        f"[fetch-sources] after Kimi value filter — "
+        f"etransfer_social={len(etransfer_social)} | "
+        f"etransfer_press={len(etransfer_press)} | "
+        f"competitor={len(competitor_mentions)}"
     )
 
     total = len(etransfer_social) + len(etransfer_press) + len(competitor_mentions)
@@ -1740,6 +1748,136 @@ async def call_kimi(system_prompt: str, user_content: str) -> str:
             raise Exception(f"Kimi API {response.status_code}: {body[:300]}")
         data = response.json()
         return data["choices"][0]["message"]["content"]
+
+
+_VALUE_FILTER_SYSTEM = """You are a strict quality gatekeeper for an Interac e-Transfer product intelligence report. Your job is to score each numbered item 1–5 on insight value for a payments product manager.
+
+# SCORING RUBRIC
+
+**5 — Excellent (include):** Specific personal experience with concrete details (dollar amount, bank name, timeframe) AND a clear problem/frustration/comparison/workaround.
+Example: "TD held my $2,400 e-Transfer for 5 days, their agent blamed Interac."
+
+**4 — Strong (include):** Personal experience OR a concrete market development with specific detail. Clear insight.
+Example: "Switched from e-Transfer to Wise for anything over $1k — saves $40 per transfer."
+
+**3 — Borderline (include):** Has some specific content — a named product, a specific comparison, or a real user question with context.
+Example: "Does anyone else's bank charge for Interac e-Transfer now?"
+
+**2 — Weak (EXCLUDE):** Generic mention, no personal experience, no concrete detail.
+Example: "e-Transfer is convenient for sending money."
+
+**1 — Junk (EXCLUDE):** Promotional, explainer content, crypto/web3 tangents, affirmations with no insight, prize/contest mentions, off-topic.
+Examples:
+- "Yes Interac e-Transfer from your Canadian bank. No fees 🇨🇦"
+- "e-transfer is a product from Interac, which is an interbank network..."
+- "This @daimo integration delivers a clean off-ramp from @CADCstablecoin via Interac e-Transfer"
+- "Win $500 via e-Transfer!"
+
+# OUTPUT FORMAT
+
+For EVERY numbered item you receive, output exactly one line:
+
+`<number>|<score>|<one-line reason>`
+
+Example output:
+```
+1|5|specific TD hold with dollar amount
+2|1|crypto stablecoin tangent, no user experience
+3|2|generic affirmation, no detail
+4|4|clear Wise vs e-Transfer comparison
+```
+
+Output scores for ALL items. Nothing else. No preamble, no summary."""
+
+
+def _build_value_filter_input(mentions: list[dict]) -> str:
+    """Format mentions as numbered blocks for Kimi scoring."""
+    lines = []
+    for i, m in enumerate(mentions, 1):
+        snippet = " ".join((m.get("snippet", "") or "").split())[:400]
+        title = (m.get("title", "") or "")[:120]
+        source = m.get("source", "unknown")
+        lines.append(f"[{i}] {source}")
+        lines.append(f"  Title: {title}")
+        lines.append(f"  Snippet: {snippet}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _parse_value_scores(response: str, count: int) -> dict[int, int]:
+    """Parse '<n>|<score>|<reason>' lines from Kimi into {index: score}."""
+    scores = {}
+    for line in response.splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        parts = line.split("|", 2)
+        if len(parts) < 2:
+            continue
+        try:
+            idx = int(parts[0].strip().lstrip("[").rstrip("]"))
+            score = int(parts[1].strip())
+            if 1 <= idx <= count and 1 <= score <= 5:
+                scores[idx] = score
+        except ValueError:
+            continue
+    return scores
+
+
+async def kimi_filter_by_value(mentions: list[dict], min_score: int = 3) -> list[dict]:
+    """Run Kimi value filter. Returns only mentions scoring >= min_score.
+
+    Items not scored by Kimi (parse failures) are kept as a safety fallback —
+    better to let the final prompt see them than silently drop them.
+    """
+    if not mentions or not KIMI_API_KEY:
+        return mentions
+
+    user_content = _build_value_filter_input(mentions)
+    if len(user_content) > 30000:
+        user_content = user_content[:30000]
+
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            r = await client.post(
+                KIMI_API_URL,
+                headers={"Authorization": f"Bearer {KIMI_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": KIMI_MODEL,
+                    "messages": [
+                        {"role": "system", "content": _VALUE_FILTER_SYSTEM},
+                        {"role": "user", "content": user_content},
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 3000,
+                },
+            )
+            if r.status_code != 200:
+                logger.warning(f"[value-filter] Kimi {r.status_code}: {r.text[:200]}")
+                return mentions  # fallback: keep everything
+            raw = r.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.warning(f"[value-filter] error: {e} — skipping filter")
+        return mentions
+
+    scores = _parse_value_scores(raw, len(mentions))
+    kept = []
+    drop_scores = []
+    for i, m in enumerate(mentions, 1):
+        score = scores.get(i)
+        if score is None:
+            kept.append(m)  # unscored → keep (safe default)
+        elif score >= min_score:
+            m["_kimi_value"] = score
+            kept.append(m)
+        else:
+            drop_scores.append(score)
+
+    logger.info(
+        f"[value-filter] {len(mentions)} in → {len(kept)} kept "
+        f"(dropped {len(drop_scores)}, scored={len(scores)}, unscored={len(mentions) - len(scores)})"
+    )
+    return kept
 
 
 async def curate_with_kimi(raw_mentions: str) -> str:

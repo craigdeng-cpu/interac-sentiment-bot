@@ -67,3 +67,22 @@ Output bullet points only. No headers, no introduction, no commentary, no blank 
 ```
 
 Target **5–8 bullets**. Include fewer if the material is genuinely thin. Only write `Nothing notable this scan.` if nothing qualifies.
+
+---
+
+## HARD RULE — READ BEFORE OUTPUTTING
+
+Every bullet MUST contain at least one of:
+- A specific personal experience (first-person: "I", "my", "we")
+- A concrete detail (dollar amount, bank name, timeframe)
+- A clear comparison or switch ("moved to X", "better than Y")
+- A specific frustration with a named product behaviour
+
+**NEVER include a bullet that is any of these:**
+- Generic affirmations (e.g. "Yes, Interac e-Transfer from your bank. No fees 🇨🇦")
+- Explainers describing what e-Transfer is
+- Crypto/stablecoin/web3 content that merely mentions e-Transfer
+- Promotional posts, giveaways, or contests
+- Passing references where e-Transfer is incidental
+
+**Three strong bullets beat six weak ones.** If fewer than 3 posts meet this bar, output `Nothing notable this scan.`

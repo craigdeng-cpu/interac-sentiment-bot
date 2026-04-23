@@ -70,3 +70,23 @@ Output bullet points only. No headers, no introduction, no commentary, no blank 
 ```
 
 Target **6–8 bullets**. If the data supports more strong items, include up to 10. Only write `Nothing notable this scan.` if nothing qualifies.
+
+---
+
+## HARD RULE — READ BEFORE OUTPUTTING
+
+Every bullet MUST be one of:
+- A concrete market event (launch, acquisition, pricing change, partnership, policy change)
+- A specific adoption/volume stat with a number
+- A real user reaction comparing or switching between products (Reddit/Twitter)
+- A regulatory or policy development
+
+**NEVER include a bullet that is any of these:**
+- Internal corporate events (conferences, awards, team announcements)
+- Individual user incident reports (personal loss stories)
+- Generic explainer content
+- Vague marketing language with no concrete claim
+- Quarterly earnings with no product detail
+- Promotional posts or giveaways
+
+**Four strong bullets beat eight weak ones.** If fewer than 4 items meet this bar, output `Nothing notable this scan.`

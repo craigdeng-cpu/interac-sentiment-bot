@@ -23,7 +23,17 @@
     "Interac e-Transfer site:reddit.com/r/personalfinancecanada",
     "e-transfer fraud OR scam OR stolen site:reddit.com",
     "e-transfer declined OR hold OR pending site:reddit.com/r/personalfinancecanada",
-    "interac e-transfer issue OR problem site:reddit.com/r/canada"
+    "interac e-transfer issue OR problem site:reddit.com/r/canada",
+    "e-transfer held OR pending OR stuck site:reddit.com",
+    "TD OR RBC OR CIBC OR BMO OR Scotiabank e-transfer site:reddit.com",
+    "e-transfer limit too low site:reddit.com/r/personalfinancecanada",
+    "interac auto-deposit site:reddit.com",
+    "got scammed e-transfer site:reddit.com",
+    "e-transfer site:reddit.com/r/askTO",
+    "e-transfer site:reddit.com/r/ontario",
+    "interac e-transfer frustrating OR annoying site:reddit.com",
+    "bank held my e-transfer site:reddit.com",
+    "e-transfer vs wise OR paypal site:reddit.com/r/personalfinancecanada"
   ],
   "competitor_queries": [
     "PayPal new feature OR launch OR update canada 2025 OR 2026",
