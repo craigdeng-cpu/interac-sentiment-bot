@@ -1668,6 +1668,7 @@ async def fetch_biweekly_mentions() -> str:
     # This is what catches "Yes Interac e-Transfer. No fees 🇨🇦" regex can't.
     # Save pre-filter pool to allow diversity floor afterwards.
     etransfer_social_prefilter = list(etransfer_social)
+    competitor_mentions_prefilter = list(competitor_mentions)
     logger.info("[value-filter] running Kimi value filter on 3 buckets in parallel...")
     etransfer_social, etransfer_press, competitor_mentions = await asyncio.gather(
         kimi_filter_by_value(etransfer_social, min_score=3),
@@ -1704,6 +1705,21 @@ async def fetch_biweekly_mentions() -> str:
         if twitter_rescue:
             etransfer_social = etransfer_social + twitter_rescue
             logger.info(f"[diversity-floor] rescued {len(twitter_rescue)} Twitter items")
+
+    # ── Market Pulse floor ──────────────────────────────────────────────────────
+    # If competitor mentions drop below 3 after Kimi filter, pull highest-scoring
+    # pre-filter items (which may have score-2) up to a floor of 4.
+    if len(competitor_mentions) < 3:
+        # Get pre-filter items, sorted by quality score, take top N to reach floor
+        competitor_rescue = sorted(
+            [(m, _mention_quality_score(m, "competitor")) for m in competitor_mentions_prefilter],
+            key=lambda x: x[1], reverse=True
+        )
+        needed = 4 - len(competitor_mentions)
+        rescue_items = [m for m, _ in competitor_rescue[:needed]]
+        if rescue_items:
+            competitor_mentions = competitor_mentions + rescue_items
+            logger.info(f"[market-floor] rescued {len(rescue_items)} competitor items to reach floor of 4")
 
     total = len(etransfer_social) + len(etransfer_press) + len(competitor_mentions)
     if total == 0:

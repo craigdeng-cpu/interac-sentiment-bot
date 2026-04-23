@@ -89,4 +89,4 @@ Every bullet MUST be one of:
 - Quarterly earnings with no product detail
 - Promotional posts or giveaways
 
-**Four strong bullets beat eight weak ones.** If fewer than 4 items meet this bar, output `Nothing notable this scan.`
+**Four strong bullets beat eight weak ones.** If fewer than 3 items meet this bar, output `Nothing notable this scan.`
