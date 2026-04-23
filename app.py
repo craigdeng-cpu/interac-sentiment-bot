@@ -1446,7 +1446,13 @@ async def fetch_biweekly_mentions() -> str:
     etransfer_ddg_queries = config.get("etransfer_queries", config.get("biweekly_queries", []))
     competitor_ddg_queries = config.get("competitor_queries", [])
 
-    seen_links: set[str] = set()
+    # Load previously-seen URLs so we don't recycle stale content across runs
+    _memory = _load_biweekly_memory()
+    previously_sent: set[str] = set(_memory.get("sent_urls", []))
+    if previously_sent:
+        logger.info(f"[dedup] filtering against {len(previously_sent)} previously-sent URLs")
+
+    seen_links: set[str] = set(previously_sent)  # pre-seed so fetched items skip already-sent URLs
     etransfer_social: list[dict] = []
     etransfer_press: list[dict] = []
     competitor_mentions: list[dict] = []
@@ -1504,6 +1510,8 @@ async def fetch_biweekly_mentions() -> str:
                 seen_links.add(link)
                 r["_fetch_method"] = "reddit_json"
                 etransfer_social.append(r)
+
+    logger.info(f"[reddit-api] et-Transfer community returned {len(etransfer_social)} posts")
 
     # ── 2. Reddit — competitor community reactions (with comment enrichment) ──
     # enrich_comments=True: for posts score>=5, fetches top comment via .json trick
@@ -1570,6 +1578,29 @@ async def fetch_biweekly_mentions() -> str:
             r["_fetch_method"] = "ddg_text"
             etransfer_social.append(r)
 
+    # ── 3b. Mandatory Reddit DDG fallback (runs regardless of skip_ddg) ─────────
+    # Reddit API is frequently blocked on Railway. These site:reddit.com queries
+    # via DDG always run to ensure Reddit content reaches the pool.
+    reddit_ddg_fallback = [
+        "interac e-transfer site:reddit.com/r/personalfinancecanada",
+        "e-transfer problem OR scam site:reddit.com",
+        "e-transfer held pending stuck site:reddit.com",
+        "bank e-transfer issue site:reddit.com/r/canada",
+        "interac auto-deposit site:reddit.com",
+    ]
+    for q in reddit_ddg_fallback:
+        rr = await web_search(q, "search", 5, tbs="qdr:m")
+        for r in rr:
+            link = r.get("link", "")
+            if not link or link in seen_links or _is_blocked_domain(link):
+                continue
+            seen_links.add(link)
+            r["channel"] = "people"
+            r["source"] = "Reddit"
+            r["_fetch_method"] = "ddg_reddit_fallback"
+            etransfer_social.append(r)
+    logger.info(f"[reddit-ddg-fallback] etransfer_social now {len(etransfer_social)} posts")
+
     # ── Platform helpers (defined here so tiered-fetch can use them) ──────────
     def _is_reddit(m: dict) -> bool:
         return "reddit.com" in (m.get("link") or "").lower() or m.get("source") == "Reddit"
@@ -1618,7 +1649,7 @@ async def fetch_biweekly_mentions() -> str:
 
         async def _fetch_comp_query(query: str) -> dict:
             async with ddg_sem:
-                tasks: list = [web_search(query, "search", 12, tbs="qdr:y")]
+                tasks: list = [web_search(query, "search", 12, tbs="qdr:m")]
                 if not _has_site_restriction(query):
                     tasks.append(search_google_news(query, max_results=8))
                 res = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1770,9 +1801,9 @@ async def fetch_biweekly_mentions() -> str:
     competitor_mentions_prefilter = list(competitor_mentions)
     logger.info("[value-filter] running Kimi value filter on 3 buckets in parallel...")
     etransfer_social, etransfer_press, competitor_mentions = await asyncio.gather(
-        kimi_filter_by_value(etransfer_social, min_score=2),
-        kimi_filter_by_value(etransfer_press, min_score=2),
-        kimi_filter_by_value(competitor_mentions, min_score=2),
+        kimi_filter_by_value(etransfer_social, min_score=3),
+        kimi_filter_by_value(etransfer_press, min_score=3),
+        kimi_filter_by_value(competitor_mentions, min_score=3),
     )
     logger.info(
         f"[fetch-sources] after Kimi value filter — "
@@ -1911,8 +1942,10 @@ Example: "Switched from e-Transfer to Wise for anything over $1k — saves $40 p
 **3 — Borderline (include):** Has some specific content — a named product, a specific comparison, or a real user question with context.
 Example: "Does anyone else's bank charge for Interac e-Transfer now?"
 
-**2 — Weak (EXCLUDE):** Generic mention, no personal experience, no concrete detail.
+**2 — Weak (EXCLUDE):** Generic mention, no personal experience, no concrete detail. IMPORTANT: Opinion or editorial content that contains statistics or industry data (e.g. "Interac is a monopoly, they charge $0.20/tx and processed 2 billion transactions") scores 2, NOT 3 — it is analysis/opinion, not a personal user experience. Planning or future-tense posts ("I plan to make a transfer today") score 2.
 Example: "e-Transfer is convenient for sending money."
+Example: "Interac is a monopoly because they control all P2P payments in Canada."
+Example: "I'm going to test if I get prompted for 2FA next time."
 
 **1 — Junk (EXCLUDE):** Promotional, explainer content, crypto/web3 tangents, affirmations with no insight, prize/contest mentions, off-topic.
 Examples:
@@ -2115,7 +2148,9 @@ async def analyze_biweekly(mentions_text: str) -> str:
     )
 
     themes = _extract_biweekly_themes(report)
-    _save_biweekly_memory(themes, scan_date)
+    # Extract URLs from the full mentions pool so they're deduped next run
+    sent_urls = re.findall(r"URL:\s*(https?://\S+)", mentions_text)
+    _save_biweekly_memory(themes, scan_date, new_urls=sent_urls)
     _append_biweekly_excel(scan_date, report)
 
     return report
@@ -2608,13 +2643,17 @@ def _load_biweekly_memory() -> dict:
         return {}
 
 
-def _save_biweekly_memory(themes: dict, scan_date: str) -> None:
+def _save_biweekly_memory(themes: dict, scan_date: str, new_urls: list[str] | None = None) -> None:
     try:
         BIWEEKLY_MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        existing = _load_biweekly_memory()
+        prev_urls: list[str] = existing.get("sent_urls", [])
+        merged_urls = list(dict.fromkeys(prev_urls + (new_urls or [])))[-150:]
         data = {
             "last_scan_date": scan_date,
             "etransfer_themes": themes.get("etransfer_themes", []),
             "competitor_themes": themes.get("competitor_themes", []),
+            "sent_urls": merged_urls,
         }
         BIWEEKLY_MEMORY_PATH.write_text(json.dumps(data, indent=2))
     except Exception as e:
