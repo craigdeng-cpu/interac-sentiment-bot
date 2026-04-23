@@ -1614,14 +1614,24 @@ async def fetch_biweekly_mentions() -> str:
     def _is_twitter(m: dict) -> bool:
         return m.get("source") == "X/Twitter"
 
-    # Pure quality sort — no platform floor. If Twitter has nothing good,
-    # Twitter is absent. Quality beats forced diversity. Kimi value filter
-    # (run later) provides the real quality gate.
+    # Score by quality, then stratify by platform to ensure both Reddit and Twitter
+    # get representational slots before Kimi filter. Prevents Reddit volume from crowding
+    # out Twitter in the top-50 cut. Quality ordering preserved within each platform.
     all_scored = sorted(
         [(m, _mention_quality_score(m, "etransfer")) for m in etransfer_social],
         key=lambda x: x[1], reverse=True,
     )
-    etransfer_social = [m for m, _ in all_scored[:50]]  # wider pool for Kimi filter
+
+    # Stratify: take top N from each platform, then merge
+    reddit_scored = [(m, s) for m, s in all_scored if _is_reddit(m)]
+    twitter_scored = [(m, s) for m, s in all_scored if _is_twitter(m)]
+    other_scored = [(m, s) for m, s in all_scored if not _is_reddit(m) and not _is_twitter(m)]
+
+    reddit_pool = [m for m, _ in reddit_scored[:25]]
+    twitter_pool = [m for m, _ in twitter_scored[:15]]
+    other_pool = [m for m, _ in other_scored[:10]]
+
+    etransfer_social = reddit_pool + twitter_pool + other_pool
 
     reddit_count  = sum(1 for m in etransfer_social if _is_reddit(m))
     twitter_count = sum(1 for m in etransfer_social if _is_twitter(m))
