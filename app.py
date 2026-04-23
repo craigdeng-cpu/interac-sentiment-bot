@@ -1518,75 +1518,89 @@ async def fetch_biweekly_mentions() -> str:
             r["_fetch_method"] = "ddg_text"
             etransfer_social.append(r)
 
+    # ── Tiered fetch: decide whether to run DDG ──
+    # If Reddit API + Twitter provided enough content, skip slow DDG calls.
+    # Otherwise, DDG is the fallback for Railway IP blocking.
+    et_social_threshold = 15  # minimum items from Reddit/Twitter before skipping DDG
+    comp_threshold = 5         # minimum items from Reddit before skipping DDG
+    skip_ddg = len(etransfer_social) >= et_social_threshold and len(competitor_mentions) >= comp_threshold
+    if skip_ddg:
+        logger.info(
+            f"[tiered-fetch] skipping DDG: "
+            f"etransfer_social={len(etransfer_social)}>={et_social_threshold}, "
+            f"competitor={len(competitor_mentions)}>={comp_threshold}"
+        )
+
     # ── 3b. DDG — e-Transfer supplement ──
     # This is the critical fallback path when Reddit API is blocked on the server.
     # Subreddit-scoped site: queries (site:reddit.com/r/personalfinancecanada) are
     # far more reliable in DDG than the broad site:reddit.com domain restriction.
     # News search added for non-site-restricted queries to get dated press articles.
-    for query in etransfer_ddg_queries:
-        # Text search (Reddit, RFD, general web)
-        results = await web_search(query, "search", 5, tbs="qdr:m")
-        for r in results:
-            link = r.get("link", "")
-            if not link or link in seen_links or _is_blocked_domain(link):
-                continue
-            seen_links.add(link)
-            channel, source = _classify_channel_and_source(link)
-            r["channel"] = channel
-            r["source"] = source
-            r["_fetch_method"] = "ddg_text"
-            if channel == "people":
-                etransfer_social.append(r)
-            else:
-                etransfer_press.append(r)
-
-        if not _has_site_restriction(query):
-            # News search — always includes dates, catches press coverage
-            news_results = await web_search(query, "news", 5, tbs="qdr:m")
-            for r in news_results:
-                link = r.get("link", "")
-                if not link or link in seen_links or _is_blocked_domain(link):
-                    continue
-                seen_links.add(link)
-                channel, source = _classify_channel_and_source(link)
-                r["channel"] = channel
-                r["source"] = source
-                r["_fetch_method"] = "ddg_news"
-                if channel == "people":
-                    etransfer_social.append(r)
-                elif not _is_low_quality_market_content(r):
-                    etransfer_press.append(r)
-
-            # X/Twitter — cap at 3 per query to keep Reddit competitive in the pool
-            x_results = await search_twitter(query, 3, tbs="qdr:m")
-            for r in x_results:
-                link = r.get("link", "")
-                if not link or link in seen_links or _is_blocked_domain(link):
-                    continue
-                seen_links.add(link)
-                r["channel"] = "people"
-                r["source"] = "X/Twitter"
-                r["_fetch_method"] = "ddg_text"
-                etransfer_social.append(r)
-
-    # ── 4. DDG — market pulse: product news + community reactions ──
-    # Use qdr:y so product launches and updates from the past year are captured.
-    # Skip Twitter searches for competitors (latency cost > value for right column).
-    for query in competitor_ddg_queries:
-        for search_type, tbs in [("search", "qdr:y"), ("news", "qdr:y")]:
-            results = await web_search(query, search_type, 12, tbs=tbs)
+    if not skip_ddg:
+        for query in etransfer_ddg_queries:
+            # Text search (Reddit, RFD, general web)
+            results = await web_search(query, "search", 5, tbs="qdr:m")
             for r in results:
                 link = r.get("link", "")
                 if not link or link in seen_links or _is_blocked_domain(link):
                     continue
-                if _is_low_quality_market_content(r):
-                    continue
                 seen_links.add(link)
                 channel, source = _classify_channel_and_source(link)
                 r["channel"] = channel
                 r["source"] = source
-                r["_fetch_method"] = f"ddg_{search_type}"
-                competitor_mentions.append(r)
+                r["_fetch_method"] = "ddg_text"
+                if channel == "people":
+                    etransfer_social.append(r)
+                else:
+                    etransfer_press.append(r)
+
+            if not _has_site_restriction(query):
+                # News search — always includes dates, catches press coverage
+                news_results = await web_search(query, "news", 5, tbs="qdr:m")
+                for r in news_results:
+                    link = r.get("link", "")
+                    if not link or link in seen_links or _is_blocked_domain(link):
+                        continue
+                    seen_links.add(link)
+                    channel, source = _classify_channel_and_source(link)
+                    r["channel"] = channel
+                    r["source"] = source
+                    r["_fetch_method"] = "ddg_news"
+                    if channel == "people":
+                        etransfer_social.append(r)
+                    elif not _is_low_quality_market_content(r):
+                        etransfer_press.append(r)
+
+                # X/Twitter — cap at 3 per query to keep Reddit competitive in the pool
+                x_results = await search_twitter(query, 3, tbs="qdr:m")
+                for r in x_results:
+                    link = r.get("link", "")
+                    if not link or link in seen_links or _is_blocked_domain(link):
+                        continue
+                    seen_links.add(link)
+                    r["channel"] = "people"
+                    r["source"] = "X/Twitter"
+                    r["_fetch_method"] = "ddg_text"
+                    etransfer_social.append(r)
+
+        # ── 4. DDG — market pulse: product news + community reactions ──
+        # Use qdr:y so product launches and updates from the past year are captured.
+        # Skip Twitter searches for competitors (latency cost > value for right column).
+        for query in competitor_ddg_queries:
+            for search_type, tbs in [("search", "qdr:y"), ("news", "qdr:y")]:
+                results = await web_search(query, search_type, 12, tbs=tbs)
+                for r in results:
+                    link = r.get("link", "")
+                    if not link or link in seen_links or _is_blocked_domain(link):
+                        continue
+                    if _is_low_quality_market_content(r):
+                        continue
+                    seen_links.add(link)
+                    channel, source = _classify_channel_and_source(link)
+                    r["channel"] = channel
+                    r["source"] = source
+                    r["_fetch_method"] = f"ddg_{search_type}"
+                    competitor_mentions.append(r)
 
     # Date backfill: Reddit .json for undated thread URLs (e.g. DDG-only Reddit hits),
     # then HTML <head> meta for other undated URLs (cap excludes Reddit threads filled above).
@@ -1670,9 +1684,9 @@ async def fetch_biweekly_mentions() -> str:
     competitor_mentions_prefilter = list(competitor_mentions)
     logger.info("[value-filter] running Kimi value filter on 3 buckets in parallel...")
     etransfer_social, etransfer_press, competitor_mentions = await asyncio.gather(
-        kimi_filter_by_value(etransfer_social, min_score=3),
-        kimi_filter_by_value(etransfer_press, min_score=3),
-        kimi_filter_by_value(competitor_mentions, min_score=3),
+        kimi_filter_by_value(etransfer_social, min_score=2),
+        kimi_filter_by_value(etransfer_press, min_score=2),
+        kimi_filter_by_value(competitor_mentions, min_score=2),
     )
     logger.info(
         f"[fetch-sources] after Kimi value filter — "
