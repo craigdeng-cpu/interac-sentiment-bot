@@ -1057,20 +1057,25 @@ async def _search_twitter_io(query: str, max_results: int = 10) -> list[dict]:
         likes = tweet.get("likeCount") or 0
         retweets = tweet.get("retweetCount") or 0
 
-        # HARDER bar: must have engagement AND at least one insight signal.
-        # Old bar was too permissive — "Yes Interac e transfer... No fees 🇨🇦"
-        # passed because it had 1 like and the word "Interac".
-        has_engagement = (likes + retweets) >= 2
+        # Balanced bar: engagement ≥ 1 AND at least one insight signal,
+        # OR engagement = 0 BUT at least two strong signals (for fresh tweets
+        # that haven't been liked yet). Value filter handles the rest.
+        has_engagement = (likes + retweets) >= 1
         has_pronoun = bool(_PRONOUN_RE.search(text))
         has_dollar = bool(_DOLLAR_AMOUNT_RE.search(text))
         has_bank = any(bank in text.lower() for bank in _CANADIAN_BANK_NAMES)
         has_question = "?" in text
         has_insight_token = any(tok in text.lower() for tok in _INSIGHT_SIGNAL_TOKENS)
 
-        # Must have engagement PLUS at least one concrete-experience signal.
         concrete_signals = sum([has_pronoun, has_dollar, has_bank, has_question, has_insight_token])
-        if not has_engagement or concrete_signals < 1:
-            continue
+
+        if has_engagement:
+            if concrete_signals < 1:
+                continue
+        else:
+            # No engagement — require stronger content signal
+            if concrete_signals < 2:
+                continue
 
         results.append({
             "title": f"Tweet by @{username}" if username else "Tweet",
@@ -1661,6 +1666,8 @@ async def fetch_biweekly_mentions() -> str:
     # Runs Kimi over every mention and scores it 1–5 on insight value.
     # Anything scoring <3 is dropped before the final generation prompt sees it.
     # This is what catches "Yes Interac e-Transfer. No fees 🇨🇦" regex can't.
+    # Save pre-filter pool to allow diversity floor afterwards.
+    etransfer_social_prefilter = list(etransfer_social)
     logger.info("[value-filter] running Kimi value filter on 3 buckets in parallel...")
     etransfer_social, etransfer_press, competitor_mentions = await asyncio.gather(
         kimi_filter_by_value(etransfer_social, min_score=3),
@@ -1673,6 +1680,30 @@ async def fetch_biweekly_mentions() -> str:
         f"etransfer_press={len(etransfer_press)} | "
         f"competitor={len(competitor_mentions)}"
     )
+
+    # ── Diversity floor (post-filter) ────────────────────────────────────────
+    # If after all filtering one platform is completely absent but the other
+    # has plenty, pull in the top 1–2 pre-filter items from the empty platform.
+    # Quality stays primary — we only restore diversity when the gap is stark.
+    def _platform_count(items: list[dict], check: callable) -> int:
+        return sum(1 for m in items if check(m))
+
+    reddit_after = _platform_count(etransfer_social, _is_reddit)
+    twitter_after = _platform_count(etransfer_social, _is_twitter)
+
+    if reddit_after == 0 and twitter_after >= 3:
+        # Twitter is dominating; pull best Reddit items from pre-filter pool
+        reddit_rescue = [m for m in etransfer_social_prefilter if _is_reddit(m)][:2]
+        if reddit_rescue:
+            etransfer_social = etransfer_social + reddit_rescue
+            logger.info(f"[diversity-floor] rescued {len(reddit_rescue)} Reddit items")
+
+    if twitter_after == 0 and reddit_after >= 3:
+        # Reddit is dominating; pull best Twitter items from pre-filter pool
+        twitter_rescue = [m for m in etransfer_social_prefilter if _is_twitter(m)][:2]
+        if twitter_rescue:
+            etransfer_social = etransfer_social + twitter_rescue
+            logger.info(f"[diversity-floor] rescued {len(twitter_rescue)} Twitter items")
 
     total = len(etransfer_social) + len(etransfer_press) + len(competitor_mentions)
     if total == 0:
