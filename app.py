@@ -1590,9 +1590,16 @@ async def fetch_biweekly_mentions() -> str:
         "e-transfer held pending stuck site:reddit.com",
         "bank e-transfer issue site:reddit.com/r/canada",
         "interac auto-deposit site:reddit.com",
+        "e-transfer declined OR failed OR error site:reddit.com",
+        "TD OR RBC OR CIBC OR Scotiabank e-transfer problem site:reddit.com",
+        "e-transfer limit increase OR workaround site:reddit.com",
+        "e-transfer scam send back site:reddit.com",
+        "interac e-transfer delay hours site:reddit.com",
+        "e-transfer not received site:reddit.com/r/personalfinancecanada",
+        "e-transfer fraud unauthorized site:reddit.com",
     ]
     for q in reddit_ddg_fallback:
-        rr = await web_search(q, "search", 5, tbs="qdr:m")
+        rr = await web_search(q, "search", 8, tbs="qdr:m")
         for r in rr:
             link = r.get("link", "")
             if not link or link in seen_links or _is_blocked_domain(link):
@@ -1640,10 +1647,10 @@ async def fetch_biweekly_mentions() -> str:
 
         async def _fetch_et_query(query: str) -> dict:
             async with ddg_sem:
-                tasks: list = [web_search(query, "search", 5, tbs="qdr:m")]
+                tasks: list = [web_search(query, "search", 8, tbs="qdr:m")]
                 if not _has_site_restriction(query):
-                    tasks.append(search_google_news(query, max_results=5))
-                    tasks.append(search_twitter(query, 3, tbs="qdr:m"))
+                    tasks.append(search_google_news(query, max_results=8))
+                    tasks.append(search_twitter(query, 4, tbs="qdr:m"))
                 res = await asyncio.gather(*tasks, return_exceptions=True)
             text = res[0] if not isinstance(res[0], Exception) else []
             news = (res[1] if not isinstance(res[1], Exception) else []) if len(res) > 1 else []

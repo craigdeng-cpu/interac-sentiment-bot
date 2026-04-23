@@ -37,7 +37,13 @@
     "e-transfer pending hours canada",
     "canadian e-transfer problem",
     "interac transfer stuck canada",
-    "e-transfer technical issue canada"
+    "e-transfer technical issue canada",
+    "e-transfer unauthorized OR unknown deposit site:reddit.com",
+    "interac e-transfer 2FA OR verification site:reddit.com",
+    "e-transfer limit increase site:reddit.com/r/personalfinancecanada",
+    "sent wrong e-transfer OR wrong recipient site:reddit.com",
+    "e-transfer not showing up site:reddit.com",
+    "interac e-transfer business account site:reddit.com"
   ],
   "competitor_queries": [
     "fintech canada funding 2026",
@@ -48,13 +54,23 @@
     "PayPal canada news 2025 OR 2026",
     "Wise money transfer canada 2025 OR 2026",
     "Wealthsimple cash update 2025 OR 2026",
+    "Revolut OR Neo Financial canada launch 2026",
+    "KOHO OR Tangerine canada new feature 2026",
+    "Apple Pay OR Google Pay canada expansion 2026",
+    "open banking canada update 2026",
+    "Payments Canada real-time rail update 2026",
+    "canadian neobank launch OR update 2026",
+    "cross-border payments canada news 2026",
     "best e-transfer alternative site:reddit.com/r/personalfinancecanada",
     "wise vs interac site:reddit.com",
     "switched from e-transfer site:reddit.com",
-    "payment app comparison site:reddit.com",
+    "payment app comparison site:reddit.com/r/personalfinancecanada",
+    "wealthsimple cash OR koho OR wise review site:reddit.com",
     "fintech trends canada site:reddit.com",
     "canadian payment services site:reddit.com",
-    "money transfer app review canada"
+    "money transfer app review canada",
+    "interac competitor canada 2026",
+    "digital payments canada consumer 2026"
   ],
   "timezone": "US/Eastern"
 }
