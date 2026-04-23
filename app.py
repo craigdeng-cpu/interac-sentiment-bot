@@ -20,7 +20,9 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from collections import defaultdict
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse, quote
+from email.utils import parsedate_to_datetime
+import xml.etree.ElementTree as ET
 
 import httpx
 from ddgs import DDGS
@@ -1111,6 +1113,56 @@ async def search_twitter(query: str, max_results: int = 5, tbs: str = "qdr:w") -
     return base_results
 
 
+async def search_google_news(query: str, max_results: int = 10) -> list[dict]:
+    """Fetch Google News RSS (CA-geo). Returns normalized mention dicts with reliable dates."""
+    url = (
+        f"https://news.google.com/rss/search?q={quote(query)}"
+        f"&hl=en-CA&gl=CA&ceid=CA:en"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, follow_redirects=True)
+            resp.raise_for_status()
+    except Exception as e:
+        logger.warning(f"[google-news] failed for '{query}': {e}")
+        return []
+
+    items = []
+    try:
+        root = ET.fromstring(resp.text)
+        for item in root.findall(".//item")[:max_results]:
+            link = item.findtext("link", "") or ""
+            if not link:
+                continue
+            title   = item.findtext("title", "") or ""
+            pub_raw = item.findtext("pubDate", "") or ""
+            desc    = item.findtext("description", "") or ""
+            source_el = item.find("source")
+            source_name = (source_el.text if source_el is not None else "Google News") or "Google News"
+
+            date_str = ""
+            if pub_raw:
+                try:
+                    dt = parsedate_to_datetime(pub_raw)
+                    date_str = dt.strftime("%B %d, %Y")
+                except Exception:
+                    pass
+
+            items.append({
+                "title":   title,
+                "link":    link,
+                "snippet": re.sub(r"<[^>]+>", "", desc).strip(),
+                "date":    date_str,
+                "source":  source_name,
+                "_fetch_method": "google_news_rss",
+            })
+    except ET.ParseError as e:
+        logger.warning(f"[google-news] parse error for '{query}': {e}")
+        return []
+
+    return items
+
+
 _REDDIT_HEADERS = {
     "User-Agent": "python:interac.intelligence.bot:v1.0 (by /u/interac_intel_bot)"
 }
@@ -1569,8 +1621,8 @@ async def fetch_biweekly_mentions() -> str:
                     etransfer_press.append(r)
 
             if not _has_site_restriction(query):
-                # News search — always includes dates, catches press coverage
-                news_results = await web_search(query, "news", 5, tbs="qdr:m")
+                # Google News RSS: replaces DDG news — reliable dates, CA-targeted
+                news_results = await search_google_news(query, max_results=5)
                 for r in news_results:
                     link = r.get("link", "")
                     if not link or link in seen_links or _is_blocked_domain(link):
@@ -1579,7 +1631,6 @@ async def fetch_biweekly_mentions() -> str:
                     channel, source = _classify_channel_and_source(link)
                     r["channel"] = channel
                     r["source"] = source
-                    r["_fetch_method"] = "ddg_news"
                     if channel == "people":
                         etransfer_social.append(r)
                     elif not _is_low_quality_market_content(r):
@@ -1597,23 +1648,35 @@ async def fetch_biweekly_mentions() -> str:
                     r["_fetch_method"] = "ddg_text"
                     etransfer_social.append(r)
 
-        # ── 4. DDG — market pulse: product news + community reactions ──
-        # Use qdr:y so product launches and updates from the past year are captured.
-        # Skip Twitter searches for competitors (latency cost > value for right column).
+        # ── 4. Market pulse: DDG text (forums/Reddit) + Google News RSS (press) ──
         for query in competitor_ddg_queries:
-            for search_type, tbs in [("search", "qdr:y"), ("news", "qdr:y")]:
-                results = await web_search(query, search_type, 12, tbs=tbs)
-                for r in results:
+            # DDG text: Reddit discussions, forum posts, general web
+            results = await web_search(query, "search", 12, tbs="qdr:y")
+            for r in results:
+                link = r.get("link", "")
+                if not link or link in seen_links or _is_blocked_domain(link):
+                    continue
+                if _is_low_quality_market_content(r):
+                    continue
+                seen_links.add(link)
+                channel, source = _classify_channel_and_source(link)
+                r["channel"] = channel
+                r["source"] = source
+                r["_fetch_method"] = "ddg_search"
+                competitor_mentions.append(r)
+
+            # Google News RSS: replaces DDG news — reliable dates, CA-targeted
+            if not _has_site_restriction(query):
+                gn_results = await search_google_news(query, max_results=8)
+                for r in gn_results:
                     link = r.get("link", "")
                     if not link or link in seen_links or _is_blocked_domain(link):
                         continue
                     if _is_low_quality_market_content(r):
                         continue
                     seen_links.add(link)
-                    channel, source = _classify_channel_and_source(link)
-                    r["channel"] = channel
-                    r["source"] = source
-                    r["_fetch_method"] = f"ddg_{search_type}"
+                    r["channel"] = "press"
+                    r["_fetch_method"] = "google_news_rss"
                     competitor_mentions.append(r)
 
     # Date backfill: Reddit .json for undated thread URLs (e.g. DDG-only Reddit hits),
