@@ -1597,16 +1597,45 @@ async def fetch_biweekly_mentions() -> str:
         f"competitor={len(competitor_mentions)} skip_ddg={skip_ddg}"
     )
 
-    # ── 3b. DDG — e-Transfer supplement ──
-    # This is the critical fallback path when Reddit API is blocked on the server.
-    # Subreddit-scoped site: queries (site:reddit.com/r/personalfinancecanada) are
-    # far more reliable in DDG than the broad site:reddit.com domain restriction.
-    # News search added for non-site-restricted queries to get dated press articles.
+    # ── 3b + 4. DDG + Google News — parallel fetch with semaphore ──────────────
+    # Semaphore limits to 5 concurrent queries to avoid DDG rate-limiting.
+    # Each query fetches sub-searches concurrently. Results are post-processed
+    # in order so seen_links dedup is safe (no shared state during gather).
     if not skip_ddg:
-        for query in etransfer_ddg_queries:
-            # Text search (Reddit, RFD, general web)
-            results = await web_search(query, "search", 5, tbs="qdr:m")
-            for r in results:
+        ddg_sem = asyncio.Semaphore(5)
+
+        async def _fetch_et_query(query: str) -> dict:
+            async with ddg_sem:
+                tasks: list = [web_search(query, "search", 5, tbs="qdr:m")]
+                if not _has_site_restriction(query):
+                    tasks.append(search_google_news(query, max_results=5))
+                    tasks.append(search_twitter(query, 3, tbs="qdr:m"))
+                res = await asyncio.gather(*tasks, return_exceptions=True)
+            text = res[0] if not isinstance(res[0], Exception) else []
+            news = (res[1] if not isinstance(res[1], Exception) else []) if len(res) > 1 else []
+            twit = (res[2] if not isinstance(res[2], Exception) else []) if len(res) > 2 else []
+            return {"text": text, "news": news, "twitter": twit}
+
+        async def _fetch_comp_query(query: str) -> dict:
+            async with ddg_sem:
+                tasks: list = [web_search(query, "search", 12, tbs="qdr:y")]
+                if not _has_site_restriction(query):
+                    tasks.append(search_google_news(query, max_results=8))
+                res = await asyncio.gather(*tasks, return_exceptions=True)
+            text = res[0] if not isinstance(res[0], Exception) else []
+            news = (res[1] if not isinstance(res[1], Exception) else []) if len(res) > 1 else []
+            return {"text": text, "news": news}
+
+        et_batches, comp_batches = await asyncio.gather(
+            asyncio.gather(*[_fetch_et_query(q) for q in etransfer_ddg_queries], return_exceptions=True),
+            asyncio.gather(*[_fetch_comp_query(q) for q in competitor_ddg_queries], return_exceptions=True),
+        )
+
+        # ── Post-process e-Transfer DDG results ──
+        for item in et_batches:
+            if isinstance(item, Exception):
+                continue
+            for r in item["text"]:
                 link = r.get("link", "")
                 if not link or link in seen_links or _is_blocked_domain(link):
                     continue
@@ -1619,40 +1648,33 @@ async def fetch_biweekly_mentions() -> str:
                     etransfer_social.append(r)
                 else:
                     etransfer_press.append(r)
-
-            if not _has_site_restriction(query):
-                # Google News RSS: replaces DDG news — reliable dates, CA-targeted
-                news_results = await search_google_news(query, max_results=5)
-                for r in news_results:
-                    link = r.get("link", "")
-                    if not link or link in seen_links or _is_blocked_domain(link):
-                        continue
-                    seen_links.add(link)
-                    channel, source = _classify_channel_and_source(link)
-                    r["channel"] = channel
-                    r["source"] = source
-                    if channel == "people":
-                        etransfer_social.append(r)
-                    elif not _is_low_quality_market_content(r):
-                        etransfer_press.append(r)
-
-                # X/Twitter — cap at 3 per query to keep Reddit competitive in the pool
-                x_results = await search_twitter(query, 3, tbs="qdr:m")
-                for r in x_results:
-                    link = r.get("link", "")
-                    if not link or link in seen_links or _is_blocked_domain(link):
-                        continue
-                    seen_links.add(link)
-                    r["channel"] = "people"
-                    r["source"] = "X/Twitter"
-                    r["_fetch_method"] = "ddg_text"
+            for r in item["news"]:
+                link = r.get("link", "")
+                if not link or link in seen_links or _is_blocked_domain(link):
+                    continue
+                seen_links.add(link)
+                channel, source = _classify_channel_and_source(link)
+                r["channel"] = channel
+                r["source"] = source
+                if channel == "people":
                     etransfer_social.append(r)
+                elif not _is_low_quality_market_content(r):
+                    etransfer_press.append(r)
+            for r in item["twitter"]:
+                link = r.get("link", "")
+                if not link or link in seen_links or _is_blocked_domain(link):
+                    continue
+                seen_links.add(link)
+                r["channel"] = "people"
+                r["source"] = "X/Twitter"
+                r["_fetch_method"] = "ddg_text"
+                etransfer_social.append(r)
 
-        # ── 4. Market pulse: DDG text (forums/Reddit) + Google News RSS (press) ──
-        for query in competitor_ddg_queries:
-            # DDG text: Reddit discussions, forum posts, general web
-            results = await web_search(query, "search", 12, tbs="qdr:y")
-            for r in results:
+        # ── Post-process competitor DDG results ──
+        for item in comp_batches:
+            if isinstance(item, Exception):
+                continue
+            for r in item["text"]:
                 link = r.get("link", "")
                 if not link or link in seen_links or _is_blocked_domain(link):
                     continue
@@ -1664,20 +1686,16 @@ async def fetch_biweekly_mentions() -> str:
                 r["source"] = source
                 r["_fetch_method"] = "ddg_search"
                 competitor_mentions.append(r)
-
-            # Google News RSS: replaces DDG news — reliable dates, CA-targeted
-            if not _has_site_restriction(query):
-                gn_results = await search_google_news(query, max_results=8)
-                for r in gn_results:
-                    link = r.get("link", "")
-                    if not link or link in seen_links or _is_blocked_domain(link):
-                        continue
-                    if _is_low_quality_market_content(r):
-                        continue
-                    seen_links.add(link)
-                    r["channel"] = "press"
-                    r["_fetch_method"] = "google_news_rss"
-                    competitor_mentions.append(r)
+            for r in item["news"]:
+                link = r.get("link", "")
+                if not link or link in seen_links or _is_blocked_domain(link):
+                    continue
+                if _is_low_quality_market_content(r):
+                    continue
+                seen_links.add(link)
+                r["channel"] = "press"
+                r["_fetch_method"] = "google_news_rss"
+                competitor_mentions.append(r)
 
     # Date backfill: Reddit .json for undated thread URLs (e.g. DDG-only Reddit hits),
     # then HTML <head> meta for other undated URLs (cap excludes Reddit threads filled above).
