@@ -1949,6 +1949,28 @@ async def fetch_biweekly_mentions(*, quarterly: bool = False) -> str:
 
 
 # ─── Kimi K2.5 Analysis ──────────────────────────────────────────────────────
+def _kimi_max_user_chars_for_context(
+    system_prompt: str, *, max_tokens: int, max_user_chars: int, margin: int = 220
+) -> int:
+    """Moonshot chat completions enforce a total context budget (often 8192 on kimi-k2.5-preview).
+
+    Reserve space for system prompt, requested completion, and framing. Returns a safe
+    user-message character cap (conservative ~3 chars per token for mixed text).
+    """
+    try:
+        max_ctx = int(os.environ.get("KIMI_MAX_CONTEXT_TOKENS", "8192"))
+    except ValueError:
+        max_ctx = 8192
+    # Rough token estimate from UTF-8 text (good enough for budgeting).
+    sys_tok = max(1, (len(system_prompt) + 3) // 4)
+    reserved = sys_tok + max_tokens + margin
+    room = max_ctx - reserved
+    if room < 256:
+        room = 256
+    by_ctx = room * 3
+    return min(max_user_chars, by_ctx)
+
+
 async def call_kimi(
     system_prompt: str,
     user_content: str,
@@ -1958,9 +1980,21 @@ async def call_kimi(
     temperature: float = 0.3,
     timeout_sec: float = 120.0,
 ) -> str:
-    # Default caps suit biweekly two-column calls. Quarterly passes larger limits.
-    if len(user_content) > max_user_chars:
-        user_content = user_content[:max_user_chars] + "\n\n[... truncated]"
+    # Stay under provider total-token limit (system + user + max_tokens).
+    cap = _kimi_max_user_chars_for_context(
+        system_prompt, max_tokens=max_tokens, max_user_chars=max_user_chars
+    )
+    if len(user_content) > cap:
+        head = (cap * 2) // 3
+        tail = cap - head - 90
+        if tail < 256:
+            user_content = user_content[:cap] + "\n\n[... truncated for API context limit ...]"
+        else:
+            user_content = (
+                user_content[:head]
+                + "\n\n[... truncated for API context limit ...]\n\n"
+                + user_content[-tail:]
+            )
 
     async with httpx.AsyncClient(timeout=timeout_sec) as client:
         response = await client.post(
@@ -2215,8 +2249,87 @@ async def analyze_biweekly(mentions_text: str) -> str:
     return report
 
 
+# Quarterly analysis uses a map-reduce pattern so each Kimi request stays under typical
+# 8192-token chat completion limits (system + user + max_tokens).
+_QUARTERLY_CHUNK_CHARS = 3000
+_QUARTERLY_DIGEST_JOIN_MAX = 12000
+_QUARTERLY_COMPRESS_SYSTEM = """You compress raw Interac / competitor intelligence scan text into evidence lines.
+
+Rules:
+- Use ONLY the chunk below. Do not invent URLs, dates, or quotes.
+- Output markdown bullets only. Each bullet: a short verbatim quote or tight paraphrase, then " — " + platform/source if known from the chunk, then " Source: URL" using a URL that appears in the chunk for that item.
+- Prefer Interac e-Transfer, Canadian banks, and named payment competitors (Wise, PayPal, Wealthsimple, KOHO, Revolut, Apple Pay, Google Pay, Zelle, Venmo, Stripe, Square, Neo, etc.).
+- Tag [Retail] or [Commercial] at the start of a bullet only when the speaker context is obvious (personal P2P vs business/payroll/vendor).
+- If nothing here is usable, output exactly: (no signal in this chunk)
+- Keep the entire response under 3200 characters."""
+
+
+def _split_mentions_for_quarterly_compress(text: str, max_chars: int) -> list[str]:
+    """Split scan text into newline-friendly chunks each under ~max_chars."""
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+    blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
+    chunks: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for b in blocks:
+        extra = len(b) + (2 if cur else 0)
+        if cur_len + extra > max_chars and cur:
+            chunks.append("\n\n".join(cur))
+            cur = [b]
+            cur_len = len(b)
+        else:
+            cur.append(b)
+            cur_len += extra
+    if cur:
+        chunks.append("\n\n".join(cur))
+    out: list[str] = []
+    for ch in chunks:
+        if len(ch) <= max_chars:
+            out.append(ch)
+        else:
+            for i in range(0, len(ch), max_chars):
+                out.append(ch[i : i + max_chars])
+    return out
+
+
+async def _build_quarterly_evidence_digest(mentions_text: str) -> str:
+    """Run small Kimi compress jobs per chunk, then merge (with cap) for the final prompt."""
+    chunks = _split_mentions_for_quarterly_compress(mentions_text, _QUARTERLY_CHUNK_CHARS)
+    if not chunks:
+        return ""
+    sem = asyncio.Semaphore(3)
+
+    async def _compress_one(idx: int, body: str) -> str:
+        async with sem:
+            header = f"CHUNK {idx + 1} / {len(chunks)}\n\n"
+            payload = header + body
+            return await call_kimi(
+                _QUARTERLY_COMPRESS_SYSTEM,
+                payload,
+                max_user_chars=len(payload) + 20,
+                max_tokens=1100,
+                temperature=0.15,
+                timeout_sec=90.0,
+            )
+
+    parts = await asyncio.gather(*[_compress_one(i, c) for i, c in enumerate(chunks)])
+    merged = "\n\n=== NEXT CHUNK ===\n\n".join(p.strip() for p in parts if p.strip())
+    if len(merged) <= _QUARTERLY_DIGEST_JOIN_MAX:
+        return merged
+    half = _QUARTERLY_DIGEST_JOIN_MAX // 2
+    return (
+        merged[:half]
+        + "\n\n[... digest truncated: middle omitted for API context limit ...]\n\n"
+        + merged[-half:]
+    )
+
+
 async def analyze_quarterly(mentions_text: str) -> str:
-    """Single Kimi call: long-form quarterly market trends report."""
+    """Quarterly report via compress (map) + full prompt (reduce) to respect 8k context APIs."""
     config = load_prompts()
     prompt = (config.get("quarterly_market_trends_prompt") or "").strip()
     if not prompt:
@@ -2224,11 +2337,42 @@ async def analyze_quarterly(mentions_text: str) -> str:
 
     scan_date = now_est()
     prompt = prompt.replace("{timestamp}", scan_date)
+
+    # Fast path when the raw scan already fits one completion (short tests / thin pools).
+    single_cap = _kimi_max_user_chars_for_context(
+        prompt, max_tokens=2000, max_user_chars=20000
+    )
+    if len(mentions_text) + 400 <= single_cap:
+        logger.info("[quarterly] single-pass analysis (raw fits API context budget)")
+        report = await call_kimi(
+            prompt,
+            mentions_text,
+            max_user_chars=20000,
+            max_tokens=2000,
+            temperature=0.35,
+            timeout_sec=180.0,
+        )
+        return report.strip()
+
+    digest = await _build_quarterly_evidence_digest(mentions_text)
+    if not digest.strip():
+        digest = mentions_text[: _QUARTERLY_CHUNK_CHARS] + "\n\n[... raw truncated; compress pass empty ...]"
+
+    intro = (
+        "The text below is a **pre-compressed evidence digest** built from the full quarterly "
+        "raw scrape (split into API-sized chunks). Treat it as your only source material; "
+        "do not invent facts that are not supported by it.\n\n"
+    )
+    user_block = intro + digest
+
+    logger.info(
+        f"[quarterly] final Kimi call — digest {len(digest)} chars, system {len(prompt)} chars"
+    )
     report = await call_kimi(
         prompt,
-        mentions_text,
-        max_user_chars=48000,
-        max_tokens=6000,
+        user_block,
+        max_user_chars=20000,
+        max_tokens=2000,
         temperature=0.35,
         timeout_sec=180.0,
     )
