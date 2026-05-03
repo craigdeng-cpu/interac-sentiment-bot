@@ -10,7 +10,8 @@
     "biweekly_prompt": "prompts/biweekly_prompt.md",
     "curation_prompt": "prompts/curation_prompt.md",
     "etransfer_chatter_prompt": "prompts/etransfer_chatter_prompt.md",
-    "market_pulse_prompt": "prompts/market_pulse_prompt.md"
+    "market_pulse_prompt": "prompts/market_pulse_prompt.md",
+    "quarterly_market_trends_prompt": "prompts/quarterly_market_trends_prompt.md"
   },
   "etransfer_queries": [
     "Interac e-Transfer problem OR complaint OR delay Canada",

@@ -72,14 +72,17 @@ TWITTERAPI_IO_KEY = os.environ.get("TWITTERAPI_IO_KEY", "")
 TWITTERAPI_IO_URL = "https://api.twitterapi.io/twitter/tweet/advanced_search"
 
 EASTERN_TZ = ZoneInfo("America/Toronto")
+EST = EASTERN_TZ  # America/Toronto — used for scheduling and rate-limit day boundaries
 
 subscribed_chats: set[int] = set()
 last_report: str = ""
 last_mentions_raw: str = ""
 # Canonical URL (see _canonical_url_for_date_lookup) -> "Month DD, YYYY" from last biweekly fetch
 last_biweekly_url_dates: dict[str, str] = {}
+last_quarterly_url_dates: dict[str, str] = {}
 last_email_sent_at: datetime | None = None
 last_weekly_email_key: str | None = None
+last_quarterly_email_key: str | None = None
 
 # Per-user daily rate limiting
 user_usage: dict[int, dict] = defaultdict(lambda: {"count": 0, "date": None})
@@ -1435,27 +1438,40 @@ async def _search_diagnostic() -> str:
     return f"OK: {len(results)} results, first='{results[0].get('title', 'n/a')[:80]}'"
 
 
-async def fetch_biweekly_mentions() -> str:
-    """Fetch mentions for the universal biweekly scan.
+async def fetch_biweekly_mentions(*, quarterly: bool = False) -> str:
+    """Fetch mentions for the universal biweekly scan (or a wider quarterly pool).
 
     Strategy:
     - Reddit API (primary): exact dates, full post content, quality score filter.
       Used for both e-Transfer pain posts and competitor community reactions.
     - DDG (supplement): RFD, X/Twitter, news for things Reddit API can't cover.
     Results split into labelled sections so the LLM assigns them correctly.
+
+    When ``quarterly=True``:
+    - Rolling ~90-day window (no biweekly ``sent_urls`` dedupe — quarterly needs full history).
+    - Broader DDG time filter and larger per-section caps for the long-form report.
     """
-    global last_biweekly_url_dates
+    global last_biweekly_url_dates, last_quarterly_url_dates
     config = load_prompts()
     etransfer_ddg_queries = config.get("etransfer_queries", config.get("biweekly_queries", []))
     competitor_ddg_queries = config.get("competitor_queries", [])
 
-    # Load previously-seen URLs so we don't recycle stale content across runs
-    _memory = _load_biweekly_memory()
-    previously_sent: set[str] = set(_memory.get("sent_urls", []))
-    if previously_sent:
-        logger.info(f"[dedup] filtering against {len(previously_sent)} previously-sent URLs")
+    ddg_tbs = "" if quarterly else "qdr:m"
+    max_age_days = 90 if quarterly else MAX_MENTION_AGE_DAYS
 
-    seen_links: set[str] = set(previously_sent)  # pre-seed so fetched items skip already-sent URLs
+    def _rd_days(d: int) -> int:
+        return max(d, 90) if quarterly else d
+
+    # Biweekly: skip URLs already surfaced so scans stay fresh. Quarterly: do not
+    # dedupe against that list — the report must reflect the full ~90-day window.
+    _memory = _load_biweekly_memory()
+    previously_sent: set[str] = set()
+    if not quarterly:
+        previously_sent = set(_memory.get("sent_urls", []))
+        if previously_sent:
+            logger.info(f"[dedup] filtering against {len(previously_sent)} previously-sent URLs")
+
+    seen_links: set[str] = set(previously_sent)  # pre-seed (empty for quarterly)
     etransfer_social: list[dict] = []
     etransfer_press: list[dict] = []
     competitor_mentions: list[dict] = []
@@ -1500,8 +1516,8 @@ async def fetch_biweekly_mentions() -> str:
         ("frugalcanada", "e-transfer", 60),
     ]
 
-    et_search_tasks = [_search(q, sub, 60) for q, sub in reddit_et_searches]
-    et_browse_tasks = [_browse(sub, kw, days) for sub, kw, days in et_browse]
+    et_search_tasks = [_search(q, sub, _rd_days(60)) for q, sub in reddit_et_searches]
+    et_browse_tasks = [_browse(sub, kw, _rd_days(days)) for sub, kw, days in et_browse]
     et_batches = await asyncio.gather(*et_search_tasks, *et_browse_tasks, return_exceptions=True)
 
     for batch in et_batches:
@@ -1546,8 +1562,8 @@ async def fetch_biweekly_mentions() -> str:
         ("canada", "koho", 60),
     ]
 
-    comp_search_tasks = [_search(q, sub, 180, score=1, comments=True) for q, sub in reddit_comp_searches]
-    comp_browse_tasks = [_browse(sub, kw, days) for sub, kw, days in comp_browse]
+    comp_search_tasks = [_search(q, sub, _rd_days(180), score=1, comments=True) for q, sub in reddit_comp_searches]
+    comp_browse_tasks = [_browse(sub, kw, _rd_days(days)) for sub, kw, days in comp_browse]
     comp_batches = await asyncio.gather(*comp_search_tasks, *comp_browse_tasks, return_exceptions=True)
 
     for batch in comp_batches:
@@ -1570,7 +1586,7 @@ async def fetch_biweekly_mentions() -> str:
     ]
     for tq in et_twitter_queries:
         # Cap at 4 per query (down from 8) — prevents Twitter flooding the social pool
-        x_results = await search_twitter(tq, 4, tbs="qdr:m")
+        x_results = await search_twitter(tq, 4, tbs=ddg_tbs)
         for r in x_results:
             link = r.get("link", "")
             if not link or link in seen_links or _is_blocked_domain(link):
@@ -1599,7 +1615,7 @@ async def fetch_biweekly_mentions() -> str:
         "e-transfer fraud unauthorized site:reddit.com",
     ]
     for q in reddit_ddg_fallback:
-        rr = await web_search(q, "search", 8, tbs="qdr:m")
+        rr = await web_search(q, "search", 8, tbs=ddg_tbs)
         for r in rr:
             link = r.get("link", "")
             if not link or link in seen_links or _is_blocked_domain(link):
@@ -1647,10 +1663,10 @@ async def fetch_biweekly_mentions() -> str:
 
         async def _fetch_et_query(query: str) -> dict:
             async with ddg_sem:
-                tasks: list = [web_search(query, "search", 8, tbs="qdr:m")]
+                tasks: list = [web_search(query, "search", 8, tbs=ddg_tbs)]
                 if not _has_site_restriction(query):
                     tasks.append(search_google_news(query, max_results=8))
-                    tasks.append(search_twitter(query, 4, tbs="qdr:m"))
+                    tasks.append(search_twitter(query, 4, tbs=ddg_tbs))
                 res = await asyncio.gather(*tasks, return_exceptions=True)
             text = res[0] if not isinstance(res[0], Exception) else []
             news = (res[1] if not isinstance(res[1], Exception) else []) if len(res) > 1 else []
@@ -1659,7 +1675,7 @@ async def fetch_biweekly_mentions() -> str:
 
         async def _fetch_comp_query(query: str) -> dict:
             async with ddg_sem:
-                tasks: list = [web_search(query, "search", 12, tbs="qdr:m")]
+                tasks: list = [web_search(query, "search", 12, tbs=ddg_tbs)]
                 if not _has_site_restriction(query):
                     tasks.append(search_google_news(query, max_results=8))
                 res = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1757,9 +1773,14 @@ async def fetch_biweekly_mentions() -> str:
     twitter_scored = [(m, s) for m, s in all_scored if _is_twitter(m)]
     other_scored = [(m, s) for m, s in all_scored if not _is_reddit(m) and not _is_twitter(m)]
 
-    reddit_pool = [m for m, _ in reddit_scored[:17]]
-    twitter_pool = [m for m, _ in twitter_scored[:11]]
-    other_pool = [m for m, _ in other_scored[:7]]
+    if quarterly:
+        reddit_pool = [m for m, _ in reddit_scored[:28]]
+        twitter_pool = [m for m, _ in twitter_scored[:18]]
+        other_pool = [m for m, _ in other_scored[:14]]
+    else:
+        reddit_pool = [m for m, _ in reddit_scored[:17]]
+        twitter_pool = [m for m, _ in twitter_scored[:11]]
+        other_pool = [m for m, _ in other_scored[:7]]
 
     etransfer_social = reddit_pool + twitter_pool + other_pool
 
@@ -1773,13 +1794,13 @@ async def fetch_biweekly_mentions() -> str:
 
     # Make recency decisions only on dated content to avoid stale/undated drift.
     etransfer_social = _filter_recent_dated_mentions(
-        etransfer_social, max_age_days=MAX_MENTION_AGE_DAYS
+        etransfer_social, max_age_days=max_age_days
     )
     etransfer_press = _filter_recent_dated_mentions(
-        etransfer_press, max_age_days=MAX_MENTION_AGE_DAYS
+        etransfer_press, max_age_days=max_age_days
     )
     competitor_mentions = _filter_recent_dated_mentions(
-        competitor_mentions, max_age_days=MAX_MENTION_AGE_DAYS
+        competitor_mentions, max_age_days=max_age_days
     )
 
     # ── Source breakdown log ──────────────────────────────────────────────────
@@ -1874,10 +1895,14 @@ async def fetch_biweekly_mentions() -> str:
 
     total = len(etransfer_social) + len(etransfer_press) + len(competitor_mentions)
     if total == 0:
-        last_biweekly_url_dates = {}
-        return "No mentions found in the past month."
+        if quarterly:
+            last_quarterly_url_dates = {}
+        else:
+            last_biweekly_url_dates = {}
+        return "No mentions found in the configured lookback window."
 
-    lines = [f"=== INTERAC BIWEEKLY SCAN — {now_est()} ==="]
+    scan_banner = "QUARTERLY" if quarterly else "BIWEEKLY"
+    lines = [f"=== INTERAC {scan_banner} SCAN — {now_est()} ==="]
     lines.append(
         f"Total: {total} mentions "
         f"({len(etransfer_social)} e-Transfer community, {len(etransfer_press)} e-Transfer news, "
@@ -1898,33 +1923,46 @@ async def fetch_biweekly_mentions() -> str:
             out.append("")
         return out
 
+    s_cap, en_cap, c_cap = (100, 28, 100) if quarterly else (60, 15, 60)
+    s_snip, en_snip, c_snip = (900, 400, 550) if quarterly else (750, 300, 450)
+
     if etransfer_social:
         lines.append("=== e-TRANSFER COMMUNITY (REDDIT, RFD, X) ===")
-        lines += _fmt("S", etransfer_social, 60, 750)
+        lines += _fmt("S", etransfer_social, s_cap, s_snip)
 
     if etransfer_press:
         lines.append("=== e-TRANSFER NEWS ===")
-        lines += _fmt("EN", etransfer_press, 15, 300)
+        lines += _fmt("EN", etransfer_press, en_cap, en_snip)
 
     if competitor_mentions:
         lines.append("=== COMPETITOR INTELLIGENCE (Wise, PayPal, Apple Pay, Wealthsimple, KOHO, Venmo, Zelle, Revolut, Neo, ACH, others) ===")
-        lines += _fmt("C", competitor_mentions, 60, 450)
+        lines += _fmt("C", competitor_mentions, c_cap, c_snip)
 
-    last_biweekly_url_dates = _build_url_date_map_from_mentions(
+    url_map = _build_url_date_map_from_mentions(
         etransfer_social, etransfer_press, competitor_mentions
     )
+    if quarterly:
+        last_quarterly_url_dates = url_map
+    else:
+        last_biweekly_url_dates = url_map
     return "\n".join(lines)
 
 
 # ─── Kimi K2.5 Analysis ──────────────────────────────────────────────────────
-async def call_kimi(system_prompt: str, user_content: str) -> str:
-    # moonshot-v1-8k: 8192 token total limit.
-    # System ~500t + output 2000t = 2500t budget used. Leaves ~5600t for input.
-    # At ~3 chars/token: 5600 * 3 = 16800 chars. Cap at 10000 to be safe.
-    if len(user_content) > 10000:
-        user_content = user_content[:10000] + "\n\n[... truncated]"
+async def call_kimi(
+    system_prompt: str,
+    user_content: str,
+    *,
+    max_user_chars: int = 10000,
+    max_tokens: int = 2000,
+    temperature: float = 0.3,
+    timeout_sec: float = 120.0,
+) -> str:
+    # Default caps suit biweekly two-column calls. Quarterly passes larger limits.
+    if len(user_content) > max_user_chars:
+        user_content = user_content[:max_user_chars] + "\n\n[... truncated]"
 
-    async with httpx.AsyncClient(timeout=90) as client:
+    async with httpx.AsyncClient(timeout=timeout_sec) as client:
         response = await client.post(
             KIMI_API_URL,
             headers={
@@ -1937,8 +1975,8 @@ async def call_kimi(system_prompt: str, user_content: str) -> str:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
                 ],
-                "temperature": 0.3,
-                "max_tokens": 2000,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
             },
         )
         if response.status_code != 200:
@@ -2177,6 +2215,26 @@ async def analyze_biweekly(mentions_text: str) -> str:
     return report
 
 
+async def analyze_quarterly(mentions_text: str) -> str:
+    """Single Kimi call: long-form quarterly market trends report."""
+    config = load_prompts()
+    prompt = (config.get("quarterly_market_trends_prompt") or "").strip()
+    if not prompt:
+        raise ValueError("quarterly_market_trends_prompt is missing from prompts.json / prompts folder")
+
+    scan_date = now_est()
+    prompt = prompt.replace("{timestamp}", scan_date)
+    report = await call_kimi(
+        prompt,
+        mentions_text,
+        max_user_chars=48000,
+        max_tokens=6000,
+        temperature=0.35,
+        timeout_sec=180.0,
+    )
+    return report.strip()
+
+
 async def run_biweekly_scan(update: Update) -> None:
     """Run the universal biweekly e-Transfer intelligence scan and deliver to Telegram."""
     global last_report, last_mentions_raw
@@ -2252,6 +2310,11 @@ def _should_send_email(
         if current_weekly_key == last_weekly_email_key:
             return False, "weekly dedup"
 
+    if trigger == "quarterly" and EMAIL_ALERT_DEDUP and now_local is not None:
+        q_key = f"q-{now_local.date().isoformat()}"
+        if q_key == last_quarterly_email_key:
+            return False, "quarterly email dedup"
+
     if EMAIL_COOLDOWN_MINUTES > 0 and last_email_sent_at is not None:
         minutes_since = (datetime.now(timezone.utc) - last_email_sent_at).total_seconds() / 60.0
         if minutes_since < EMAIL_COOLDOWN_MINUTES:
@@ -2313,14 +2376,16 @@ def _validate_resend_config() -> tuple[bool, str]:
     return True, "ok"
 
 
-def _send_email_smtp(subject: str, body: str) -> tuple[bool, str]:
+def _send_email_smtp(
+    subject: str, body: str, url_dates: dict[str, str] | None = None
+) -> tuple[bool, str]:
     valid, reason = _validate_smtp_config()
     if not valid:
         logger.warning(f"Email send skipped: {reason}")
         return False, reason
 
     try:
-        text_body, html_body = build_email_bodies(subject, body)
+        text_body, html_body = build_email_bodies(subject, body, url_dates=url_dates)
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = EMAIL_FROM
@@ -2364,14 +2429,16 @@ def _smtp_login_check() -> tuple[bool, str]:
         return False, str(e)
 
 
-def _send_email_resend(subject: str, body: str) -> tuple[bool, str]:
+def _send_email_resend(
+    subject: str, body: str, url_dates: dict[str, str] | None = None
+) -> tuple[bool, str]:
     valid, reason = _validate_resend_config()
     if not valid:
         logger.warning(f"Email send skipped: {reason}")
         return False, reason
 
     try:
-        text_body, html_body = build_email_bodies(subject, body)
+        text_body, html_body = build_email_bodies(subject, body, url_dates=url_dates)
         response = httpx.post(
             RESEND_API_URL,
             headers={
@@ -2422,10 +2489,12 @@ def smtp_health_check() -> tuple[bool, str]:
     return False, f"SMTP health check failed: {send_reason}. {_smtp_config_summary()}"
 
 
-def send_email(subject: str, body: str) -> tuple[bool, str]:
+def send_email(
+    subject: str, body: str, url_dates: dict[str, str] | None = None
+) -> tuple[bool, str]:
     if EMAIL_PROVIDER == "resend":
-        return _send_email_resend(subject, body)
-    return _send_email_smtp(subject, body)
+        return _send_email_resend(subject, body, url_dates=url_dates)
+    return _send_email_smtp(subject, body, url_dates=url_dates)
 
 
 # ─── Preflight Checks ────────────────────────────────────────────────────────
@@ -2622,6 +2691,10 @@ EMAIL_ACCENT = "#175CD3"
 EMAIL_CONTAINER_WIDTH = "920"
 BIWEEKLY_MEMORY_PATH = Path(__file__).parent / "state" / "biweekly_memory.json"
 BIWEEKLY_EXCEL_PATH = Path(__file__).parent / "state" / "biweekly_reports.xlsx"
+QUARTERLY_MEMORY_PATH = Path(__file__).parent / "state" / "quarterly_memory.json"
+
+# Scheduled quarterly market-trends runs (America/Toronto calendar).
+QUARTERLY_RUN_MONTH_DAY: set[tuple[int, int]] = {(11, 1), (2, 1), (5, 1), (8, 1)}
 
 
 def _compact_panel(raw: str, empty_msg: str, *, max_lines: int = 3, list_mode: bool = True) -> str:
@@ -2679,6 +2752,35 @@ def _save_biweekly_memory(themes: dict, scan_date: str, new_urls: list[str] | No
         BIWEEKLY_MEMORY_PATH.write_text(json.dumps(data, indent=2))
     except Exception as e:
         logger.warning(f"Could not save biweekly memory: {e}")
+
+
+def _load_quarterly_memory() -> dict:
+    try:
+        if not QUARTERLY_MEMORY_PATH.exists():
+            return {}
+        return json.loads(QUARTERLY_MEMORY_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def _save_quarterly_memory(*, calendar_day_iso: str) -> None:
+    """Persist last successful quarterly run (Toronto calendar YYYY-MM-DD)."""
+    try:
+        QUARTERLY_MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        data = {"last_run_calendar_day": calendar_day_iso}
+        QUARTERLY_MEMORY_PATH.write_text(json.dumps(data, indent=2))
+    except Exception as e:
+        logger.warning(f"Could not save quarterly memory: {e}")
+
+
+def _quarterly_scan_due_today(now_local: datetime) -> tuple[bool, str]:
+    if (now_local.month, now_local.day) not in QUARTERLY_RUN_MONTH_DAY:
+        return False, "not a scheduled quarter-start day"
+    today = now_local.date().isoformat()
+    last_day = (_load_quarterly_memory().get("last_run_calendar_day") or "").strip()
+    if last_day == today:
+        return False, f"already completed quarterly run for {today}"
+    return True, "ok"
 
 
 def _extract_biweekly_themes(report: str) -> dict:
@@ -2995,10 +3097,12 @@ def build_email_bodies(
 
 
 def _record_email_sent(trigger: str, *, now_local: datetime | None = None) -> None:
-    global last_email_sent_at, last_weekly_email_key
+    global last_email_sent_at, last_weekly_email_key, last_quarterly_email_key
     last_email_sent_at = datetime.now(timezone.utc)
     if trigger == "weekly" and now_local is not None:
         last_weekly_email_key = weekly_key(now_local)
+    if trigger == "quarterly" and now_local is not None:
+        last_quarterly_email_key = f"q-{now_local.date().isoformat()}"
 
 
 def weekly_est_to_utc(day_name: str, hour_est: int) -> tuple[int, int]:
@@ -3065,6 +3169,32 @@ async def send_chunked_message(
         await _reply_with_fallback(prefix + chunk)
 
 
+async def send_chunked_plain_chat(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, chunk_size: int = 3900
+) -> None:
+    """Send a long plain-text message to a chat (e.g. scheduled jobs), respecting Telegram limits."""
+    if len(text) <= chunk_size:
+        await context.bot.send_message(chat_id=chat_id, text=text)
+        return
+    chunks: list[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= chunk_size:
+            chunks.append(remaining)
+            break
+        split_at = remaining.rfind("\n\n", 0, chunk_size)
+        if split_at < 0:
+            split_at = remaining.rfind("\n", 0, chunk_size)
+        if split_at < 0:
+            split_at = chunk_size
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+    total = len(chunks)
+    for idx, chunk in enumerate(chunks, 1):
+        prefix = f"({idx}/{total})\n" if total > 1 else ""
+        await context.bot.send_message(chat_id=chat_id, text=prefix + chunk)
+
+
 # ─── Scheduled Broadcast ─────────────────────────────────────────────────────
 async def scheduled_biweekly_broadcast(context: ContextTypes.DEFAULT_TYPE):
     """Daily job that runs the biweekly scan if 14+ days have passed since the last one."""
@@ -3117,6 +3247,57 @@ async def scheduled_biweekly_broadcast(context: ContextTypes.DEFAULT_TYPE):
         _untrack_task(tracked)
 
 
+async def scheduled_quarterly_market_trends(context: ContextTypes.DEFAULT_TYPE):
+    """Daily job: on Nov 1 / Feb 1 / May 1 / Aug 1 (Toronto), run the quarterly trends report once."""
+    now_local = datetime.now(EST)
+    due, reason = _quarterly_scan_due_today(now_local)
+    if not due:
+        logger.info(f"Quarterly market trends skipped: {reason}")
+        return
+
+    tracked = _track_current_task()
+    logger.info(f"[{now_est()}] Running scheduled quarterly market trends scan...")
+    try:
+        mentions = await asyncio.wait_for(fetch_biweekly_mentions(quarterly=True), timeout=600)
+        if mentions.startswith("No mentions"):
+            logger.warning(f"Quarterly scan: no data — {mentions[:200]}")
+            _save_quarterly_memory(calendar_day_iso=now_local.date().isoformat())
+            return
+
+        report = await asyncio.wait_for(analyze_quarterly(mentions), timeout=600)
+
+        message = f"Interac e-Transfer — Quarterly market trends — {now_est()}\n\n{report}"
+        for chat_id in subscribed_chats.copy():
+            try:
+                await send_chunked_plain_chat(context, chat_id, message)
+            except Exception as e:
+                logger.error(f"Failed to send quarterly report to {chat_id}: {e}")
+                subscribed_chats.discard(chat_id)
+
+        should_send, email_reason = _should_send_email(trigger="quarterly", now_local=now_local)
+        if should_send:
+            subject = f"{EMAIL_SUBJECT_PREFIX} — QUARTERLY MARKET TRENDS"
+            ok, send_reason = send_email(
+                subject,
+                message,
+                url_dates=last_quarterly_url_dates,
+            )
+            if ok:
+                _record_email_sent("quarterly", now_local=now_local)
+            else:
+                logger.error(f"Quarterly email failed: {send_reason}")
+        else:
+            logger.info(f"Quarterly email not sent: {email_reason}")
+
+        _save_quarterly_memory(calendar_day_iso=now_local.date().isoformat())
+    except asyncio.TimeoutError:
+        logger.error("Quarterly market trends scan timed out.")
+    except Exception as e:
+        logger.error(f"Scheduled quarterly market trends failed: {e}")
+    finally:
+        _untrack_task(tracked)
+
+
 # ─── Command Handlers ────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     subscribed_chats.add(update.effective_chat.id)
@@ -3132,6 +3313,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /prompt — View current config\n"
         "• /status — Check bot status\n"
         "• /email — Admin: run fresh biweekly scan + send email\n"
+        "• /quarterly — Admin: quarterly market trends report\n"
         "• /stop — Admin: cancel running jobs\n"
         "• /smtpcheck — Admin: check email config\n"
         "• Any text → Follow-up on latest report",
@@ -3154,7 +3336,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     et_count = len(config.get("etransfer_queries", config.get("biweekly_queries", [])))
     comp_count = len(config.get("competitor_queries", []))
     memory = _load_biweekly_memory()
+    qmem = _load_quarterly_memory()
     last_scan = memory.get("last_scan_date", "never")
+    last_q = qmem.get("last_run_calendar_day", "never")
     is_admin = "✅" if update.effective_user.id in ADMIN_IDS else "❌"
     resend_key_hint = f"✅ set ({RESEND_API_KEY[:6]}...)" if RESEND_API_KEY else "❌ missing"
     kimi_key_hint = f"✅ set ({KIMI_API_KEY[:6]}...)" if KIMI_API_KEY else "❌ missing"
@@ -3164,7 +3348,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Search provider: DuckDuckGo (ddgs)\n"
         f"e-Transfer queries: {et_count} | Competitor queries: {comp_count}\n"
         f"Last biweekly scan: {last_scan}\n"
+        f"Last quarterly market trends run (calendar day): {last_q}\n"
         f"Schedule: daily check at 9am EST, runs every 14 days\n"
+        f"Quarterly: Nov 1 / Feb 1 / May 1 / Aug 1 (same daily job time)\n"
         f"Subscribed chats: {len(subscribed_chats)}\n"
         f"Email provider: {EMAIL_PROVIDER}\n"
         f"Resend key: {resend_key_hint}\n"
@@ -3258,6 +3444,60 @@ async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _untrack_task(tracked)
 
 
+async def cmd_quarterly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: run the quarterly market-trends fetch + Kimi report (long timeout)."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    ok, msg = await preflight_check(check_email=False)
+    if not ok:
+        await update.message.reply_text(f"❌ Preflight failed — aborted:\n\n{msg}")
+        return
+
+    await update.message.reply_text(
+        "Running quarterly market trends scan (~90-day pool). This may take several minutes..."
+    )
+    tracked = _track_current_task()
+    try:
+        mentions = await asyncio.wait_for(fetch_biweekly_mentions(quarterly=True), timeout=600)
+        if mentions.startswith("No mentions"):
+            await update.message.reply_text(f"No data found.\n\n{mentions[:800]}")
+            return
+
+        await update.message.reply_text("Mentions collected. Running quarterly Kimi analysis...")
+        report = await asyncio.wait_for(analyze_quarterly(mentions), timeout=600)
+
+        out = f"Interac e-Transfer — Quarterly market trends — {now_est()}\n\n{report}"
+        await send_chunked_message(update, out)
+
+        now_local = datetime.now(EST)
+        should_send, email_reason = _should_send_email(trigger="quarterly", now_local=now_local)
+        if should_send:
+            subject = f"{EMAIL_SUBJECT_PREFIX} — QUARTERLY MARKET TRENDS (manual)"
+            ok_mail, send_reason = send_email(
+                subject,
+                out,
+                url_dates=last_quarterly_url_dates,
+            )
+            if ok_mail:
+                _record_email_sent("quarterly", now_local=now_local)
+                await update.message.reply_text("✅ Quarterly email sent.")
+            else:
+                await update.message.reply_text(f"⚠️ Quarterly email not sent: {send_reason}")
+        else:
+            await update.message.reply_text(f"ℹ️ Email skipped: {email_reason}")
+
+        _save_quarterly_memory(calendar_day_iso=now_local.date().isoformat())
+    except asyncio.TimeoutError:
+        await update.message.reply_text("⏱️ /quarterly timed out after 20 minutes.")
+    except Exception as e:
+        logger.error(f"/quarterly failed: {e}")
+        await update.message.reply_text(f"❌ /quarterly failed: {e}")
+    finally:
+        _untrack_task(tracked)
+
+
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Admin only.")
@@ -3317,6 +3557,7 @@ def main():
     app.add_handler(CommandHandler("raw", cmd_raw))
     app.add_handler(CommandHandler("prompt", cmd_prompt))
     app.add_handler(CommandHandler("email", cmd_email))
+    app.add_handler(CommandHandler("quarterly", cmd_quarterly))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("smtpcheck", cmd_smtpcheck))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -3327,6 +3568,11 @@ def main():
         scheduled_biweekly_broadcast,
         time=datetime.strptime("14:00", "%H:%M").time(),
         name="biweekly_scan",
+    )
+    job_queue.run_daily(
+        scheduled_quarterly_market_trends,
+        time=datetime.strptime("14:00", "%H:%M").time(),
+        name="quarterly_market_trends",
     )
 
     if WEBHOOK_URL:
