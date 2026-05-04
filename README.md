@@ -64,7 +64,7 @@ Admin only (`ADMIN_IDS`):
 |---|---|
 | `/email` | Run biweekly scan and send email now |
 | `/smtpcheck` | Validate email provider config/connectivity |
-| `/statefiles` | Download `biweekly_reports.xlsx` + `source_ledger.xlsx` from the server’s state dir |
+| `/statefiles` | Download `biweekly_reports.xlsx` (rolling per-mention pool) + `source_ledger.xlsx` from the server’s state dir |
 | `/stop` | Cancel active running tasks |
 
 ## Data pipeline
@@ -124,6 +124,8 @@ DAILY_LIMIT=5
 ### Persisted files (Excel + JSON)
 
 Biweekly memory, `biweekly_reports.xlsx`, `source_ledger.xlsx`, and quarterly memory live under **`STATE_DIR`** (default: `<repo>/state`). On Railway the default disk is **ephemeral** (cleared on redeploy) unless you use a **volume**.
+
+`biweekly_reports.xlsx` is a **rolling append-only log**: each biweekly run adds **one row per mention** included in the Kimi input pool (community, news, competitor), with the same inclusion/chatter/market columns as the biweekly rows in `source_ledger.xlsx`. Legacy one-row-per-scan sheets are reset automatically on the next run.
 
 ```bash
 # Optional: mount a Railway volume at e.g. /data, then:

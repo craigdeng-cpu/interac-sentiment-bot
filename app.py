@@ -74,6 +74,25 @@ def _resolve_state_dir() -> Path:
 STATE_DIR = _resolve_state_dir()
 BIWEEKLY_MEMORY_PATH = STATE_DIR / "biweekly_memory.json"
 BIWEEKLY_EXCEL_PATH = STATE_DIR / "biweekly_reports.xlsx"
+# One row per mention included in the Kimi input pool for this scan (rolling append).
+BIWEEKLY_POOL_HEADERS = (
+    "report_scan_datetime",
+    "run_calendar_date",
+    "source_bucket",
+    "url_original",
+    "source_label",
+    "channel",
+    "published_date",
+    "title",
+    "snippet_included_in_prompt",
+    "quality_score_heuristic",
+    "in_biweekly_chatter",
+    "in_biweekly_market_pulse",
+    "biweekly_chatter_bullet",
+    "biweekly_chatter_category",
+    "biweekly_market_bullet",
+    "pool_row_written_at",
+)
 SOURCE_LEDGER_PATH = STATE_DIR / "source_ledger.xlsx"
 QUARTERLY_MEMORY_PATH = STATE_DIR / "quarterly_memory.json"
 ATTACH_STATE_EXCEL_ON_BIWEEKLY = _env_bool("ATTACH_STATE_EXCEL_ON_BIWEEKLY")
@@ -2480,6 +2499,23 @@ def _excerpt_around_url(text: str, url_norm: str, *, radius: int = 450) -> str:
     return " ".join(text[start:end].split())
 
 
+def _biweekly_pool_maps_from_report_core(report_core: str) -> tuple[dict[str, list[str]], dict[str, list[str]], dict[str, list[str]]]:
+    """URL-keyed maps from finalized biweekly report text (for chatter/market inclusion columns)."""
+    chatter_raw = _extract_section(
+        report_core,
+        "e-Transfer Chatter:",
+        ["Market Pulse:", "Trend vs Last Scan:"],
+    )
+    market_raw = _extract_section(
+        report_core,
+        "Market Pulse:",
+        ["Trend vs Last Scan:"],
+    )
+    chatter_map, chatter_cat_map = _norm_url_to_chatter_lines(chatter_raw)
+    market_map = _norm_url_to_bullets(market_raw)
+    return chatter_map, chatter_cat_map, market_map
+
+
 def _append_source_ledger(
     *,
     run_type: str,
@@ -2502,18 +2538,9 @@ def _append_source_ledger(
     chatter_cat_map: dict[str, list[str]] = {}
     market_map: dict[str, list[str]] = {}
     if biweekly_report_for_match:
-        chatter_raw = _extract_section(
-            biweekly_report_for_match,
-            "e-Transfer Chatter:",
-            ["Market Pulse:", "Trend vs Last Scan:"],
+        chatter_map, chatter_cat_map, market_map = _biweekly_pool_maps_from_report_core(
+            biweekly_report_for_match
         )
-        market_raw = _extract_section(
-            biweekly_report_for_match,
-            "Market Pulse:",
-            ["Trend vs Last Scan:"],
-        )
-        chatter_map, chatter_cat_map = _norm_url_to_chatter_lines(chatter_raw)
-        market_map = _norm_url_to_bullets(market_raw)
 
     q_report_map: dict[str, list[str]] = {}
     if quarterly_report_for_match:
@@ -2655,6 +2682,97 @@ def _append_source_ledger(
     )
 
 
+def _append_biweekly_pool_excel(report_scan_datetime: str, report_core: str, sources: list[dict]) -> None:
+    """Append one row per mention in the Kimi input pool to biweekly_reports.xlsx (rolling evidence log)."""
+    try:
+        from openpyxl import Workbook, load_workbook
+    except ImportError:
+        logger.warning("openpyxl not available — skipping biweekly pool Excel")
+        return
+
+    if not sources:
+        logger.info("biweekly_reports.xlsx: empty source pool; skipping append")
+        return
+
+    run_cal = datetime.now(EST).date().isoformat()
+    written_at = datetime.now(timezone.utc).isoformat()
+    chatter_map, chatter_cat_map, market_map = _biweekly_pool_maps_from_report_core(report_core)
+
+    def _join_bullets(xs: list[str] | None) -> str:
+        if not xs:
+            return ""
+        return " | ".join(xs)
+
+    def _join_chatter_categories(keys: list[str] | None) -> str:
+        if not keys:
+            return ""
+        return " | ".join(CHATTER_CAT_LABELS.get(k, k) for k in keys)
+
+    def _pool_headers_ok(sheet) -> bool:
+        if sheet.max_row < 1:
+            return False
+        hdr = [c.value for c in sheet[1]]
+        return bool(hdr) and hdr[0] == "report_scan_datetime" and "url_original" in hdr
+
+    BIWEEKLY_EXCEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if BIWEEKLY_EXCEL_PATH.exists():
+        wb = load_workbook(BIWEEKLY_EXCEL_PATH)
+        ws = wb.active
+    else:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Biweekly pool"
+
+    if not _pool_headers_ok(ws):
+        logger.warning(
+            "biweekly_reports.xlsx: resetting active sheet to per-source pool layout "
+            "(replacing legacy one-row-per-scan or unknown headers)."
+        )
+        if ws.max_row:
+            ws.delete_rows(1, ws.max_row)
+        ws.append(list(BIWEEKLY_POOL_HEADERS))
+        ws.title = "Biweekly pool"
+
+    hdr = [c.value for c in ws[1]]
+    for src in sources:
+        url_o = src.get("url_original") or ""
+        nk = _normalize_url_for_match(url_o)
+        in_ch = "yes" if nk and nk in chatter_map else "no"
+        in_mp = "yes" if nk and nk in market_map else "no"
+        row = {
+            "report_scan_datetime": report_scan_datetime,
+            "run_calendar_date": run_cal,
+            "source_bucket": src.get("source_bucket", ""),
+            "url_original": url_o,
+            "source_label": src.get("source_label", ""),
+            "channel": src.get("channel", ""),
+            "published_date": src.get("published_date", ""),
+            "title": src.get("title", ""),
+            "snippet_included_in_prompt": src.get("snippet_included_in_prompt", ""),
+            "quality_score_heuristic": src.get("quality_score_heuristic", ""),
+            "in_biweekly_chatter": in_ch,
+            "in_biweekly_market_pulse": in_mp,
+            "biweekly_chatter_bullet": _join_bullets(chatter_map.get(nk)),
+            "biweekly_chatter_category": _join_chatter_categories(chatter_cat_map.get(nk)),
+            "biweekly_market_bullet": _join_bullets(market_map.get(nk)),
+            "pool_row_written_at": written_at,
+        }
+        ws.append([row.get(h, "") for h in hdr])
+
+    wb.save(BIWEEKLY_EXCEL_PATH)
+    bp = BIWEEKLY_EXCEL_PATH.resolve()
+    try:
+        bsz = bp.stat().st_size
+    except OSError:
+        bsz = -1
+    logger.info(
+        "state_excel biweekly_reports path=%s bytes=%s appended_pool_rows=%s",
+        bp,
+        bsz,
+        len(sources),
+    )
+
+
 async def analyze_biweekly(mentions_text: str, sources: list[dict]) -> str:
     """Two independent Kimi calls — one per column — then combine into one report."""
     config = load_prompts()
@@ -2689,7 +2807,7 @@ async def analyze_biweekly(mentions_text: str, sources: list[dict]) -> str:
     _save_biweekly_memory(themes, scan_date, new_urls=sent_urls)
     footer = _source_ledger_footer()
     delivered = report_core + footer
-    _append_biweekly_excel(scan_date, delivered)
+    _append_biweekly_pool_excel(scan_date, report_core, sources)
     _append_source_ledger(
         run_type="biweekly",
         report_scan_datetime=scan_date,
@@ -3332,14 +3450,6 @@ EMAIL_MUTED = "#667085"
 EMAIL_ACCENT = "#175CD3"
 EMAIL_CONTAINER_WIDTH = "920"
 # Persisted paths: STATE_DIR, BIWEEKLY_*_PATH, SOURCE_LEDGER_PATH, QUARTERLY_MEMORY_PATH (top of file).
-BIWEEKLY_EXCEL_HEADERS = (
-    "Scan Date",
-    "e-Transfer Chatter",
-    "Chatter category mix (Kimi)",
-    "Market Pulse",
-    "Trend vs Last Scan",
-    "Full Report",
-)
 
 # Scheduled quarterly market-trends runs (America/Toronto calendar).
 QUARTERLY_RUN_MONTH_DAY: set[tuple[int, int]] = {(11, 1), (2, 1), (5, 1), (8, 1)}
@@ -3453,85 +3563,6 @@ def _extract_biweekly_themes(report: str) -> dict:
         "etransfer_themes": _bullets_to_themes(etransfer_raw),
         "competitor_themes": _bullets_to_themes(competitor_raw),
     }
-
-
-def _maybe_migrate_biweekly_excel_headers(ws) -> list:
-    """Ensure ``Chatter category mix (Kimi)`` column exists; migrate legacy 5-column sheets."""
-    if ws.max_row < 1:
-        return list(BIWEEKLY_EXCEL_HEADERS)
-    hdr = [c.value for c in ws[1]]
-    if not hdr:
-        return list(BIWEEKLY_EXCEL_HEADERS)
-    if "Chatter category mix (Kimi)" in hdr:
-        return hdr
-    if len(hdr) == 5 and hdr[0] == "Scan Date" and hdr[2] == "Market Pulse":
-        ws.insert_cols(3, amount=1)
-        ws.cell(row=1, column=3, value="Chatter category mix (Kimi)")
-        return [c.value for c in ws[1]]
-    return hdr
-
-
-def _append_biweekly_excel(scan_date: str, report: str) -> None:
-    """Append biweekly report sections to Excel file for human review."""
-    try:
-        from openpyxl import Workbook, load_workbook
-
-        etransfer_raw = _extract_section(report, "e-Transfer Chatter:", ["Market Pulse:", "Trend vs Last Scan:"])
-        competitor_raw = _extract_section(report, "Market Pulse:", ["Trend vs Last Scan:"])
-        trend_raw = _extract_section(report, "Trend vs Last Scan:", [])
-
-        BIWEEKLY_EXCEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-        if BIWEEKLY_EXCEL_PATH.exists():
-            wb = load_workbook(BIWEEKLY_EXCEL_PATH)
-            ws = wb.active
-        else:
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Biweekly Reports"
-            ws.append(list(BIWEEKLY_EXCEL_HEADERS))
-
-        hdr = _maybe_migrate_biweekly_excel_headers(ws)
-        chatter_bullets: list[str] = []
-        for line in (etransfer_raw or "").splitlines():
-            s = line.strip()
-            if not (s.startswith("- ") or s.startswith("• ")):
-                continue
-            if "Nothing notable" in s:
-                continue
-            if not s[2:].strip():
-                continue
-            chatter_bullets.append(s)
-        counts = _chatter_category_counts(chatter_bullets)
-        total = sum(counts[k] for k in CHATTER_CAT_ORDER)
-        mix_parts: list[str] = []
-        if total:
-            for k in CHATTER_CAT_ORDER:
-                n = counts[k]
-                if not n:
-                    continue
-                pct = round(100.0 * n / total, 1)
-                mix_parts.append(f"{CHATTER_CAT_LABELS[k]} {n} ({pct}%)")
-        mix_cell = "; ".join(mix_parts)
-
-        row_map = {
-            "Scan Date": scan_date,
-            "e-Transfer Chatter": (etransfer_raw or "").strip(),
-            "Chatter category mix (Kimi)": mix_cell,
-            "Market Pulse": (competitor_raw or "").strip(),
-            "Trend vs Last Scan": (trend_raw or "").strip(),
-            "Full Report": report.strip(),
-        }
-        ws.append([row_map.get(h, "") for h in hdr])
-        wb.save(BIWEEKLY_EXCEL_PATH)
-        bp = BIWEEKLY_EXCEL_PATH.resolve()
-        try:
-            bsz = bp.stat().st_size
-        except OSError:
-            bsz = -1
-        logger.info("state_excel biweekly_reports path=%s bytes=%s", bp, bsz)
-    except Exception as e:
-        logger.warning(f"Could not append to Excel: {e}")
 
 
 def _styled_raw_report_html(subject: str, body: str) -> str:
@@ -4220,7 +4251,7 @@ async def _send_state_excel_bundle_to_chat(bot, chat_id: int, *, context_note: s
     sent = 0
     note = f" {context_note}" if context_note else ""
     for path, title in (
-        (BIWEEKLY_EXCEL_PATH, "Biweekly reports"),
+        (BIWEEKLY_EXCEL_PATH, "Biweekly pool (one row per mention in Kimi input)"),
         (SOURCE_LEDGER_PATH, "Source ledger"),
     ):
         if not path.is_file():
