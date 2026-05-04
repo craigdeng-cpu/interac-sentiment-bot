@@ -66,6 +66,7 @@ RESEND_API_URL = os.environ.get("RESEND_API_URL", "https://api.resend.com/emails
 EMAIL_FROM = os.environ.get("EMAIL_FROM", "")
 EMAIL_TO = [x.strip() for x in os.environ.get("EMAIL_TO", "").split(",") if x.strip()]
 EMAIL_SUBJECT_PREFIX = os.environ.get("EMAIL_SUBJECT_PREFIX", "Interac Intelligence")
+SOURCE_LEDGER_PUBLIC_URL = os.environ.get("SOURCE_LEDGER_PUBLIC_URL", "").strip()
 MAX_MENTION_AGE_DAYS = int(os.environ.get("MAX_MENTION_AGE_DAYS", "120"))
 QUALITY_STRICT = os.environ.get("QUALITY_STRICT", "1") == "1"
 TWITTERAPI_IO_KEY = os.environ.get("TWITTERAPI_IO_KEY", "")
@@ -169,7 +170,31 @@ def load_prompts() -> dict:
         else:
             raise FileNotFoundError(f"Missing prompt file for {prompt_key}: {prompt_path}")
 
+    ledger_url = source_ledger_display_url()
+    for k, v in list(config.items()):
+        if isinstance(v, str) and "{source_ledger_url}" in v:
+            config[k] = v.replace("{source_ledger_url}", ledger_url)
+
     return config
+
+
+def source_ledger_display_url() -> str:
+    """Human-facing location of the per-source Excel ledger (env or on-server fallback)."""
+    if SOURCE_LEDGER_PUBLIC_URL:
+        return SOURCE_LEDGER_PUBLIC_URL
+    return "On server: state/source_ledger.xlsx (not web-hosted)"
+
+
+def _source_ledger_footer() -> str:
+    return f"\n\nSource ledger: {source_ledger_display_url()}"
+
+
+def _strip_model_ledger_lines(text: str) -> str:
+    """Remove trailing `Source ledger: ...` lines models may emit; app adds one canonical footer."""
+    lines = (text or "").strip().splitlines()
+    while lines and "source ledger:" in lines[-1].lower():
+        lines.pop()
+    return "\n".join(lines).strip()
 
 
 # ─── Web Scraping ─────────────────────────────────────────────────────────────
@@ -1438,7 +1463,7 @@ async def _search_diagnostic() -> str:
     return f"OK: {len(results)} results, first='{results[0].get('title', 'n/a')[:80]}'"
 
 
-async def fetch_biweekly_mentions(*, quarterly: bool = False) -> str:
+async def fetch_biweekly_mentions(*, quarterly: bool = False) -> tuple[str, list[dict]]:
     """Fetch mentions for the universal biweekly scan (or a wider quarterly pool).
 
     Strategy:
@@ -1899,7 +1924,7 @@ async def fetch_biweekly_mentions(*, quarterly: bool = False) -> str:
             last_quarterly_url_dates = {}
         else:
             last_biweekly_url_dates = {}
-        return "No mentions found in the configured lookback window."
+        return ("No mentions found in the configured lookback window.", [])
 
     scan_banner = "QUARTERLY" if quarterly else "BIWEEKLY"
     lines = [f"=== INTERAC {scan_banner} SCAN — {now_est()} ==="]
@@ -1945,7 +1970,42 @@ async def fetch_biweekly_mentions(*, quarterly: bool = False) -> str:
         last_quarterly_url_dates = url_map
     else:
         last_biweekly_url_dates = url_map
-    return "\n".join(lines)
+
+    def _mention_source_row(m: dict, *, bucket: str, snippet_cap: int) -> dict:
+        link = (m.get("link") or "").strip()
+        ch, _src = _classify_channel_and_source(link)
+        sec = "competitor" if bucket == "competitor_intelligence" else "etransfer"
+        snip = " ".join((m.get("snippet", "") or "").split())[:snippet_cap]
+        return {
+            "source_bucket": bucket,
+            "url_original": link,
+            "source_label": m.get("source", "") or "",
+            "channel": (m.get("channel") or ch or ""),
+            "published_date": m.get("date") or "",
+            "title": (m.get("title", "") or "")[:120],
+            "snippet_included_in_prompt": snip,
+            "quality_score_heuristic": round(float(_mention_quality_score(m, sec)), 3),
+        }
+
+    sources: list[dict] = []
+    seen_pair: set[tuple[str, str]] = set()
+
+    def _add_source_row(m: dict, *, bucket: str, snippet_cap: int) -> None:
+        row = _mention_source_row(m, bucket=bucket, snippet_cap=snippet_cap)
+        key = (row["url_original"], row["source_bucket"])
+        if not row["url_original"] or key in seen_pair:
+            return
+        seen_pair.add(key)
+        sources.append(row)
+
+    for m in etransfer_social[:s_cap]:
+        _add_source_row(m, bucket="e_transfer_community", snippet_cap=s_snip)
+    for m in etransfer_press[:en_cap]:
+        _add_source_row(m, bucket="e_transfer_news", snippet_cap=en_snip)
+    for m in competitor_mentions[:c_cap]:
+        _add_source_row(m, bucket="competitor_intelligence", snippet_cap=c_snip)
+
+    return ("\n".join(lines), sources)
 
 
 # ─── Kimi K2.5 Analysis ──────────────────────────────────────────────────────
@@ -2214,7 +2274,217 @@ def _split_mentions_sections(mentions_text: str) -> tuple[str, str]:
     return community_text.strip(), market_text.strip()
 
 
-async def analyze_biweekly(mentions_text: str) -> str:
+def _normalize_url_for_match(url: str) -> str:
+    """Normalize URL for joining report bullets to ledger rows (not persisted as its own column)."""
+    u = (url or "").strip().rstrip(").,;]")
+    if not u:
+        return ""
+    if not u.startswith("http"):
+        u = "https://" + u
+    try:
+        p = urlparse(u)
+        netloc = (p.netloc or "").lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        path = (p.path or "").rstrip("/").lower()
+        return f"{netloc}{path}"
+    except Exception:
+        return re.sub(r"\?.*$", "", u.lower())
+
+
+def _norm_url_to_bullets(section_text: str) -> dict[str, list[str]]:
+    """Map normalized URL -> list of bullet lines in that section containing the URL."""
+    out: dict[str, list[str]] = {}
+    for line in (section_text or "").splitlines():
+        s = line.strip()
+        if "http" not in s:
+            continue
+        if not (s.startswith("-") or s.startswith("•") or re.match(r"^\d+\.\s", s)):
+            continue
+        for raw_u in re.findall(r"https?://[^\s\)\]<>\"']+", s):
+            key = _normalize_url_for_match(raw_u)
+            if key:
+                out.setdefault(key, []).append(s)
+    return out
+
+
+def _norm_url_to_lines_any(text: str) -> dict[str, list[str]]:
+    """Like _norm_url_to_bullets but matches any line containing a URL (for quarterly prose)."""
+    out: dict[str, list[str]] = {}
+    for line in (text or "").splitlines():
+        if "http" not in line:
+            continue
+        for raw_u in re.findall(r"https?://[^\s\)\]<>\"']+", line):
+            key = _normalize_url_for_match(raw_u)
+            if key:
+                out.setdefault(key, []).append(line.strip())
+    return out
+
+
+def _excerpt_around_url(text: str, url_norm: str, *, radius: int = 450) -> str:
+    if not text or not url_norm:
+        return ""
+    lower = text.lower()
+    idx = -1
+    for m in re.finditer(r"https?://[^\s\)\]<>\"']+", text):
+        if _normalize_url_for_match(m.group(0)) == url_norm:
+            idx = m.start()
+            break
+    if idx < 0:
+        return ""
+    start = max(0, idx - radius)
+    end = min(len(text), idx + radius)
+    return " ".join(text[start:end].split())
+
+
+def _append_source_ledger(
+    *,
+    run_type: str,
+    report_scan_datetime: str,
+    sources: list[dict],
+    biweekly_report_for_match: str | None = None,
+    quarterly_report_for_match: str | None = None,
+    quarterly_digest: str | None = None,
+    quarterly_digest_used: bool | None = None,
+) -> None:
+    """Append one row per source to state/source_ledger.xlsx (see plan for columns)."""
+    try:
+        from openpyxl import Workbook, load_workbook
+    except ImportError:
+        logger.warning("openpyxl not available — skipping source ledger")
+        return
+
+    run_cal = datetime.now(EST).date().isoformat()
+    chatter_map: dict[str, list[str]] = {}
+    market_map: dict[str, list[str]] = {}
+    if biweekly_report_for_match:
+        chatter_raw = _extract_section(
+            biweekly_report_for_match,
+            "e-Transfer Chatter:",
+            ["Market Pulse:", "Trend vs Last Scan:"],
+        )
+        market_raw = _extract_section(
+            biweekly_report_for_match,
+            "Market Pulse:",
+            ["Trend vs Last Scan:"],
+        )
+        chatter_map = _norm_url_to_bullets(chatter_raw)
+        market_map = _norm_url_to_bullets(market_raw)
+
+    q_report_map: dict[str, list[str]] = {}
+    if quarterly_report_for_match:
+        q_report_map = _norm_url_to_lines_any(quarterly_report_for_match)
+
+    q_digest_map: dict[str, list[str]] = {}
+    if quarterly_digest:
+        q_digest_map = _norm_url_to_lines_any(quarterly_digest)
+
+    written_at = datetime.now(timezone.utc).isoformat()
+
+    header = [
+        "run_type",
+        "report_scan_datetime",
+        "run_calendar_date",
+        "source_bucket",
+        "url_original",
+        "source_label",
+        "channel",
+        "published_date",
+        "title",
+        "snippet_included_in_prompt",
+        "quality_score_heuristic",
+        "in_biweekly_chatter",
+        "in_biweekly_market_pulse",
+        "biweekly_chatter_bullet",
+        "biweekly_market_bullet",
+        "in_quarterly_final_report",
+        "quarterly_report_excerpt",
+        "in_quarterly_compress_digest",
+        "quarterly_digest_excerpt",
+        "ledger_written_at",
+        "notes",
+    ]
+
+    SOURCE_LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if SOURCE_LEDGER_PATH.exists():
+        wb = load_workbook(SOURCE_LEDGER_PATH)
+        ws = wb.active
+    else:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Sources"
+        ws.append(header)
+
+    def _join_bullets(xs: list[str] | None) -> str:
+        if not xs:
+            return ""
+        return " | ".join(xs)
+
+    for src in sources:
+        url_o = src.get("url_original") or ""
+        nk = _normalize_url_for_match(url_o)
+        notes = ""
+
+        if run_type == "biweekly":
+            in_ch = "yes" if nk and nk in chatter_map else "no"
+            in_mp = "yes" if nk and nk in market_map else "no"
+            b_ch = _join_bullets(chatter_map.get(nk))
+            b_mp = _join_bullets(market_map.get(nk))
+            in_q = "n_a"
+            q_ex = ""
+            in_qd = "n_a"
+            qd_ex = ""
+        else:
+            in_ch = "n_a"
+            in_mp = "n_a"
+            b_ch = ""
+            b_mp = ""
+            in_q = "yes" if nk and nk in q_report_map else "no"
+            q_ex = _excerpt_around_url(quarterly_report_for_match or "", nk) if quarterly_report_for_match else ""
+            if quarterly_digest_used is True:
+                in_qd = "yes" if nk and nk in q_digest_map else "no"
+                qd_ex = _excerpt_around_url(quarterly_digest or "", nk) if quarterly_digest else ""
+            elif quarterly_digest_used is False:
+                in_qd = "n_a"
+                qd_ex = ""
+            else:
+                in_qd = "n_a"
+                qd_ex = ""
+
+        if nk and in_ch == "yes" and in_mp == "yes":
+            notes = "matched_both_biweekly_columns"
+
+        ws.append(
+            [
+                run_type,
+                report_scan_datetime,
+                run_cal,
+                src.get("source_bucket", ""),
+                url_o,
+                src.get("source_label", ""),
+                src.get("channel", ""),
+                src.get("published_date", ""),
+                src.get("title", ""),
+                src.get("snippet_included_in_prompt", ""),
+                src.get("quality_score_heuristic", ""),
+                in_ch,
+                in_mp,
+                b_ch,
+                b_mp,
+                in_q,
+                q_ex,
+                in_qd,
+                qd_ex,
+                written_at,
+                notes,
+            ]
+        )
+
+    wb.save(SOURCE_LEDGER_PATH)
+    logger.info(f"Appended {len(sources)} source ledger row(s) to {SOURCE_LEDGER_PATH}")
+
+
+async def analyze_biweekly(mentions_text: str, sources: list[dict]) -> str:
     """Two independent Kimi calls — one per column — then combine into one report."""
     config = load_prompts()
     community_text, market_text = _split_mentions_sections(mentions_text)
@@ -2228,9 +2498,11 @@ async def analyze_biweekly(mentions_text: str) -> str:
 
     chatter_bullets = await chatter_task if chatter_task else "Nothing notable this scan."
     market_bullets = await market_task if market_task else "Nothing notable this scan."
+    chatter_bullets = _strip_model_ledger_lines(chatter_bullets)
+    market_bullets = _strip_model_ledger_lines(market_bullets)
 
     scan_date = now_est()
-    report = (
+    report_core = (
         f"SCAN DATE: {scan_date}\n\n"
         f"e-Transfer Chatter:\n{chatter_bullets.strip()}\n\n"
         f"Market Pulse:\n{market_bullets.strip()}\n\n"
@@ -2240,13 +2512,21 @@ async def analyze_biweekly(mentions_text: str) -> str:
         f"- New this scan: none identified"
     )
 
-    themes = _extract_biweekly_themes(report)
+    themes = _extract_biweekly_themes(report_core)
     # Extract URLs from the full mentions pool so they're deduped next run
     sent_urls = re.findall(r"URL:\s*(https?://\S+)", mentions_text)
     _save_biweekly_memory(themes, scan_date, new_urls=sent_urls)
-    _append_biweekly_excel(scan_date, report)
+    footer = _source_ledger_footer()
+    delivered = report_core + footer
+    _append_biweekly_excel(scan_date, delivered)
+    _append_source_ledger(
+        run_type="biweekly",
+        report_scan_datetime=scan_date,
+        sources=sources,
+        biweekly_report_for_match=report_core,
+    )
 
-    return report
+    return delivered
 
 
 # Quarterly analysis uses a map-reduce pattern so each Kimi request stays under typical
@@ -2296,11 +2576,11 @@ def _split_mentions_for_quarterly_compress(text: str, max_chars: int) -> list[st
     return out
 
 
-async def _build_quarterly_evidence_digest(mentions_text: str) -> str:
-    """Run small Kimi compress jobs per chunk, then merge (with cap) for the final prompt."""
+async def _build_quarterly_evidence_digest(mentions_text: str) -> tuple[str, str]:
+    """Return (full_merged_digest, digest_for_final_kimi_input — may be truncated for context)."""
     chunks = _split_mentions_for_quarterly_compress(mentions_text, _QUARTERLY_CHUNK_CHARS)
     if not chunks:
-        return ""
+        return "", ""
     sem = asyncio.Semaphore(3)
 
     async def _compress_one(idx: int, body: str) -> str:
@@ -2319,17 +2599,18 @@ async def _build_quarterly_evidence_digest(mentions_text: str) -> str:
     parts = await asyncio.gather(*[_compress_one(i, c) for i, c in enumerate(chunks)])
     merged = "\n\n=== NEXT CHUNK ===\n\n".join(p.strip() for p in parts if p.strip())
     if len(merged) <= _QUARTERLY_DIGEST_JOIN_MAX:
-        return merged
+        return merged, merged
     half = _QUARTERLY_DIGEST_JOIN_MAX // 2
-    return (
+    trimmed = (
         merged[:half]
         + "\n\n[... digest truncated: middle omitted for API context limit ...]\n\n"
         + merged[-half:]
     )
+    return merged, trimmed
 
 
-async def analyze_quarterly(mentions_text: str) -> str:
-    """Quarterly report via compress (map) + full prompt (reduce) to respect 8k context APIs."""
+async def analyze_quarterly(mentions_text: str, sources: list[dict]) -> tuple[str, str | None, bool]:
+    """Quarterly report via compress (map) + full prompt (reduce). Returns (delivered_text, digest_full_or_none, digest_map_reduce_used)."""
     config = load_prompts()
     prompt = (config.get("quarterly_market_trends_prompt") or "").strip()
     if not prompt:
@@ -2338,45 +2619,74 @@ async def analyze_quarterly(mentions_text: str) -> str:
     scan_date = now_est()
     prompt = prompt.replace("{timestamp}", scan_date)
 
+    footer = _source_ledger_footer()
+
     # Fast path when the raw scan already fits one completion (short tests / thin pools).
     single_cap = _kimi_max_user_chars_for_context(
         prompt, max_tokens=2000, max_user_chars=20000
     )
     if len(mentions_text) + 400 <= single_cap:
         logger.info("[quarterly] single-pass analysis (raw fits API context budget)")
-        report = await call_kimi(
-            prompt,
-            mentions_text,
-            max_user_chars=20000,
-            max_tokens=2000,
-            temperature=0.35,
-            timeout_sec=180.0,
+        report_core = _strip_model_ledger_lines(
+            (
+                await call_kimi(
+                    prompt,
+                    mentions_text,
+                    max_user_chars=20000,
+                    max_tokens=2000,
+                    temperature=0.35,
+                    timeout_sec=180.0,
+                )
+            ).strip()
         )
-        return report.strip()
+        delivered = report_core + footer
+        _append_source_ledger(
+            run_type="quarterly",
+            report_scan_datetime=scan_date,
+            sources=sources,
+            quarterly_report_for_match=report_core,
+            quarterly_digest=None,
+            quarterly_digest_used=False,
+        )
+        return delivered, None, False
 
-    digest = await _build_quarterly_evidence_digest(mentions_text)
-    if not digest.strip():
-        digest = mentions_text[: _QUARTERLY_CHUNK_CHARS] + "\n\n[... raw truncated; compress pass empty ...]"
+    digest_full, digest_for_model = await _build_quarterly_evidence_digest(mentions_text)
+    if not digest_for_model.strip():
+        digest_for_model = mentions_text[: _QUARTERLY_CHUNK_CHARS] + "\n\n[... raw truncated; compress pass empty ...]"
+        digest_full = digest_for_model
 
     intro = (
         "The text below is a **pre-compressed evidence digest** built from the full quarterly "
         "raw scrape (split into API-sized chunks). Treat it as your only source material; "
         "do not invent facts that are not supported by it.\n\n"
     )
-    user_block = intro + digest
+    user_block = intro + digest_for_model
 
     logger.info(
-        f"[quarterly] final Kimi call — digest {len(digest)} chars, system {len(prompt)} chars"
+        f"[quarterly] final Kimi call — digest {len(digest_for_model)} chars, system {len(prompt)} chars"
     )
-    report = await call_kimi(
-        prompt,
-        user_block,
-        max_user_chars=20000,
-        max_tokens=2000,
-        temperature=0.35,
-        timeout_sec=180.0,
+    report_core = _strip_model_ledger_lines(
+        (
+            await call_kimi(
+                prompt,
+                user_block,
+                max_user_chars=20000,
+                max_tokens=2000,
+                temperature=0.35,
+                timeout_sec=180.0,
+            )
+        ).strip()
     )
-    return report.strip()
+    delivered = report_core + footer
+    _append_source_ledger(
+        run_type="quarterly",
+        report_scan_datetime=scan_date,
+        sources=sources,
+        quarterly_report_for_match=report_core,
+        quarterly_digest=digest_full,
+        quarterly_digest_used=True,
+    )
+    return delivered, digest_full, True
 
 
 async def run_biweekly_scan(update: Update) -> None:
@@ -2387,7 +2697,7 @@ async def run_biweekly_scan(update: Update) -> None:
         await update.message.reply_text(
             "Running biweekly e-Transfer intelligence scan (Reddit, X, RedFlagDeals, news)..."
         )
-        mentions = await asyncio.wait_for(fetch_biweekly_mentions(), timeout=300)
+        mentions, sources = await asyncio.wait_for(fetch_biweekly_mentions(), timeout=300)
         last_mentions_raw = mentions
 
         if mentions.startswith("No mentions"):
@@ -2395,7 +2705,7 @@ async def run_biweekly_scan(update: Update) -> None:
             return
 
         await update.message.reply_text("Mentions collected. Running Kimi curation pass, then analysis...")
-        report = await asyncio.wait_for(analyze_biweekly(mentions), timeout=180)
+        report = await asyncio.wait_for(analyze_biweekly(mentions, sources), timeout=180)
         last_report = report
 
         await send_chunked_message(
@@ -2521,7 +2831,11 @@ def _validate_resend_config() -> tuple[bool, str]:
 
 
 def _send_email_smtp(
-    subject: str, body: str, url_dates: dict[str, str] | None = None
+    subject: str,
+    body: str,
+    url_dates: dict[str, str] | None = None,
+    *,
+    html_kind: str = "auto",
 ) -> tuple[bool, str]:
     valid, reason = _validate_smtp_config()
     if not valid:
@@ -2529,7 +2843,7 @@ def _send_email_smtp(
         return False, reason
 
     try:
-        text_body, html_body = build_email_bodies(subject, body, url_dates=url_dates)
+        text_body, html_body = build_email_bodies(subject, body, url_dates=url_dates, html_kind=html_kind)
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = EMAIL_FROM
@@ -2574,7 +2888,11 @@ def _smtp_login_check() -> tuple[bool, str]:
 
 
 def _send_email_resend(
-    subject: str, body: str, url_dates: dict[str, str] | None = None
+    subject: str,
+    body: str,
+    url_dates: dict[str, str] | None = None,
+    *,
+    html_kind: str = "auto",
 ) -> tuple[bool, str]:
     valid, reason = _validate_resend_config()
     if not valid:
@@ -2582,7 +2900,7 @@ def _send_email_resend(
         return False, reason
 
     try:
-        text_body, html_body = build_email_bodies(subject, body, url_dates=url_dates)
+        text_body, html_body = build_email_bodies(subject, body, url_dates=url_dates, html_kind=html_kind)
         response = httpx.post(
             RESEND_API_URL,
             headers={
@@ -2634,11 +2952,15 @@ def smtp_health_check() -> tuple[bool, str]:
 
 
 def send_email(
-    subject: str, body: str, url_dates: dict[str, str] | None = None
+    subject: str,
+    body: str,
+    url_dates: dict[str, str] | None = None,
+    *,
+    html_kind: str = "auto",
 ) -> tuple[bool, str]:
     if EMAIL_PROVIDER == "resend":
-        return _send_email_resend(subject, body, url_dates=url_dates)
-    return _send_email_smtp(subject, body, url_dates=url_dates)
+        return _send_email_resend(subject, body, url_dates=url_dates, html_kind=html_kind)
+    return _send_email_smtp(subject, body, url_dates=url_dates, html_kind=html_kind)
 
 
 # ─── Preflight Checks ────────────────────────────────────────────────────────
@@ -2835,6 +3157,7 @@ EMAIL_ACCENT = "#175CD3"
 EMAIL_CONTAINER_WIDTH = "920"
 BIWEEKLY_MEMORY_PATH = Path(__file__).parent / "state" / "biweekly_memory.json"
 BIWEEKLY_EXCEL_PATH = Path(__file__).parent / "state" / "biweekly_reports.xlsx"
+SOURCE_LEDGER_PATH = Path(__file__).parent / "state" / "source_ledger.xlsx"
 QUARTERLY_MEMORY_PATH = Path(__file__).parent / "state" / "quarterly_memory.json"
 
 # Scheduled quarterly market-trends runs (America/Toronto calendar).
@@ -3233,9 +3556,77 @@ def _build_biweekly_html(
 </html>""".strip()
 
 
+def _build_quarterly_html(subject: str, body: str, url_dates: dict[str, str] | None = None) -> str:
+    """Sectioned HTML for long-form quarterly reports (split on markdown ### headings)."""
+    scan_date = _extract_report_field(body, "REPORT DATE") or _extract_report_field(body, "SCAN DATE")
+    raw = body.strip()
+    parts = re.split(r"(?m)^###\s+", raw)
+    blocks: list[tuple[str, str]] = []
+    if parts and parts[0].strip():
+        blocks.append(("Overview", parts[0].strip()))
+    for chunk in parts[1:]:
+        if not chunk.strip():
+            continue
+        first_line, _, rest = chunk.partition("\n")
+        title = first_line.strip() or "Section"
+        blocks.append((title, rest.strip() if rest.strip() else chunk.strip()))
+
+    sections_html = ""
+    for title, content in blocks:
+        sections_html += (
+            f"<div style='margin-bottom:18px;border:1px solid {EMAIL_BORDER};border-radius:10px;"
+            f"padding:14px 16px;background:#fcfdff;'>"
+            f"<h3 style='margin:0 0 8px 0;font-size:15px;color:{EMAIL_NAVY};'>{html.escape(title)}</h3>"
+            f"<pre style='white-space:pre-wrap;font-size:13px;line-height:1.5;margin:0;color:{EMAIL_TEXT};'>"
+            f"{html.escape(content)}</pre></div>"
+        )
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+</head>
+<body style="margin:0;padding:0;background:{EMAIL_PAGE_BG};font-family:{EMAIL_FONT_STACK};color:{EMAIL_TEXT};">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 0;">
+    <tr><td align="center">
+      <table role="presentation" width="{EMAIL_CONTAINER_WIDTH}" cellspacing="0" cellpadding="0" style="background:{EMAIL_CARD_BG};border-radius:14px;overflow:hidden;border:1px solid {EMAIL_BORDER};">
+        <tr>
+          <td style="background:{EMAIL_NAVY};color:#ffffff;padding:20px 28px;border-bottom:4px solid #fdb913;">
+            <div style="font-size:24px;font-weight:700;letter-spacing:0.2px;">Quarterly market trends</div>
+            <div style="font-size:13px;color:#aebce2;margin-top:5px;">{html.escape(scan_date)}</div>
+            <div style="font-size:12px;color:#d8def0;margin-top:6px;">{html.escape(subject)}</div>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:22px 28px;vertical-align:top;">
+            {sections_html}
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>""".strip()
+
+
 def build_email_bodies(
-    subject: str, body: str, url_dates: dict[str, str] | None = None
+    subject: str,
+    body: str,
+    url_dates: dict[str, str] | None = None,
+    *,
+    html_kind: str = "auto",
 ) -> tuple[str, str]:
+    kind = html_kind
+    if kind == "auto":
+        kind = (
+            "quarterly"
+            if "QUARTERLY" in subject.upper() or "Quarterly market trends" in subject
+            else "biweekly"
+        )
+    if kind == "quarterly":
+        merged = url_dates if url_dates is not None else last_quarterly_url_dates
+        return body, _build_quarterly_html(subject, body, url_dates=merged or {})
     merged = url_dates if url_dates is not None else last_biweekly_url_dates
     return body, _build_biweekly_html(subject, body, url_dates=merged)
 
@@ -3361,9 +3752,9 @@ async def scheduled_biweekly_broadcast(context: ContextTypes.DEFAULT_TYPE):
     tracked = _track_current_task()
     logger.info(f"[{now_est()}] Running scheduled biweekly scan...")
     try:
-        mentions = await fetch_biweekly_mentions()
+        mentions, sources = await fetch_biweekly_mentions()
         last_mentions_raw = mentions
-        report = await analyze_biweekly(mentions)
+        report = await analyze_biweekly(mentions, sources)
         last_report = report
 
         message = f"Interac e-Transfer Intelligence — {now_est()}\n\n{report}"
@@ -3378,7 +3769,11 @@ async def scheduled_biweekly_broadcast(context: ContextTypes.DEFAULT_TYPE):
         should_send, reason = _should_send_email(trigger="weekly", now_local=now_local)
         if should_send:
             subject = f"{EMAIL_SUBJECT_PREFIX} — BIWEEKLY REPORT"
-            ok, send_reason = send_email(subject, f"Interac e-Transfer Intelligence — {now_est()}\n\n{report}")
+            ok, send_reason = send_email(
+                subject,
+                f"Interac e-Transfer Intelligence — {now_est()}\n\n{report}",
+                html_kind="biweekly",
+            )
             if ok:
                 _record_email_sent("weekly", now_local=now_local)
             else:
@@ -3402,13 +3797,13 @@ async def scheduled_quarterly_market_trends(context: ContextTypes.DEFAULT_TYPE):
     tracked = _track_current_task()
     logger.info(f"[{now_est()}] Running scheduled quarterly market trends scan...")
     try:
-        mentions = await asyncio.wait_for(fetch_biweekly_mentions(quarterly=True), timeout=600)
+        mentions, sources = await asyncio.wait_for(fetch_biweekly_mentions(quarterly=True), timeout=600)
         if mentions.startswith("No mentions"):
             logger.warning(f"Quarterly scan: no data — {mentions[:200]}")
             _save_quarterly_memory(calendar_day_iso=now_local.date().isoformat())
             return
 
-        report = await asyncio.wait_for(analyze_quarterly(mentions), timeout=600)
+        report, _digest, _used = await asyncio.wait_for(analyze_quarterly(mentions, sources), timeout=600)
 
         message = f"Interac e-Transfer — Quarterly market trends — {now_est()}\n\n{report}"
         for chat_id in subscribed_chats.copy():
@@ -3425,6 +3820,7 @@ async def scheduled_quarterly_market_trends(context: ContextTypes.DEFAULT_TYPE):
                 subject,
                 message,
                 url_dates=last_quarterly_url_dates,
+                html_kind="quarterly",
             )
             if ok:
                 _record_email_sent("quarterly", now_local=now_local)
@@ -3560,7 +3956,7 @@ async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tracked = _track_current_task()
     await update.message.reply_text("📧 Running fresh biweekly scan and sending email...")
     try:
-        mentions = await asyncio.wait_for(fetch_biweekly_mentions(), timeout=300)
+        mentions, sources = await asyncio.wait_for(fetch_biweekly_mentions(), timeout=300)
         last_mentions_raw = mentions
 
         if mentions.startswith("No mentions"):
@@ -3568,12 +3964,12 @@ async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await update.message.reply_text("Mentions collected. Running Kimi curation pass, then analysis...")
-        report = await asyncio.wait_for(analyze_biweekly(mentions), timeout=180)
+        report = await asyncio.wait_for(analyze_biweekly(mentions, sources), timeout=180)
         last_report = report
 
         subject = f"{EMAIL_SUBJECT_PREFIX} — MANUAL REPORT"
         body = f"Interac e-Transfer Intelligence — {now_est()}\n\n{report}"
-        ok, send_reason = send_email(subject, body)
+        ok, send_reason = send_email(subject, body, html_kind="biweekly")
         if ok:
             _record_email_sent("on_demand")
             await update.message.reply_text("✅ Email sent successfully.")
@@ -3604,13 +4000,13 @@ async def cmd_quarterly(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     tracked = _track_current_task()
     try:
-        mentions = await asyncio.wait_for(fetch_biweekly_mentions(quarterly=True), timeout=600)
+        mentions, sources = await asyncio.wait_for(fetch_biweekly_mentions(quarterly=True), timeout=600)
         if mentions.startswith("No mentions"):
             await update.message.reply_text(f"No data found.\n\n{mentions[:800]}")
             return
 
         await update.message.reply_text("Mentions collected. Running quarterly Kimi analysis...")
-        report = await asyncio.wait_for(analyze_quarterly(mentions), timeout=600)
+        report, _digest, _used = await asyncio.wait_for(analyze_quarterly(mentions, sources), timeout=600)
 
         out = f"Interac e-Transfer — Quarterly market trends — {now_est()}\n\n{report}"
         await send_chunked_message(update, out)
@@ -3623,6 +4019,7 @@ async def cmd_quarterly(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 subject,
                 out,
                 url_dates=last_quarterly_url_dates,
+                html_kind="quarterly",
             )
             if ok_mail:
                 _record_email_sent("quarterly", now_local=now_local)

@@ -123,3 +123,13 @@ Rules:
 - Write like a senior analyst briefing executives who read many reports: direct, structured, minimal filler.
 - No fabricated metrics, no sentiment scores unless present in input, no "strategic recommendations" phrasing ("Interac should…"). Analytical conclusions about **where conversation is trending** are allowed when grounded as specified above.
 - Prefer clarity over length: a longer report means more **substantiated** subsections and evidence, not repetition.
+
+---
+
+## SOURCE LEDGER LINE (MANDATORY)
+
+After all numbered sections (including section 8), end the report with **exactly one** final line:
+
+`Source ledger: {source_ledger_url}`
+
+Evidence bullets must keep **`Source: URL`** on each cited item whenever a URL exists in the input, so downstream tooling can match rows to sources.

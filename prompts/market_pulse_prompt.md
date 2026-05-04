@@ -71,6 +71,10 @@ Output bullet points only. No headers, no introduction, no commentary, no blank 
 
 Target **6–8 bullets**. If the data supports more strong items, include up to 10. Only write `Nothing notable this scan.` if nothing qualifies.
 
+After your bullets (or the `Nothing notable this scan.` line), output **exactly one** additional line (not a bullet):
+
+`Source ledger: {source_ledger_url}`
+
 ---
 
 ## HARD RULE — READ BEFORE OUTPUTTING

@@ -57,6 +57,8 @@ Trend vs Last Scan:
 - Went quiet: [comma-separated short theme labels from PREVIOUS SCAN CONTEXT not seen in current data, or: none identified]
 - New this scan: [brief short labels for themes in current data not present in PREVIOUS SCAN CONTEXT, or: none identified]
 
+Source ledger: {source_ledger_url}
+
 ---
 
 ## STYLE
