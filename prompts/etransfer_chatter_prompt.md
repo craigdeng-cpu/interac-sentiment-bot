@@ -60,16 +60,28 @@ Include a post if it contains a **specific personal experience** with e-Transfer
 
 Output bullet points only. No headers, no introduction, no commentary, no blank lines between bullets.
 
+**Every bullet MUST start with exactly one category tag** (square brackets, title case, then a space) immediately after the leading `- `:
+
+| Tag | Use when the post is mainly… |
+|-----|------------------------------|
+| `[Praise]` | Positive sentiment about e-Transfer / Interac / auto-deposit (specific or generic praise). |
+| `[Comparison]` | Compares e-Transfer to another product, bank rail, or payment method; switching; “vs” alternatives. |
+| `[Education]` | Explains how something works, asks how/what/why/when, or seeks clarification (including “is this legit?” style questions). |
+| `[Blame]` | Frustration, problems, holds, fees, fraud/scam, limits, errors, or blaming a bank/Interac. |
+| `[Thin mention]` | e-Transfer appears but the post is low-signal, incidental, or off-topic relative to the product story. |
+
+Pick the **single best-fitting** tag per bullet. If unsure between two, prefer **Education** for genuine questions and **Thin mention** for passing or promotional noise.
+
 **Format with date:**
-`- "exact quote from post" — Platform, Date. Source: URL`
+`- [Blame] "exact quote from post" — Platform, Date. Source: URL`
 
 **Format without date:**
-`- "exact quote from post" — Platform. Source: URL`
+`- [Comparison] "exact quote from post" — Platform. Source: URL`
 
 **Example output (using fake data to illustrate format):**
 ```
-- "Sent $3,200 to my landlord on Friday, still showing pending Tuesday morning. TD says it's an Interac issue, Interac says it's TD." — Reddit, April 5, 2026. Source: https://reddit.com/r/personalfinancecanada/abc123
-- "Switched to Wealthsimple Cash for rent — no holds, instant, and no fees. RBC e-Transfer held my payment for 4 days last month." — Reddit. Source: https://reddit.com/r/personalfinancecanada/xyz456
+- [Blame] "Sent $3,200 to my landlord on Friday, still showing pending Tuesday morning. TD says it's an Interac issue, Interac says it's TD." — Reddit, April 5, 2026. Source: https://reddit.com/r/personalfinancecanada/abc123
+- [Comparison] "Switched to Wealthsimple Cash for rent — no holds, instant, and no fees. RBC e-Transfer held my payment for 4 days last month." — Reddit. Source: https://reddit.com/r/personalfinancecanada/xyz456
 ```
 
 Target **5–8 bullets**. Include fewer if the material is genuinely thin. Only write `Nothing notable this scan.` if nothing qualifies.

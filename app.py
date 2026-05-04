@@ -2308,6 +2308,73 @@ def _norm_url_to_bullets(section_text: str) -> dict[str, list[str]]:
     return out
 
 
+_CHATTER_KIMI_TAG_RE = re.compile(
+    r"^\[\s*(Praise|Comparison|Education|Blame|Thin\s+mention)\s*\]\s+",
+    re.IGNORECASE,
+)
+
+
+def _split_chatter_kimi_tag(text: str) -> tuple[str, str]:
+    """Parse leading ``[Praise]``-style tag. Returns ``(category_key, rest)``; key empty if missing."""
+    s = (text or "").strip()
+    m = _CHATTER_KIMI_TAG_RE.match(s)
+    if not m:
+        return ("", s)
+    raw = re.sub(r"\s+", " ", m.group(1).strip().lower())
+    key_map = {
+        "praise": "praise",
+        "comparison": "comparison",
+        "education": "education",
+        "blame": "blame",
+        "thin mention": "thin",
+    }
+    key = key_map.get(raw, "")
+    return (key, s[m.end() :])
+
+
+def _chatter_category_from_line(stripped: str) -> str:
+    """Kimi ``[Tag]`` on the bullet if present, else keyword fallback (same keys as mix bars)."""
+    st = stripped.strip()
+    if not (st.startswith("- ") or st.startswith("• ")):
+        return "thin"
+    body = st[2:].strip()
+    tag_key, _ = _split_chatter_kimi_tag(body)
+    if tag_key:
+        return tag_key
+    return _classify_chatter_bullet_line(stripped)
+
+
+def _chatter_body_after_tag(stripped: str) -> str:
+    """Content after ``- `` / ``• `` with optional ``[Tag] `` removed for quote vs attribution split."""
+    st = stripped.strip()
+    if not (st.startswith("- ") or st.startswith("• ")):
+        return st.strip()
+    body = st[2:].strip()
+    tag_key, rest = _split_chatter_kimi_tag(body)
+    return rest if tag_key else body
+
+
+def _norm_url_to_chatter_lines(
+    section_text: str,
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """Like ``_norm_url_to_bullets`` for e-Transfer Chatter, plus parallel Kimi category keys per URL."""
+    lines_out: dict[str, list[str]] = {}
+    cats_out: dict[str, list[str]] = {}
+    for line in (section_text or "").splitlines():
+        s = line.strip()
+        if "http" not in s:
+            continue
+        if not (s.startswith("-") or s.startswith("•") or re.match(r"^\d+\.\s", s)):
+            continue
+        cat = _chatter_category_from_line(s)
+        for raw_u in re.findall(r"https?://[^\s\)\]<>\"']+", s):
+            key = _normalize_url_for_match(raw_u)
+            if key:
+                lines_out.setdefault(key, []).append(s)
+                cats_out.setdefault(key, []).append(cat)
+    return lines_out, cats_out
+
+
 def _norm_url_to_lines_any(text: str) -> dict[str, list[str]]:
     """Like _norm_url_to_bullets but matches any line containing a URL (for quarterly prose)."""
     out: dict[str, list[str]] = {}
@@ -2356,6 +2423,7 @@ def _append_source_ledger(
 
     run_cal = datetime.now(EST).date().isoformat()
     chatter_map: dict[str, list[str]] = {}
+    chatter_cat_map: dict[str, list[str]] = {}
     market_map: dict[str, list[str]] = {}
     if biweekly_report_for_match:
         chatter_raw = _extract_section(
@@ -2368,7 +2436,7 @@ def _append_source_ledger(
             "Market Pulse:",
             ["Trend vs Last Scan:"],
         )
-        chatter_map = _norm_url_to_bullets(chatter_raw)
+        chatter_map, chatter_cat_map = _norm_url_to_chatter_lines(chatter_raw)
         market_map = _norm_url_to_bullets(market_raw)
 
     q_report_map: dict[str, list[str]] = {}
@@ -2396,6 +2464,7 @@ def _append_source_ledger(
         "in_biweekly_chatter",
         "in_biweekly_market_pulse",
         "biweekly_chatter_bullet",
+        "biweekly_chatter_category",
         "biweekly_market_bullet",
         "in_quarterly_final_report",
         "quarterly_report_excerpt",
@@ -2420,6 +2489,19 @@ def _append_source_ledger(
             return ""
         return " | ".join(xs)
 
+    def _join_chatter_categories(keys: list[str] | None) -> str:
+        if not keys:
+            return ""
+        return " | ".join(CHATTER_CAT_LABELS.get(k, k) for k in keys)
+
+    hdr_row = [c.value for c in ws[1]] if ws.max_row else []
+    if hdr_row and "biweekly_chatter_category" not in hdr_row and "biweekly_chatter_bullet" in hdr_row:
+        j = hdr_row.index("biweekly_chatter_bullet")
+        insert_at = j + 2
+        ws.insert_cols(insert_at, amount=1)
+        ws.cell(row=1, column=insert_at, value="biweekly_chatter_category")
+        hdr_row = [c.value for c in ws[1]]
+
     for src in sources:
         url_o = src.get("url_original") or ""
         nk = _normalize_url_for_match(url_o)
@@ -2429,6 +2511,7 @@ def _append_source_ledger(
             in_ch = "yes" if nk and nk in chatter_map else "no"
             in_mp = "yes" if nk and nk in market_map else "no"
             b_ch = _join_bullets(chatter_map.get(nk))
+            b_ch_cat = _join_chatter_categories(chatter_cat_map.get(nk))
             b_mp = _join_bullets(market_map.get(nk))
             in_q = "n_a"
             q_ex = ""
@@ -2438,6 +2521,7 @@ def _append_source_ledger(
             in_ch = "n_a"
             in_mp = "n_a"
             b_ch = ""
+            b_ch_cat = ""
             b_mp = ""
             in_q = "yes" if nk and nk in q_report_map else "no"
             q_ex = _excerpt_around_url(quarterly_report_for_match or "", nk) if quarterly_report_for_match else ""
@@ -2454,31 +2538,32 @@ def _append_source_ledger(
         if nk and in_ch == "yes" and in_mp == "yes":
             notes = "matched_both_biweekly_columns"
 
-        ws.append(
-            [
-                run_type,
-                report_scan_datetime,
-                run_cal,
-                src.get("source_bucket", ""),
-                url_o,
-                src.get("source_label", ""),
-                src.get("channel", ""),
-                src.get("published_date", ""),
-                src.get("title", ""),
-                src.get("snippet_included_in_prompt", ""),
-                src.get("quality_score_heuristic", ""),
-                in_ch,
-                in_mp,
-                b_ch,
-                b_mp,
-                in_q,
-                q_ex,
-                in_qd,
-                qd_ex,
-                written_at,
-                notes,
-            ]
-        )
+        row_vals = {
+            "run_type": run_type,
+            "report_scan_datetime": report_scan_datetime,
+            "run_calendar_date": run_cal,
+            "source_bucket": src.get("source_bucket", ""),
+            "url_original": url_o,
+            "source_label": src.get("source_label", ""),
+            "channel": src.get("channel", ""),
+            "published_date": src.get("published_date", ""),
+            "title": src.get("title", ""),
+            "snippet_included_in_prompt": src.get("snippet_included_in_prompt", ""),
+            "quality_score_heuristic": src.get("quality_score_heuristic", ""),
+            "in_biweekly_chatter": in_ch,
+            "in_biweekly_market_pulse": in_mp,
+            "biweekly_chatter_bullet": b_ch,
+            "biweekly_chatter_category": b_ch_cat,
+            "biweekly_market_bullet": b_mp,
+            "in_quarterly_final_report": in_q,
+            "quarterly_report_excerpt": q_ex,
+            "in_quarterly_compress_digest": in_qd,
+            "quarterly_digest_excerpt": qd_ex,
+            "ledger_written_at": written_at,
+            "notes": notes,
+        }
+        hdr = [c.value for c in ws[1]]
+        ws.append([row_vals.get(h, "") for h in hdr])
 
     wb.save(SOURCE_LEDGER_PATH)
     logger.info(f"Appended {len(sources)} source ledger row(s) to {SOURCE_LEDGER_PATH}")
@@ -3157,6 +3242,14 @@ EMAIL_ACCENT = "#175CD3"
 EMAIL_CONTAINER_WIDTH = "920"
 BIWEEKLY_MEMORY_PATH = Path(__file__).parent / "state" / "biweekly_memory.json"
 BIWEEKLY_EXCEL_PATH = Path(__file__).parent / "state" / "biweekly_reports.xlsx"
+BIWEEKLY_EXCEL_HEADERS = (
+    "Scan Date",
+    "e-Transfer Chatter",
+    "Chatter category mix (Kimi)",
+    "Market Pulse",
+    "Trend vs Last Scan",
+    "Full Report",
+)
 SOURCE_LEDGER_PATH = Path(__file__).parent / "state" / "source_ledger.xlsx"
 QUARTERLY_MEMORY_PATH = Path(__file__).parent / "state" / "quarterly_memory.json"
 
@@ -3260,7 +3353,7 @@ def _extract_biweekly_themes(report: str) -> dict:
         for line in (section_text or "").splitlines():
             stripped = line.strip()
             if stripped.startswith("- ") and "Nothing notable" not in stripped:
-                quote_only = stripped[2:].strip()
+                quote_only = _chatter_body_after_tag(stripped)
                 if " — " in quote_only:
                     quote_only = quote_only.split(" — ")[0].strip()
                 theme = quote_only[:60]
@@ -3272,6 +3365,22 @@ def _extract_biweekly_themes(report: str) -> dict:
         "etransfer_themes": _bullets_to_themes(etransfer_raw),
         "competitor_themes": _bullets_to_themes(competitor_raw),
     }
+
+
+def _maybe_migrate_biweekly_excel_headers(ws) -> list:
+    """Ensure ``Chatter category mix (Kimi)`` column exists; migrate legacy 5-column sheets."""
+    if ws.max_row < 1:
+        return list(BIWEEKLY_EXCEL_HEADERS)
+    hdr = [c.value for c in ws[1]]
+    if not hdr:
+        return list(BIWEEKLY_EXCEL_HEADERS)
+    if "Chatter category mix (Kimi)" in hdr:
+        return hdr
+    if len(hdr) == 5 and hdr[0] == "Scan Date" and hdr[2] == "Market Pulse":
+        ws.insert_cols(3, amount=1)
+        ws.cell(row=1, column=3, value="Chatter category mix (Kimi)")
+        return [c.value for c in ws[1]]
+    return hdr
 
 
 def _append_biweekly_excel(scan_date: str, report: str) -> None:
@@ -3292,15 +3401,40 @@ def _append_biweekly_excel(scan_date: str, report: str) -> None:
             wb = Workbook()
             ws = wb.active
             ws.title = "Biweekly Reports"
-            ws.append(["Scan Date", "e-Transfer Chatter", "Market Pulse", "Trend vs Last Scan", "Full Report"])
+            ws.append(list(BIWEEKLY_EXCEL_HEADERS))
 
-        ws.append([
-            scan_date,
-            (etransfer_raw or "").strip(),
-            (competitor_raw or "").strip(),
-            (trend_raw or "").strip(),
-            report.strip(),
-        ])
+        hdr = _maybe_migrate_biweekly_excel_headers(ws)
+        chatter_bullets: list[str] = []
+        for line in (etransfer_raw or "").splitlines():
+            s = line.strip()
+            if not (s.startswith("- ") or s.startswith("• ")):
+                continue
+            if "Nothing notable" in s:
+                continue
+            if not s[2:].strip():
+                continue
+            chatter_bullets.append(s)
+        counts = _chatter_category_counts(chatter_bullets)
+        total = sum(counts[k] for k in CHATTER_CAT_ORDER)
+        mix_parts: list[str] = []
+        if total:
+            for k in CHATTER_CAT_ORDER:
+                n = counts[k]
+                if not n:
+                    continue
+                pct = round(100.0 * n / total, 1)
+                mix_parts.append(f"{CHATTER_CAT_LABELS[k]} {n} ({pct}%)")
+        mix_cell = "; ".join(mix_parts)
+
+        row_map = {
+            "Scan Date": scan_date,
+            "e-Transfer Chatter": (etransfer_raw or "").strip(),
+            "Chatter category mix (Kimi)": mix_cell,
+            "Market Pulse": (competitor_raw or "").strip(),
+            "Trend vs Last Scan": (trend_raw or "").strip(),
+            "Full Report": report.strip(),
+        }
+        ws.append([row_map.get(h, "") for h in hdr])
         wb.save(BIWEEKLY_EXCEL_PATH)
         logger.info(f"Appended biweekly report to {BIWEEKLY_EXCEL_PATH}")
     except Exception as e:
@@ -3333,6 +3467,233 @@ def _styled_raw_report_html(subject: str, body: str) -> str:
   </body>
 </html>
 """.strip()
+
+
+# e-Transfer Chatter email mix — heuristic labels (keyword rules on Kimi bullet text).
+CHATTER_CAT_ORDER = ("praise", "comparison", "education", "blame", "thin")
+CHATTER_CAT_LABELS = {
+    "praise": "Praise",
+    "comparison": "Comparison",
+    "education": "Education",
+    "blame": "Blame",
+    "thin": "Thin mention",
+}
+CHATTER_CAT_COLORS = {
+    "praise": "#039855",
+    "comparison": "#5925DC",
+    "education": "#175CD3",
+    "blame": "#c4320a",
+    "thin": "#667085",
+}
+
+_CHATTER_COMP_TOKENS = (
+    "wise", "paypal", "wealthsimple", "koho", "revolut", "neo financial", "venmo", "zelle",
+    "stripe", "square", "wire transfer", "western union", " vs ", " versus ", "switched to",
+    "switched from", "instead of", "moved to", "alternative to", " compared ", "better than",
+    "worse than", "crypto", "bitcoin",
+)
+_CHATTER_BLAME_TOKENS = (
+    "fraud", "scam", "phish", "stolen", "unauthorized", "hack", "hold", "pending", "declined",
+    "rejected", "stuck", "frozen", "delay", "didn't arrive", "not received", "limit", "fee",
+    "charged", "complaint", "problem", "issue", "broken", "error", "hate", "terrible", "worst",
+    "frustrat", "annoying", "disappoint", "blame", "won't let", "wouldn't", "blocked",
+)
+_CHATTER_PRAISE_TOKENS = (
+    "love ", " great", "awesome", "thankful", " appreciate", "works great", "so easy",
+    "never had an issue", "no issues", "convenient", "best service", "smooth ", "flawless",
+    " easy ", "saved me", "quick and",
+)
+_CHATTER_EDU_TOKENS = (
+    "how do ", "how does", "what is ", "what are ", "anyone know", "anyone else", "explain",
+    "confused", "first time", "new to", "is it safe", " legit ", "why does", "why do ",
+    "when will", "where can", "could someone", "help me understand",
+)
+_CHATTER_THIN_TOKENS = ("win $", "win a", "prize", "giveaway", "contest", "promo code", "free money")
+
+
+def _classify_chatter_bullet_line(line: str) -> str:
+    """Keyword fallback when a chatter bullet omits the Kimi ``[Tag]`` prefix."""
+    low = line.lower()
+    if "nothing notable" in low:
+        return "thin"
+    if any(t in low for t in _CHATTER_THIN_TOKENS):
+        return "thin"
+    if _LOW_INSIGHT_RE.search(line):
+        return "thin"
+    if len(line) < 38 and line.count(" ") < 6 and "http" not in low:
+        return "thin"
+
+    if any(t in low for t in _CHATTER_COMP_TOKENS):
+        return "comparison"
+    if any(t in low for t in _CHATTER_BLAME_TOKENS):
+        return "blame"
+    if "?" in line and any(t in low for t in _CHATTER_EDU_TOKENS):
+        return "education"
+    if any(t in low for t in _CHATTER_PRAISE_TOKENS) and "?" not in line:
+        return "praise"
+    if "?" in line:
+        return "education"
+    if len(line) < 90:
+        return "thin"
+    return "blame"
+
+
+def _chatter_category_counts(lines: list[str]) -> dict[str, int]:
+    counts = {k: 0 for k in CHATTER_CAT_ORDER}
+    for ln in lines:
+        counts[_chatter_category_from_line(ln)] += 1
+    return counts
+
+
+def _render_chatter_category_bars(counts: dict[str, int]) -> str:
+    total = sum(counts.get(k, 0) for k in CHATTER_CAT_ORDER)
+    if total == 0:
+        return ""
+    parts = [
+        "<div style='margin-bottom:16px;padding:12px 14px;background:#f9fbff;border-radius:10px;"
+        f"border:1px solid {EMAIL_BORDER};'>",
+        "<div style='font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;"
+        f"color:{EMAIL_MUTED};margin-bottom:4px;'>Chatter mix</div>",
+        f"<div style='font-size:11px;color:{EMAIL_MUTED};margin-bottom:10px;line-height:1.4;'>"
+        f"{html.escape('Share of bullets from Kimi [Tag] labels on each line; missing tags use a keyword fallback.')}"
+        "</div>",
+    ]
+    for key in CHATTER_CAT_ORDER:
+        n = counts.get(key, 0)
+        pct = round(100.0 * n / total, 1) if total else 0.0
+        label = CHATTER_CAT_LABELS[key]
+        color = CHATTER_CAT_COLORS[key]
+        w = min(100.0, max(0.0, pct))
+        parts.append(
+            f"<div style='margin-bottom:10px;'>"
+            f"<table role='presentation' width='100%' cellspacing='0' cellpadding='0' style='margin-bottom:2px;'>"
+            f"<tr><td style='font-size:12px;font-weight:600;color:{EMAIL_TEXT};'>{html.escape(label)}</td>"
+            f"<td align='right' style='font-size:12px;color:{EMAIL_MUTED};'>{pct:.1f}% ({n})</td></tr></table>"
+            f"<div style='background:#e8ecf4;border-radius:6px;height:11px;overflow:hidden;'>"
+            f"<div style='width:{w:.1f}%;background:{color};height:11px;border-radius:6px;'></div>"
+            f"</div></div>"
+        )
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def _render_chatter_column_with_mix(raw: str, url_dates: dict[str, str] | None) -> str:
+    """e-Transfer Chatter HTML: category mix bars + quote cards with small category badges."""
+    _empty = (
+        f"<div style='padding:12px 14px;font-size:13px;color:{EMAIL_MUTED};'>"
+        f"{html.escape('Nothing notable this scan.')}</div>"
+    )
+    if not raw or not raw.strip():
+        return _empty
+
+    bullet_lines: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or not (stripped.startswith("- ") or stripped.startswith("• ")):
+            continue
+        text = stripped[2:].strip()
+        if not text or "Nothing notable" in text:
+            continue
+        bullet_lines.append(stripped)
+
+    if not bullet_lines:
+        return _empty
+
+    bars = _render_chatter_category_bars(_chatter_category_counts(bullet_lines))
+
+    cards: list[str] = []
+    for stripped in bullet_lines:
+        cat = _chatter_category_from_line(stripped)
+        cat_color = CHATTER_CAT_COLORS[cat]
+        cat_label = CHATTER_CAT_LABELS[cat]
+        text = _chatter_body_after_tag(stripped)
+
+        if " — " in text:
+            quote_part, attr_part = text.split(" — ", 1)
+        else:
+            quote_part, attr_part = text, ""
+
+        url = ""
+        url_match = re.search(r"Source:\s*(https?://\S+)", attr_part, re.IGNORECASE)
+        if url_match:
+            url = url_match.group(1).rstrip(".,)")
+            attr_part = re.sub(r"\s*Source:\s*https?://\S+", "", attr_part, flags=re.IGNORECASE).strip()
+        else:
+            bare_match = re.search(r"(https?://\S+)", attr_part)
+            if bare_match:
+                url = bare_match.group(1).rstrip(".,)")
+                attr_part = re.sub(r"https?://\S+", "", attr_part).strip()
+
+        attr_clean = attr_part.rstrip(".")
+        if "," in attr_clean:
+            _platform_from_llm, date_label = attr_clean.split(",", 1)
+            date_label = date_label.strip().rstrip(".")
+        else:
+            date_label = ""
+
+        if not date_label and url:
+            date_label = (url_dates or {}).get(_canonical_url_for_date_lookup(url), "")
+        if not date_label and url:
+            date_label = _resolve_relative_date(_extract_date_from_url(url))
+
+        COMMUNITY_SOURCES = {"Reddit", "X/Twitter", "RedFlagDeals", "Forum"}
+        show_badge = False
+        platform_label = ""
+        if url:
+            _, url_source = _classify_channel_and_source(url)
+            if url_source in COMMUNITY_SOURCES:
+                platform_label = url_source
+                show_badge = True
+
+        badge_color = _platform_badge_color(platform_label) if show_badge else "#d1d5db"
+
+        link_html = ""
+        if url:
+            safe_url = html.escape(url, quote=True)
+            domain = re.sub(r"^www\.", "", re.sub(r"https?://", "", url).split("/")[0])
+            link_html = (
+                f"<a href='{safe_url}' style='font-size:11px;color:{EMAIL_ACCENT};"
+                f"text-decoration:none;'>{html.escape(domain)}</a>"
+            )
+
+        quote_html = html.escape(quote_part.strip())
+        date_html = html.escape(date_label) if date_label else ""
+
+        cat_badge = (
+            f"<span style='font-size:9px;font-weight:700;padding:2px 7px;border-radius:4px;"
+            f"letter-spacing:0.2px;background:{cat_color}18;color:{cat_color};"
+            f"margin-bottom:6px;display:inline-block;'>{html.escape(cat_label)}</span>"
+        )
+
+        meta_inner = ""
+        if show_badge and platform_label:
+            meta_inner += (
+                f"<span style='background:{badge_color};color:#fff;font-size:10px;"
+                f"font-weight:700;padding:2px 7px;border-radius:999px;"
+                f"letter-spacing:0.3px;white-space:nowrap;margin-right:6px;display:inline-block;'>"
+                f"{html.escape(platform_label)}</span>"
+            )
+        if date_html:
+            meta_inner += (
+                f"<span style='font-size:11px;color:{EMAIL_MUTED};margin-right:6px;'>{date_html}</span>"
+            )
+        if link_html:
+            meta_inner += link_html
+
+        meta_row = (
+            f"<div style='margin-top:5px;line-height:1.8;'>{meta_inner}</div>" if meta_inner else ""
+        )
+
+        card = (
+            f"<div style='border-left:3px solid {cat_color};padding:8px 0 8px 12px;margin-bottom:14px;'>"
+            f"{cat_badge}"
+            f"<div style='font-size:13px;line-height:1.55;color:{EMAIL_TEXT};'>{quote_html}</div>"
+            f"{meta_row}"
+            f"</div>"
+        )
+        cards.append(card)
+
+    return bars + "".join(cards)
 
 
 def _platform_badge_color(platform: str) -> str:
@@ -3507,8 +3868,37 @@ def _build_biweekly_html(
         return _styled_raw_report_html(subject, body)
 
     umap = url_dates or {}
-    etransfer_html = _render_quote_bullets(etransfer_raw, "Nothing notable this scan.", umap)
+    etransfer_html = _render_chatter_column_with_mix(etransfer_raw, umap)
     competitor_html = _render_quote_bullets(competitor_raw, "Nothing notable this scan.", umap)
+
+    trend_block = _extract_section(body, "Trend vs Last Scan:", [])
+    ledger_line = f"Source ledger: {source_ledger_display_url()}"
+    if trend_block:
+        tl = trend_block.lower()
+        if "source ledger:" in tl:
+            idx = tl.rfind("source ledger:")
+            ledger_line = trend_block[idx:].strip()
+            trend_block = trend_block[:idx].strip()
+        still, quiet, new = _parse_trend_fields(trend_block)
+        trend_html = (
+            f"<tr><td colspan='2' style='padding:18px 28px 8px 28px;border-top:1px solid {EMAIL_BORDER};'>"
+            f"<div style='font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;"
+            f"color:{EMAIL_MUTED};margin-bottom:10px;'>Trend vs last scan</div>"
+            f"<table role='presentation' width='100%' cellspacing='0' cellpadding='0'><tr>"
+            f"{_trend_mini_card('Still active', still, '#175CD3')}"
+            f"{_trend_mini_card('Went quiet', quiet, '#667085')}"
+            f"{_trend_mini_card('New this scan', new, '#039855')}"
+            f"</tr></table></td></tr>"
+        )
+    else:
+        trend_html = ""
+
+    ledger_html = (
+        f"<tr><td colspan='2' style='padding:12px 28px 22px 28px;border-top:1px solid {EMAIL_BORDER};"
+        f"background:#f9fbff;'>"
+        f"<div style='font-size:13px;line-height:1.5;color:{EMAIL_TEXT};'>{html.escape(ledger_line)}</div>"
+        f"</td></tr>"
+    )
 
     return f"""<!DOCTYPE html>
 <html>
@@ -3548,6 +3938,8 @@ def _build_biweekly_html(
             {competitor_html}
           </td>
         </tr>
+        {trend_html}
+        {ledger_html}
 
       </table>
     </td></tr>
