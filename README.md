@@ -139,6 +139,29 @@ STATE_EXCEL_TELEGRAM_CHAT_ID=-1001234567890
 
 Admins can always pull the latest files from the running host with **`/statefiles`**. Deploy logs also print absolute paths and byte sizes whenever a workbook is written.
 
+### Workbook download links in biweekly / quarterly emails
+
+If you configure **S3-compatible storage** (AWS S3, Cloudflare R2, etc.), each HTML email run **uploads** the current `biweekly_reports.xlsx` and `source_ledger.xlsx` and adds **clickable download links** in the footer (plain-text body gets the same URLs on their own lines).
+
+```bash
+WORKBOOK_S3_BUCKET=your-bucket-name
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_REGION=us-east-1
+# Optional: R2 or MinIO — set API endpoint
+# S3_ENDPOINT_URL=https://<accountid>.r2.cloudflarestorage.com
+# Public URL base for links (required for R2 custom domain; optional for AWS if you use default virtual-host URLs)
+WORKBOOK_PUBLIC_BASE_URL=https://files.example.com/my-prefix
+# Optional: key prefix inside the bucket (no leading slash)
+WORKBOOK_S3_PREFIX=interac-intel/workbooks
+# Optional: omit ACL on buckets that block ACLs; or set public-read if your bucket policy allows it
+# WORKBOOK_S3_OBJECT_ACL=public-read
+# Optional: Cache-Control on uploaded objects (default short cache so repeat opens pick up new scans)
+# WORKBOOK_S3_CACHE_CONTROL=public, max-age=120
+```
+
+Objects are written to stable keys (`…/biweekly_reports.xlsx` and `…/source_ledger.xlsx`) so **each send overwrites** the same URLs with the latest files. The bucket (or CDN in front of it) must allow **HTTPS GET** for those keys.
+
 ### Email
 
 ```bash

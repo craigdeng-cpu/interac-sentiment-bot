@@ -284,6 +284,130 @@ def _source_ledger_footer() -> str:
     return f"\n\nSource ledger: {source_ledger_display_url()}"
 
 
+def _workbook_s3_upload_configured() -> bool:
+    """S3-compatible upload for fresh email download links (AWS S3, Cloudflare R2, etc.)."""
+    return bool(
+        os.environ.get("WORKBOOK_S3_BUCKET", "").strip()
+        and os.environ.get("AWS_ACCESS_KEY_ID", "").strip()
+        and os.environ.get("AWS_SECRET_ACCESS_KEY", "").strip()
+    )
+
+
+def _s3_object_http_url(bucket: str, region: str, object_key: str) -> str:
+    """Build HTTPS URL for an object. Prefer ``WORKBOOK_PUBLIC_BASE_URL`` for R2/custom domains."""
+    base = os.environ.get("WORKBOOK_PUBLIC_BASE_URL", "").strip().rstrip("/")
+    enc_key = "/".join(quote(part, safe="") for part in object_key.split("/"))
+    if base:
+        return f"{base}/{enc_key}"
+    if region == "us-east-1":
+        return f"https://{bucket}.s3.amazonaws.com/{enc_key}"
+    return f"https://{bucket}.s3.{region}.amazonaws.com/{enc_key}"
+
+
+def _upload_workbooks_for_email_links() -> dict[str, str | None]:
+    """Upload pool + ledger workbooks; return HTTPS URLs for email footers. Empty dict values if skipped."""
+    out: dict[str, str | None] = {"pool": None, "ledger": None}
+    if not _workbook_s3_upload_configured():
+        return out
+    try:
+        import boto3
+    except ImportError:
+        logger.warning("boto3 missing — cannot upload workbooks for email links (pip install boto3)")
+        return out
+    bucket = os.environ.get("WORKBOOK_S3_BUCKET", "").strip()
+    region = (
+        os.environ.get("AWS_REGION", "").strip()
+        or os.environ.get("AWS_DEFAULT_REGION", "").strip()
+        or "us-east-1"
+    )
+    prefix = os.environ.get("WORKBOOK_S3_PREFIX", "interac-intel/workbooks").strip().strip("/")
+    endpoint = os.environ.get("S3_ENDPOINT_URL", "").strip()
+    client_kw: dict = {"region_name": region}
+    if endpoint:
+        client_kw["endpoint_url"] = endpoint
+    try:
+        client = boto3.client("s3", **client_kw)
+    except Exception as e:
+        logger.warning("Could not create S3 client: %s", e)
+        return out
+
+    def _put(local: Path, filename: str) -> str | None:
+        if not local.is_file():
+            logger.warning("Workbook upload skipped — file missing: %s", local)
+            return None
+        key = f"{prefix}/{filename}" if prefix else filename
+        put_kw: dict = {
+            "Bucket": bucket,
+            "Key": key,
+            "Body": local.read_bytes(),
+            "ContentType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }
+        cache = os.environ.get("WORKBOOK_S3_CACHE_CONTROL", "public, max-age=120").strip()
+        if cache:
+            put_kw["CacheControl"] = cache
+        acl = os.environ.get("WORKBOOK_S3_OBJECT_ACL", "").strip()
+        if acl:
+            put_kw["ACL"] = acl
+        try:
+            client.put_object(**put_kw)
+        except Exception as e:
+            logger.warning("S3 put_object failed for %s: %s", key, e)
+            return None
+        return _s3_object_http_url(bucket, region, key)
+
+    out["pool"] = _put(BIWEEKLY_EXCEL_PATH, "biweekly_reports.xlsx")
+    out["ledger"] = _put(SOURCE_LEDGER_PATH, "source_ledger.xlsx")
+    logger.info(
+        "Workbook upload for email: pool_url=%s ledger_url=%s",
+        "set" if out["pool"] else "none",
+        "set" if out["ledger"] else "none",
+    )
+    return out
+
+
+def _workbook_footer_plain(workbook_urls: dict[str, str | None]) -> str:
+    p, lg = workbook_urls.get("pool"), workbook_urls.get("ledger")
+    if not p and not lg:
+        return ""
+    lines = ["", "---", "Excel downloads (this email):"]
+    if p:
+        lines.append(f"Biweekly pool workbook: {p}")
+    if lg:
+        lines.append(f"Source ledger workbook: {lg}")
+    return "\n".join(lines)
+
+
+def _workbook_downloads_block_html(workbook_urls: dict[str, str | None] | None) -> str:
+    """Inner HTML for clickable workbook links (no outer <tr>)."""
+    if not workbook_urls:
+        return ""
+    pool_u = workbook_urls.get("pool")
+    led_u = workbook_urls.get("ledger")
+    if not pool_u and not led_u:
+        return ""
+    links: list[str] = []
+    if pool_u:
+        su = html.escape(pool_u, quote=True)
+        links.append(
+            f"<a href='{su}' style='font-size:13px;color:{EMAIL_ACCENT};font-weight:600;"
+            f"text-decoration:none;'>Biweekly pool (Excel)</a>"
+        )
+    if led_u:
+        su = html.escape(led_u, quote=True)
+        links.append(
+            f"<a href='{su}' style='font-size:13px;color:{EMAIL_ACCENT};font-weight:600;"
+            f"text-decoration:none;'>Source ledger (Excel)</a>"
+        )
+    sep = f"<span style='color:{EMAIL_MUTED};'>&nbsp;·&nbsp;</span>"
+    return (
+        f"<div style='margin-top:14px;padding-top:14px;border-top:1px dashed {EMAIL_BORDER};'>"
+        f"<div style='font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;"
+        f"color:{EMAIL_MUTED};margin-bottom:8px;'>Excel downloads (this email)</div>"
+        f"<div style='font-size:14px;line-height:1.65;'>{sep.join(links)}</div>"
+        "</div>"
+    )
+
+
 def _strip_model_ledger_lines(text: str) -> str:
     """Remove trailing `Source ledger: ...` lines models may emit; app adds one canonical footer."""
     lines = (text or "").strip().splitlines()
@@ -3983,7 +4107,11 @@ def _parse_trend_fields(trend_raw: str) -> tuple[str, str, str]:
 
 
 def _build_biweekly_html(
-    subject: str, body: str, url_dates: dict[str, str] | None = None
+    subject: str,
+    body: str,
+    url_dates: dict[str, str] | None = None,
+    *,
+    workbook_urls: dict[str, str | None] | None = None,
 ) -> str:
     scan_date = _extract_report_field(body, "SCAN DATE")
     etransfer_raw = _extract_section(body, "e-Transfer Chatter:", ["Market Pulse:", "Trend vs Last Scan:"])
@@ -4017,10 +4145,12 @@ def _build_biweekly_html(
     else:
         trend_html = ""
 
+    dl_html = _workbook_downloads_block_html(workbook_urls or {})
     ledger_html = (
         f"<tr><td colspan='2' style='padding:12px 28px 22px 28px;border-top:1px solid {EMAIL_BORDER};"
         f"background:#f9fbff;'>"
         f"<div style='font-size:13px;line-height:1.5;color:{EMAIL_TEXT};'>{html.escape(ledger_line)}</div>"
+        f"{dl_html}"
         f"</td></tr>"
     )
 
@@ -4072,7 +4202,13 @@ def _build_biweekly_html(
 </html>""".strip()
 
 
-def _build_quarterly_html(subject: str, body: str, url_dates: dict[str, str] | None = None) -> str:
+def _build_quarterly_html(
+    subject: str,
+    body: str,
+    url_dates: dict[str, str] | None = None,
+    *,
+    workbook_urls: dict[str, str | None] | None = None,
+) -> str:
     """Sectioned HTML for long-form quarterly reports (split on markdown ### headings)."""
     scan_date = _extract_report_field(body, "REPORT DATE") or _extract_report_field(body, "SCAN DATE")
     raw = body.strip()
@@ -4097,6 +4233,14 @@ def _build_quarterly_html(subject: str, body: str, url_dates: dict[str, str] | N
             f"{html.escape(content)}</pre></div>"
         )
 
+    dl_row = ""
+    dl_inner = _workbook_downloads_block_html(workbook_urls or {})
+    if dl_inner:
+        dl_row = (
+            f"<tr><td style='padding:12px 28px 22px 28px;border-top:1px solid {EMAIL_BORDER};"
+            f"background:#f9fbff;'>{dl_inner}</td></tr>"
+        )
+
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -4119,6 +4263,7 @@ def _build_quarterly_html(subject: str, body: str, url_dates: dict[str, str] | N
             {sections_html}
           </td>
         </tr>
+        {dl_row}
       </table>
     </td></tr>
   </table>
@@ -4140,11 +4285,21 @@ def build_email_bodies(
             if "QUARTERLY" in subject.upper() or "Quarterly market trends" in subject
             else "biweekly"
         )
+    wb_urls: dict[str, str | None] = {}
+    if kind in ("biweekly", "quarterly"):
+        wb_urls = _upload_workbooks_for_email_links()
+
     if kind == "quarterly":
         merged = url_dates if url_dates is not None else last_quarterly_url_dates
-        return body, _build_quarterly_html(subject, body, url_dates=merged or {})
-    merged = url_dates if url_dates is not None else last_biweekly_url_dates
-    return body, _build_biweekly_html(subject, body, url_dates=merged)
+        html = _build_quarterly_html(
+            subject, body, url_dates=merged or {}, workbook_urls=wb_urls
+        )
+        return body + _workbook_footer_plain(wb_urls), html
+    if kind == "biweekly":
+        merged = url_dates if url_dates is not None else last_biweekly_url_dates
+        html = _build_biweekly_html(subject, body, url_dates=merged, workbook_urls=wb_urls)
+        return body + _workbook_footer_plain(wb_urls), html
+    return body, _styled_raw_report_html(subject, body)
 
 
 def _record_email_sent(trigger: str, *, now_local: datetime | None = None) -> None:
