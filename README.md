@@ -145,8 +145,12 @@ If you configure **S3-compatible storage** (AWS S3, Cloudflare R2, etc.), each H
 
 ```bash
 WORKBOOK_S3_BUCKET=your-bucket-name
+# IAM keys (standard AWS names — or use WORKBOOK_* below if another service already uses AWS_* on Railway)
 AWS_ACCESS_KEY_ID=...
 AWS_SECRET_ACCESS_KEY=...
+# Optional Railway-friendly aliases (read if AWS_* are unset):
+# WORKBOOK_AWS_ACCESS_KEY_ID=...
+# WORKBOOK_AWS_SECRET_ACCESS_KEY=...
 AWS_REGION=us-east-1
 # Optional: R2 or MinIO — set API endpoint
 # S3_ENDPOINT_URL=https://<accountid>.r2.cloudflarestorage.com
@@ -161,6 +165,8 @@ WORKBOOK_S3_PREFIX=interac-intel/workbooks
 ```
 
 Objects are written to stable keys (`…/biweekly_reports.xlsx` and `…/source_ledger.xlsx`) so **each send overwrites** the same URLs with the latest files. The bucket (or CDN in front of it) must allow **HTTPS GET** for those keys.
+
+**Troubleshooting:** After changing env vars, **redeploy** so the image includes `boto3` from `requirements.txt`. In deploy logs, look for `S3 workbook upload starting` (success path) or `S3 workbook upload skipped` (missing bucket/keys) or `put_object failed` (permissions / ACL / policy). If the HTML email shows the two-column layout but no download row, check you are not hitting the rare “empty chatter + empty market” fallback — redeploy this repo version, which adds workbook links there too.
 
 ### Email
 

@@ -284,13 +284,38 @@ def _source_ledger_footer() -> str:
     return f"\n\nSource ledger: {source_ledger_display_url()}"
 
 
+def _workbook_s3_access_key_id() -> str:
+    """Prefer namespaced keys on Railway to avoid colliding with other AWS consumers."""
+    return (
+        os.environ.get("WORKBOOK_AWS_ACCESS_KEY_ID", "").strip()
+        or os.environ.get("AWS_ACCESS_KEY_ID", "").strip()
+    )
+
+
+def _workbook_s3_secret_access_key() -> str:
+    return (
+        os.environ.get("WORKBOOK_AWS_SECRET_ACCESS_KEY", "").strip()
+        or os.environ.get("AWS_SECRET_ACCESS_KEY", "").strip()
+    )
+
+
 def _workbook_s3_upload_configured() -> bool:
     """S3-compatible upload for fresh email download links (AWS S3, Cloudflare R2, etc.)."""
     return bool(
         os.environ.get("WORKBOOK_S3_BUCKET", "").strip()
-        and os.environ.get("AWS_ACCESS_KEY_ID", "").strip()
-        and os.environ.get("AWS_SECRET_ACCESS_KEY", "").strip()
+        and _workbook_s3_access_key_id()
+        and _workbook_s3_secret_access_key()
     )
+
+
+def _workbook_s3_skip_reason() -> str:
+    if os.environ.get("WORKBOOK_S3_BUCKET", "").strip():
+        parts = ["WORKBOOK_S3_BUCKET is set"]
+    else:
+        parts = ["WORKBOOK_S3_BUCKET is empty"]
+    parts.append(f"access_key_id={'set' if _workbook_s3_access_key_id() else 'missing'}")
+    parts.append(f"secret_access_key={'set' if _workbook_s3_secret_access_key() else 'missing'}")
+    return "; ".join(parts)
 
 
 def _s3_object_http_url(bucket: str, region: str, object_key: str) -> str:
@@ -308,11 +333,20 @@ def _upload_workbooks_for_email_links() -> dict[str, str | None]:
     """Upload pool + ledger workbooks; return HTTPS URLs for email footers. Empty dict values if skipped."""
     out: dict[str, str | None] = {"pool": None, "ledger": None}
     if not _workbook_s3_upload_configured():
+        logger.info(
+            "S3 workbook upload skipped (%s). Set WORKBOOK_S3_BUCKET plus "
+            "AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or WORKBOOK_AWS_ACCESS_KEY_ID/"
+            "WORKBOOK_AWS_SECRET_ACCESS_KEY.",
+            _workbook_s3_skip_reason(),
+        )
         return out
     try:
         import boto3
     except ImportError:
-        logger.warning("boto3 missing — cannot upload workbooks for email links (pip install boto3)")
+        logger.error(
+            "boto3 is not installed in this image — workbook S3 upload disabled. "
+            "Rebuild the container so `pip install -r requirements.txt` includes boto3."
+        )
         return out
     bucket = os.environ.get("WORKBOOK_S3_BUCKET", "").strip()
     region = (
@@ -322,18 +356,39 @@ def _upload_workbooks_for_email_links() -> dict[str, str | None]:
     )
     prefix = os.environ.get("WORKBOOK_S3_PREFIX", "interac-intel/workbooks").strip().strip("/")
     endpoint = os.environ.get("S3_ENDPOINT_URL", "").strip()
-    client_kw: dict = {"region_name": region}
-    if endpoint:
-        client_kw["endpoint_url"] = endpoint
+    pub_base = os.environ.get("WORKBOOK_PUBLIC_BASE_URL", "").strip()
     try:
-        client = boto3.client("s3", **client_kw)
-    except Exception as e:
-        logger.warning("Could not create S3 client: %s", e)
+        client_kw: dict = {
+            "service_name": "s3",
+            "region_name": region,
+            "aws_access_key_id": _workbook_s3_access_key_id(),
+            "aws_secret_access_key": _workbook_s3_secret_access_key(),
+        }
+        tok = os.environ.get("AWS_SESSION_TOKEN", "").strip()
+        if tok:
+            client_kw["aws_session_token"] = tok
+        if endpoint:
+            client_kw["endpoint_url"] = endpoint
+        client = boto3.client(**client_kw)
+    except Exception:
+        logger.exception("Could not create S3 client (check WORKBOOK_* / AWS_* env and S3_ENDPOINT_URL)")
         return out
+
+    logger.info(
+        "S3 workbook upload starting bucket=%s region=%s endpoint_set=%s prefix=%r "
+        "public_base_set=%s pool_exists=%s ledger_exists=%s",
+        bucket,
+        region,
+        bool(endpoint),
+        prefix,
+        bool(pub_base),
+        BIWEEKLY_EXCEL_PATH.is_file(),
+        SOURCE_LEDGER_PATH.is_file(),
+    )
 
     def _put(local: Path, filename: str) -> str | None:
         if not local.is_file():
-            logger.warning("Workbook upload skipped — file missing: %s", local)
+            logger.warning("Workbook upload skipped — file missing: %s", local.resolve())
             return None
         key = f"{prefix}/{filename}" if prefix else filename
         put_kw: dict = {
@@ -350,15 +405,21 @@ def _upload_workbooks_for_email_links() -> dict[str, str | None]:
             put_kw["ACL"] = acl
         try:
             client.put_object(**put_kw)
-        except Exception as e:
-            logger.warning("S3 put_object failed for %s: %s", key, e)
+        except Exception:
+            logger.exception("S3 put_object failed for s3://%s/%s", bucket, key)
             return None
-        return _s3_object_http_url(bucket, region, key)
+        url = _s3_object_http_url(bucket, region, key)
+        logger.info("S3 put_object ok key=%s url=%s", key, url[:120] + ("…" if len(url) > 120 else ""))
+        return url
 
-    out["pool"] = _put(BIWEEKLY_EXCEL_PATH, "biweekly_reports.xlsx")
-    out["ledger"] = _put(SOURCE_LEDGER_PATH, "source_ledger.xlsx")
+    try:
+        out["pool"] = _put(BIWEEKLY_EXCEL_PATH, "biweekly_reports.xlsx")
+        out["ledger"] = _put(SOURCE_LEDGER_PATH, "source_ledger.xlsx")
+    except Exception:
+        logger.exception("Unexpected error during workbook S3 upload")
+        return out
     logger.info(
-        "Workbook upload for email: pool_url=%s ledger_url=%s",
+        "Workbook upload finished pool_url=%s ledger_url=%s",
         "set" if out["pool"] else "none",
         "set" if out["ledger"] else "none",
     )
@@ -3689,8 +3750,19 @@ def _extract_biweekly_themes(report: str) -> dict:
     }
 
 
-def _styled_raw_report_html(subject: str, body: str) -> str:
+def _styled_raw_report_html(
+    subject: str,
+    body: str,
+    *,
+    workbook_footer_html: str = "",
+) -> str:
     escaped = html.escape(body)
+    footer_row = ""
+    if workbook_footer_html.strip():
+        footer_row = (
+            f"<tr><td style='padding:16px 24px 22px 24px;border-top:1px solid {EMAIL_BORDER};"
+            f"background:#f9fbff;'>{workbook_footer_html}</td></tr>"
+        )
     return f"""
 <html>
   <body style="margin:0;padding:0;background:{EMAIL_PAGE_BG};font-family:{EMAIL_FONT_STACK};color:{EMAIL_TEXT};">
@@ -3709,6 +3781,7 @@ def _styled_raw_report_html(subject: str, body: str) -> str:
               <pre style="white-space:pre-wrap;background:#f9fbff;border:1px solid {EMAIL_BORDER};border-radius:10px;padding:14px;font-size:13px;line-height:1.5;color:{EMAIL_TEXT};">{escaped}</pre>
             </td>
           </tr>
+          {footer_row}
         </table>
       </td></tr>
     </table>
@@ -4117,7 +4190,8 @@ def _build_biweekly_html(
     etransfer_raw = _extract_section(body, "e-Transfer Chatter:", ["Market Pulse:", "Trend vs Last Scan:"])
     competitor_raw = _extract_section(body, "Market Pulse:", ["Trend vs Last Scan:"])
     if not any(s.strip() for s in [etransfer_raw, competitor_raw]):
-        return _styled_raw_report_html(subject, body)
+        wf = _workbook_downloads_block_html(workbook_urls or {})
+        return _styled_raw_report_html(subject, body, workbook_footer_html=wf)
 
     umap = url_dates or {}
     etransfer_html = _render_chatter_column_with_mix(etransfer_raw, umap)
