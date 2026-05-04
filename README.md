@@ -64,6 +64,7 @@ Admin only (`ADMIN_IDS`):
 |---|---|
 | `/email` | Run biweekly scan and send email now |
 | `/smtpcheck` | Validate email provider config/connectivity |
+| `/statefiles` | Download `biweekly_reports.xlsx` + `source_ledger.xlsx` from the server’s state dir |
 | `/stop` | Cancel active running tasks |
 
 ## Data pipeline
@@ -119,6 +120,22 @@ WEBHOOK_URL=
 ADMIN_IDS=123456789,987654321
 DAILY_LIMIT=5
 ```
+
+### Persisted files (Excel + JSON)
+
+Biweekly memory, `biweekly_reports.xlsx`, `source_ledger.xlsx`, and quarterly memory live under **`STATE_DIR`** (default: `<repo>/state`). On Railway the default disk is **ephemeral** (cleared on redeploy) unless you use a **volume**.
+
+```bash
+# Optional: mount a Railway volume at e.g. /data, then:
+STATE_DIR=/data
+
+# Optional: after each successful /scan, /email, or scheduled biweekly, Telegram-deliver both workbooks
+ATTACH_STATE_EXCEL_ON_BIWEEKLY=1
+# For scheduled runs, set an explicit chat (group/channel/user id), or the lowest ADMIN_IDS is used
+STATE_EXCEL_TELEGRAM_CHAT_ID=-1001234567890
+```
+
+Admins can always pull the latest files from the running host with **`/statefiles`**. Deploy logs also print absolute paths and byte sizes whenever a workbook is written.
 
 ### Email
 
@@ -181,10 +198,12 @@ Set `WEBHOOK_URL` to use webhook mode instead of polling.
 3. Add env vars (at minimum `TELEGRAM_TOKEN`, `KIMI_API_KEY`).
 4. Default port is `3978`.
 5. Verify with Telegram `/status`.
+6. **Excel visibility:** add a **volume**, set **`STATE_DIR`** to the mount path (see “Persisted files” above), and use **`/statefiles`** or **`ATTACH_STATE_EXCEL_ON_BIWEEKLY=1`** so you receive workbooks in Telegram. On startup the service logs the resolved `STATE_DIR` and whether each `.xlsx` exists.
 
 ## Known limitations
 
 - Subscription state, last report, and rate-limit counters are in-memory (reset on restart).
+- Excel/JSON on disk survive process restarts but **not** Railway redeploys unless **`STATE_DIR`** points at a mounted volume.
 - No persistence layer (Redis/Postgres recommended for production durability).
 - DDG search quality depends on upstream indexing — X/Twitter results can be sparse.
 - `manifest.json` is a legacy Teams artifact and is not used.

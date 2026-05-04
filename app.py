@@ -26,7 +26,7 @@ import xml.etree.ElementTree as ET
 
 import httpx
 from ddgs import DDGS
-from telegram import Update
+from telegram import InputFile, Update
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
@@ -39,6 +39,64 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+def _env_bool(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _resolve_state_dir() -> Path:
+    """Directory for biweekly memory, Excel exports, and source ledger.
+
+    On Railway, mount a volume and set ``STATE_DIR`` to that path (e.g. ``/data``)
+    so files survive redeploys. Default: ``<app>/state``.
+    """
+    raw = os.environ.get("STATE_DIR", "").strip()
+    fallback = (Path(__file__).resolve().parent / "state").resolve()
+    if not raw:
+        try:
+            fallback.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.error("Could not create default state dir %s: %s", fallback, e)
+        return fallback
+    p = Path(raw).expanduser()
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+        return p.resolve()
+    except OSError as e:
+        logger.warning("STATE_DIR=%r not usable (%s); using %s", raw, e, fallback)
+        try:
+            fallback.mkdir(parents=True, exist_ok=True)
+        except OSError as e2:
+            logger.error("Fallback state dir failed: %s", e2)
+        return fallback
+
+
+STATE_DIR = _resolve_state_dir()
+BIWEEKLY_MEMORY_PATH = STATE_DIR / "biweekly_memory.json"
+BIWEEKLY_EXCEL_PATH = STATE_DIR / "biweekly_reports.xlsx"
+SOURCE_LEDGER_PATH = STATE_DIR / "source_ledger.xlsx"
+QUARTERLY_MEMORY_PATH = STATE_DIR / "quarterly_memory.json"
+ATTACH_STATE_EXCEL_ON_BIWEEKLY = _env_bool("ATTACH_STATE_EXCEL_ON_BIWEEKLY")
+
+
+def _log_state_store_paths(where: str) -> None:
+    """Log absolute paths and sizes for operators (Railway has no file browser)."""
+    parts = [f"{where}: STATE_DIR={STATE_DIR}"]
+    for label, path in (
+        ("biweekly_reports.xlsx", BIWEEKLY_EXCEL_PATH),
+        ("source_ledger.xlsx", SOURCE_LEDGER_PATH),
+    ):
+        try:
+            if path.is_file():
+                sz = path.stat().st_size
+                parts.append(f"  {label}: {path.resolve()} ({sz} bytes)")
+            else:
+                parts.append(f"  {label}: (not created yet) {path.resolve()}")
+        except OSError as e:
+            parts.append(f"  {label}: {path.resolve()} (stat error: {e})")
+    logger.info("\n".join(parts))
+
+
 # ─── Config ───────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 KIMI_API_KEY = os.environ["KIMI_API_KEY"]
@@ -48,6 +106,20 @@ PORT = int(os.environ.get("PORT", 3978))
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x}
 DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "5"))
+
+
+def _state_excel_broadcast_chat_id() -> int | None:
+    """Chat to receive workbooks after scheduled biweekly when attach mode is on."""
+    raw = os.environ.get("STATE_EXCEL_TELEGRAM_CHAT_ID", "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            logger.warning("STATE_EXCEL_TELEGRAM_CHAT_ID is not an int: %r", raw)
+            return None
+    if ADMIN_IDS:
+        return sorted(ADMIN_IDS)[0]
+    return None
 
 EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "0") == "1"
 EMAIL_SEND_MODE = os.environ.get("EMAIL_SEND_MODE", "alert").lower()
@@ -182,7 +254,11 @@ def source_ledger_display_url() -> str:
     """Human-facing location of the per-source Excel ledger (env or on-server fallback)."""
     if SOURCE_LEDGER_PUBLIC_URL:
         return SOURCE_LEDGER_PUBLIC_URL
-    return "On server: state/source_ledger.xlsx (not web-hosted)"
+    loc = str(SOURCE_LEDGER_PATH.resolve())
+    return (
+        f"Ledger on server disk (not web-hosted): {loc} "
+        f"(Telegram admin: /statefiles; persist on Railway: STATE_DIR + volume)"
+    )
 
 
 def _source_ledger_footer() -> str:
@@ -2566,7 +2642,17 @@ def _append_source_ledger(
         ws.append([row_vals.get(h, "") for h in hdr])
 
     wb.save(SOURCE_LEDGER_PATH)
-    logger.info(f"Appended {len(sources)} source ledger row(s) to {SOURCE_LEDGER_PATH}")
+    sp = SOURCE_LEDGER_PATH.resolve()
+    try:
+        sz = sp.stat().st_size
+    except OSError:
+        sz = -1
+    logger.info(
+        "source_ledger wrote path=%s bytes=%s appended_rows=%s",
+        sp,
+        sz,
+        len(sources),
+    )
 
 
 async def analyze_biweekly(mentions_text: str, sources: list[dict]) -> str:
@@ -2796,6 +2882,11 @@ async def run_biweekly_scan(update: Update) -> None:
         await send_chunked_message(
             update,
             f"Interac e-Transfer Intelligence — {now_est()}\n\n{report}",
+        )
+        await _maybe_attach_state_excels_after_biweekly(
+            update.get_bot(),
+            chat_id=update.effective_chat.id,
+            context_note="(after /scan)",
         )
     finally:
         _untrack_task(tracked)
@@ -3240,8 +3331,7 @@ EMAIL_TEXT = "#101828"
 EMAIL_MUTED = "#667085"
 EMAIL_ACCENT = "#175CD3"
 EMAIL_CONTAINER_WIDTH = "920"
-BIWEEKLY_MEMORY_PATH = Path(__file__).parent / "state" / "biweekly_memory.json"
-BIWEEKLY_EXCEL_PATH = Path(__file__).parent / "state" / "biweekly_reports.xlsx"
+# Persisted paths: STATE_DIR, BIWEEKLY_*_PATH, SOURCE_LEDGER_PATH, QUARTERLY_MEMORY_PATH (top of file).
 BIWEEKLY_EXCEL_HEADERS = (
     "Scan Date",
     "e-Transfer Chatter",
@@ -3250,8 +3340,6 @@ BIWEEKLY_EXCEL_HEADERS = (
     "Trend vs Last Scan",
     "Full Report",
 )
-SOURCE_LEDGER_PATH = Path(__file__).parent / "state" / "source_ledger.xlsx"
-QUARTERLY_MEMORY_PATH = Path(__file__).parent / "state" / "quarterly_memory.json"
 
 # Scheduled quarterly market-trends runs (America/Toronto calendar).
 QUARTERLY_RUN_MONTH_DAY: set[tuple[int, int]] = {(11, 1), (2, 1), (5, 1), (8, 1)}
@@ -3436,7 +3524,12 @@ def _append_biweekly_excel(scan_date: str, report: str) -> None:
         }
         ws.append([row_map.get(h, "") for h in hdr])
         wb.save(BIWEEKLY_EXCEL_PATH)
-        logger.info(f"Appended biweekly report to {BIWEEKLY_EXCEL_PATH}")
+        bp = BIWEEKLY_EXCEL_PATH.resolve()
+        try:
+            bsz = bp.stat().st_size
+        except OSError:
+            bsz = -1
+        logger.info("state_excel biweekly_reports path=%s bytes=%s", bp, bsz)
     except Exception as e:
         logger.warning(f"Could not append to Excel: {e}")
 
@@ -4122,6 +4215,50 @@ async def send_chunked_plain_chat(
         await context.bot.send_message(chat_id=chat_id, text=prefix + chunk)
 
 
+async def _send_state_excel_bundle_to_chat(bot, chat_id: int, *, context_note: str = "") -> int:
+    """Send biweekly + ledger workbooks if present. Returns number of documents sent."""
+    sent = 0
+    note = f" {context_note}" if context_note else ""
+    for path, title in (
+        (BIWEEKLY_EXCEL_PATH, "Biweekly reports"),
+        (SOURCE_LEDGER_PATH, "Source ledger"),
+    ):
+        if not path.is_file():
+            continue
+        caption = f"{title}{note}\n{path.resolve()}"
+        try:
+            with path.open("rb") as fh:
+                await bot.send_document(
+                    chat_id=chat_id,
+                    document=InputFile(fh, filename=path.name),
+                    caption=caption[:1024],
+                )
+            sent += 1
+        except Exception as e:
+            logger.warning("Could not send %s to chat %s: %s", path.name, chat_id, e)
+    if sent == 0:
+        logger.info(
+            "No state Excel files to send yet (expected after first successful write): %s, %s",
+            BIWEEKLY_EXCEL_PATH,
+            SOURCE_LEDGER_PATH,
+        )
+    return sent
+
+
+async def _maybe_attach_state_excels_after_biweekly(bot, *, chat_id: int | None, context_note: str) -> None:
+    if not ATTACH_STATE_EXCEL_ON_BIWEEKLY:
+        return
+    if chat_id is None:
+        logger.warning(
+            "ATTACH_STATE_EXCEL_ON_BIWEEKLY=1 but no Telegram chat target — set STATE_EXCEL_TELEGRAM_CHAT_ID "
+            "(or ADMIN_IDS for scheduled fallback), or run /scan from a chat."
+        )
+        return
+    n = await _send_state_excel_bundle_to_chat(bot, chat_id, context_note=context_note)
+    if n:
+        logger.info("Attached %s state Excel file(s) to Telegram chat %s", n, chat_id)
+
+
 # ─── Scheduled Broadcast ─────────────────────────────────────────────────────
 async def scheduled_biweekly_broadcast(context: ContextTypes.DEFAULT_TYPE):
     """Daily job that runs the biweekly scan if 14+ days have passed since the last one."""
@@ -4172,6 +4309,12 @@ async def scheduled_biweekly_broadcast(context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Biweekly email failed: {send_reason}")
         else:
             logger.info(f"Biweekly email not sent: {reason}")
+
+        await _maybe_attach_state_excels_after_biweekly(
+            context.bot,
+            chat_id=_state_excel_broadcast_chat_id(),
+            context_note="(scheduled biweekly)",
+        )
     except Exception as e:
         logger.error(f"Scheduled biweekly scan failed: {e}")
     finally:
@@ -4248,6 +4391,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /quarterly — Admin: quarterly market trends report\n"
         "• /stop — Admin: cancel running jobs\n"
         "• /smtpcheck — Admin: check email config\n"
+        "• /statefiles — Admin: download Excel workbooks (biweekly + ledger)\n"
         "• Any text → Follow-up on latest report",
         parse_mode="Markdown",
     )
@@ -4290,6 +4434,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Twitter: {twitter_key_hint}\n"
         f"Email from: {EMAIL_FROM or '❌ missing'}\n"
         f"Email to: {EMAIL_TO or '❌ missing'}\n"
+        f"State dir: {STATE_DIR}\n"
+        f"Excel attach after biweekly: {'on' if ATTACH_STATE_EXCEL_ON_BIWEEKLY else 'off'}\n"
         f"Admin: {is_admin}\n"
         f"Your ID: `{update.effective_user.id}`"
     )
@@ -4367,6 +4513,12 @@ async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("✅ Email sent successfully.")
         else:
             await update.message.reply_text(f"❌ Email failed: {send_reason}")
+
+        await _maybe_attach_state_excels_after_biweekly(
+            update.get_bot(),
+            chat_id=update.effective_chat.id,
+            context_note="(after /email)",
+        )
     except asyncio.TimeoutError:
         await update.message.reply_text("⏱️ /email timed out after 480 seconds.")
     except Exception as e:
@@ -4453,6 +4605,30 @@ async def cmd_smtpcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ {reason}")
 
 
+async def cmd_statefiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: send persisted Excel workbooks from STATE_DIR (Railway-friendly)."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    await update.message.reply_text(
+        f"State directory:\n{STATE_DIR}\n"
+        f"Attach after biweekly: {'on' if ATTACH_STATE_EXCEL_ON_BIWEEKLY else 'off'} "
+        f"(set ATTACH_STATE_EXCEL_ON_BIWEEKLY=1)\n"
+        f"Sending files if they exist…",
+    )
+    n = await _send_state_excel_bundle_to_chat(
+        update.get_bot(),
+        update.effective_chat.id,
+        context_note="(manual /statefiles)",
+    )
+    if n == 0:
+        await update.message.reply_text(
+            "No workbook files on disk yet. Run a successful /scan or /email first, "
+            "or check deploy logs for Excel write errors."
+        )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     if not user_text:
@@ -4493,7 +4669,10 @@ def main():
     app.add_handler(CommandHandler("quarterly", cmd_quarterly))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("smtpcheck", cmd_smtpcheck))
+    app.add_handler(CommandHandler("statefiles", cmd_statefiles))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    _log_state_store_paths("startup")
 
     # Biweekly scan: runs daily at 9am EST (14:00 UTC) but self-guards to only execute every 14 days.
     job_queue = app.job_queue
