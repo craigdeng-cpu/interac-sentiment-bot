@@ -93,7 +93,7 @@ Everything required to run the core pipeline and email stakeholders:
 | **Launch-grade persistence** | Scan memory, source ledgers, and mention-pool exports on disk (e.g. `state/` + optional S3 upload) — enough to dedupe URLs, track trends, and audit a run, but not a full application database |
 | **Configuration** | `prompts.json`, versioned prompt files, environment-based secrets |
 
-MVP delivery is **email only**. Operators may use existing dev tooling (e.g. the Telegram bot in the current codebase) to trigger manual scans during rollout; that is not the stakeholder-facing product.
+MVP delivery is **email only**. Scans run on the automated schedule; any operator-only trigger mechanisms during rollout are not a stakeholder-facing channel.
 
 #### Ideal state (longer term)
 
@@ -108,20 +108,7 @@ Capabilities deferred past launch:
 
 **Proprietary data (ideal).** Internal PDFs, slide decks, and market-study extracts would be ingested into a dedicated bucket (e.g. `internal_research`), tagged `source_type: proprietary`, and never mixed into public-facing bullets without explicit labeling. Kimi analysis prompts would gain a third input track or inline section for "Internal context" where product team material informs market-pulse interpretation without being quoted as public sentiment. Access to raw proprietary files stays inside Interac's network; only derived bullets approved for distribution appear in email.
 
-#### Summary
-
-```
-MVP launch                          Ideal state (later)
-─────────────────────────────       ─────────────────────────────────────
-Public web scan                     + Interac proprietary studies
-Kimi filter + analyze               (same)
-Biweekly + quarterly reports        (same)
-Email delivery                      + Teams notifications + Q&A
-File/Excel persistence              → Full DB + object storage
-Manual operator triggers OK         + Automated evals + quality dashboard
-```
-
-The repository today is closest to **MVP**, with a Telegram-based operator interface and partial persistence. See [PROJECT_SYSTEM_OVERVIEW.md](PROJECT_SYSTEM_OVERVIEW.md) for current implementation details.
+The repository today is closest to **MVP**, with file-based persistence and scheduled email delivery. See [PROJECT_SYSTEM_OVERVIEW.md](PROJECT_SYSTEM_OVERVIEW.md) for current implementation details.
 
 ---
 
