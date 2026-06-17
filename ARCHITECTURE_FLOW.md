@@ -4,9 +4,9 @@
 
 ### 1.1 Purpose of this document
 
-This document describes the **ideal end state** for the Interac Intelligence Bot: how it should be built, what each part does, and how data flows from the public web to stakeholders. It is written for onboarding and design review.
+This document describes how the Interac Intelligence Bot should be built — from **MVP launch** through **longer-term ideal state**. It is written for onboarding and design review.
 
-For how the code works today, see [PROJECT_SYSTEM_OVERVIEW.md](PROJECT_SYSTEM_OVERVIEW.md) and [README.md](README.md). Section 5 at the end summarizes what still needs to be built.
+For how the code works today, see [PROJECT_SYSTEM_OVERVIEW.md](PROJECT_SYSTEM_OVERVIEW.md) and [README.md](README.md). Section 1.4 summarizes what ships at launch vs what comes later.
 
 ### 1.2 What the system does
 
@@ -15,24 +15,22 @@ On a fixed schedule, the service:
 1. **Collects** public mentions of Interac e-Transfer and competing Canadian payment products from Reddit, news sites, forums, and X/Twitter — using keyword search and APIs, not AI-driven web browsing.
 2. **Filters** low-value noise with an LLM scoring pass so only useful signal reaches analysis.
 3. **Analyzes** the remaining material with focused AI calls — two parallel tracks for biweekly (chatter + market), or a map-reduce path for quarterly trends.
-4. **Stores** every scan, source URL, and generated bullet in a durable data layer.
-5. **Delivers** a two-column HTML email digest with footer links to the underlying data.
-6. **Supports follow-up** in Microsoft Teams — users ask questions about the latest report without leaving their workspace.
-7. **Evaluates** retrieval, filtering, and analysis quality over time (planned — see §3.5).
+4. **Stores** scan outputs and source records (MVP: file-based; ideal: full database — see §1.4).
+5. **Delivers** a two-column HTML email digest with footer links to underlying data.
 
-**Delivery surfaces in the target design:** email (formal digest) and Microsoft Teams (notifications + conversational Q&A).
+Longer-term capabilities (ideal state — see §1.4): Microsoft Teams follow-up Q&A, automated evals, full data storage, and ingestion of Interac proprietary market studies alongside public web scanning.
 
 ### 1.3 Core building blocks
 
 The system has five layers. Each layer has one job; together they form a repeatable intelligence pipeline.
 
-| Layer | Role | Ideal implementation |
-|---|---|---|
-| **Scheduler** | Runs biweekly and quarterly scans on a calendar | Background job runner (cron or managed scheduler) — independent of any chat platform |
-| **Collector** | Fetches and classifies raw mentions from the web | Reddit API, DuckDuckGo (web/news/X), optional dedicated X API |
-| **Agent / LLM** | Scores, filters, and writes the report | Moonshot Kimi API with versioned prompt files in `prompts/` |
-| **Data store** | Persists scans, sources, reports, eval results, and conversation context | Database (e.g. Postgres) + object storage for exports |
-| **Delivery** | Gets the report to people | HTML email (SMTP/Resend) + Microsoft Teams bot |
+| Layer | Role | MVP | Ideal |
+|---|---|---|---|
+| **Scheduler** | Runs biweekly and quarterly scans on a calendar | Job runner on container host | Independent of any chat platform |
+| **Collector** | Fetches and classifies raw mentions | Reddit API, DuckDuckGo, optional X API | + Interac proprietary studies (§1.4) |
+| **Agent / LLM** | Scores, filters, and writes the report | Moonshot Kimi + `prompts/` | Same; eval-gated prompt deploys (§3.5) |
+| **Data store** | Persists scans, sources, reports | `state/` files + optional S3 exports | Postgres + object storage (§4.1) |
+| **Delivery** | Gets the report to people | HTML email (SMTP/Resend) | + Microsoft Teams bot (§3.4) |
 
 ```mermaid
 flowchart TB
@@ -76,7 +74,54 @@ flowchart TB
     TEAMS_API --> PIPE
 ```
 
-The scheduler kicks off the pipeline on a timer. The pipeline talks to web sources and Kimi, writes everything to the data store, then pushes output through email and Teams. Follow-up questions read from the data store (latest report + source pool), not from process memory.
+The diagram above reflects the **ideal state**. At MVP launch, Teams, the eval runner, and the full database layer are out of scope — see §1.4.
+
+### 1.4 MVP vs ideal state
+
+This project ships in two phases. **MVP** is the minimum needed to deliver reliable biweekly and quarterly intelligence digests from public web signal. **Ideal state** adds conversational access, quality measurement, durable infrastructure, and internal data sources.
+
+#### MVP (launch)
+
+Everything required to run the core pipeline and email stakeholders:
+
+| Capability | What it includes |
+|---|---|
+| **Public web collection** | Reddit API, DuckDuckGo (web/news/X), optional X API — keyword queries from `prompts.json` (§3.1) |
+| **LLM filter + analysis** | Kimi value scoring, biweekly dual-column reports, quarterly map-reduce trends (§3.2, §3.3) |
+| **Scheduling** | Automated biweekly (14-day guard) and quarterly (calendar) scan triggers |
+| **Email delivery** | HTML two-column digest via SMTP or Resend; footer with scan metadata and download links to exported workbooks |
+| **Launch-grade persistence** | Scan memory, source ledgers, and mention-pool exports on disk (e.g. `state/` + optional S3 upload) — enough to dedupe URLs, track trends, and audit a run, but not a full application database |
+| **Configuration** | `prompts.json`, versioned prompt files, environment-based secrets |
+
+MVP delivery is **email only**. Operators may use existing dev tooling (e.g. the Telegram bot in the current codebase) to trigger manual scans during rollout; that is not the stakeholder-facing product.
+
+#### Ideal state (longer term)
+
+Capabilities deferred past launch:
+
+| Capability | What it adds |
+|---|---|
+| **Full data storage** | Postgres (or equivalent) as system of record — scans, sources, conversations, eval results; object storage for exports; survives redeploys and supports multiple instances (§4.1) |
+| **Microsoft Teams bot** | Channel notifications, Adaptive Cards, and conversational follow-up Q&A over the latest report (§3.4) |
+| **Evals** | Automated measurement of retrieval recall, filter quality, analysis faithfulness, and end-to-end usefulness; regression alerts and footer quality summaries (§3.5) |
+| **Proprietary data ingestion** | Load Interac private market studies, internal research, and other non-public material into the analysis pool alongside public web mentions — with access controls, separate source tagging, and prompts that distinguish public chatter from internal evidence |
+
+**Proprietary data (ideal).** Internal PDFs, slide decks, and market-study extracts would be ingested into a dedicated bucket (e.g. `internal_research`), tagged `source_type: proprietary`, and never mixed into public-facing bullets without explicit labeling. Kimi analysis prompts would gain a third input track or inline section for "Internal context" where product team material informs market-pulse interpretation without being quoted as public sentiment. Access to raw proprietary files stays inside Interac's network; only derived bullets approved for distribution appear in email.
+
+#### Summary
+
+```
+MVP launch                          Ideal state (later)
+─────────────────────────────       ─────────────────────────────────────
+Public web scan                     + Interac proprietary studies
+Kimi filter + analyze               (same)
+Biweekly + quarterly reports        (same)
+Email delivery                      + Teams notifications + Q&A
+File/Excel persistence              → Full DB + object storage
+Manual operator triggers OK         + Automated evals + quality dashboard
+```
+
+The repository today is closest to **MVP**, with a Telegram-based operator interface and partial persistence. See [PROJECT_SYSTEM_OVERVIEW.md](PROJECT_SYSTEM_OVERVIEW.md) for current implementation details.
 
 ---
 
@@ -91,8 +136,8 @@ The scheduler kicks off the pipeline on a timer. The pipeline talks to web sourc
 | Web collection | Reddit JSON API, DuckDuckGo (`ddgs`), optional twitterapi.io |
 | LLM | Moonshot Kimi (`kimi-k2.5-preview` or later) via OpenAI-compatible chat API |
 | Email | SMTP or Resend — table-based HTML, inline CSS |
-| Conversational UI | Microsoft Teams via Bot Framework + `manifest.json` |
-| Persistence (target) | Postgres + S3-compatible object storage |
+| Conversational UI (ideal) | Microsoft Teams via Bot Framework + `manifest.json` |
+| Persistence | MVP: `state/` files + optional S3 · Ideal: Postgres + object storage |
 | Config | `prompts.json`, `prompts/*.md`, environment variables / key vault |
 
 ### 2.2 Kimi vs other AI models
@@ -123,9 +168,9 @@ Kimi is invoked at several points — different **jobs**, same API:
 | Biweekly analysis | Write chatter column | `etransfer_chatter_prompt.md` |
 | Biweekly analysis | Write market column | `market_pulse_prompt.md` |
 | Quarterly (if needed) | Compress chunks, then write trends report | Inline compress + `quarterly_market_trends_prompt.md` |
-| Teams follow-up | Answer user questions | `followup_prompt.md` |
+| Teams follow-up (ideal) | Answer user questions | `followup_prompt.md` |
 
-### 2.4 Deployment (ideal)
+### 2.4 Deployment
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -177,7 +222,7 @@ flowchart LR
     A["1. Collect<br/>search + classify"] --> B["2. Filter<br/>LLM value scores"]
     B --> C["3. Analyze<br/>two parallel Kimi calls"]
     C --> D["4. Store<br/>report + every source URL"]
-    D --> E["5. Deliver<br/>email + Teams post"]
+    D --> E["5. Deliver<br/>email (+ Teams ideal)"]
 ```
 
 **Step 1 — Collect.** Queries from `prompts.json` run across Reddit, DuckDuckGo, and optional X API. Results land in the three buckets above.
@@ -195,7 +240,7 @@ Output merges into one report: scan date, both columns, and **Trend vs Last Scan
 
 **Step 4 — Store.** Scan record, per-URL source rows, sent-URL history, and optional export files (see §4.1).
 
-**Step 5 — Deliver.** HTML email (two columns) + Teams Adaptive Card in the configured channel.
+**Step 5 — Deliver.** HTML email (two columns). Teams channel post is ideal state (§1.4).
 
 ### 3.3 Quarterly workflow
 
@@ -206,7 +251,7 @@ flowchart LR
     A["1. Collect<br/>~90-day window"] --> B["2. Filter<br/>LLM value scores"]
     B --> C["3. Analyze<br/>map-reduce → trends report"]
     C --> D["4. Store<br/>report + sources + digest"]
-    D --> E["5. Deliver<br/>email + Teams post"]
+    D --> E["5. Deliver<br/>email (+ Teams ideal)"]
 ```
 
 **Differences from biweekly:**
@@ -222,9 +267,9 @@ flowchart LR
 
 Quarterly does not replace biweekly — it zooms out while biweekly catches fresh signal.
 
-### 3.4 Microsoft Teams integration
+### 3.4 Microsoft Teams integration (ideal state)
 
-Teams is the conversational interface: scan notifications and follow-up Q&A.
+Teams is the planned conversational interface: scan notifications and follow-up Q&A. Not in MVP — email is the launch delivery channel (§1.4).
 
 **Components:**
 
@@ -259,9 +304,9 @@ sequenceDiagram
 
 Users ask in natural language. The model sees the latest report, a sample of stored source mentions, and the question (`followup_prompt.md`). Rate limits and conversation history are persisted in the data store.
 
-### 3.5 Evals (planned)
+### 3.5 Evals (ideal state)
 
-No eval system exists in the codebase today. The target architecture includes **automated evaluations** to measure whether the pipeline is retrieving the right material, filtering wisely, and writing accurate reports.
+No eval system exists in the codebase today. Ideal state includes **automated evaluations** to measure whether the pipeline is retrieving the right material, filtering wisely, and writing accurate reports. Deferred past MVP (§1.4).
 
 **Goals:**
 
@@ -323,9 +368,11 @@ eval_results
 
 ## 4. Data Storage and Integrity
 
-### 4.1 Data store (ideal design)
+### 4.1 Data store
 
-All durable data lives in a proper store so the system survives redeploys, supports multiple instances, and answers "where did this bullet come from?" months later.
+**MVP** uses file-based persistence: `biweekly_memory.json`, `source_ledger.xlsx`, `biweekly_reports.xlsx`, and optional S3 uploads for email footer links. This is sufficient for launch but is lost or fragmented on redeploy without a mounted volume.
+
+**Ideal state** moves all durable data into a proper store so the system survives redeploys, supports multiple instances, and answers "where did this bullet come from?" months later.
 
 ```
 scans
@@ -367,7 +414,7 @@ Every biweekly and quarterly email ends with a **data footer** so recipients can
 | Mention pool download | Filtered pool sent to Kimi |
 | Archive link | Historical scans |
 | Methodology note | Platforms searched, prompt version, model version |
-| Eval summary (planned) | Latest quality-check pass rate |
+| Eval summary (ideal) | Latest quality-check pass rate |
 
 Example (conceptual):
 
@@ -387,23 +434,6 @@ Body bullets link to source domains where possible; the footer is the **index to
 
 ### 4.3 Object storage and exports
 
-Large exports (`source_ledger.xlsx`, mention pools) are **artifacts of** the database — generated after each scan, uploaded to S3-compatible storage with stable URLs referenced in email footers. Spreadsheets supplement the DB; they do not replace it.
+**MVP:** Exports are the primary audit trail — generated after each scan and uploaded to S3-compatible storage when configured.
 
----
-
-## 5. Current vs Future State
-
-This document is the **north star**. The table below maps target capabilities to what the repository implements today.
-
-| Target (this document) | Current code |
-|---|---|
-| Postgres (or similar) data store | In-memory vars + `state/*.json` + Excel on disk |
-| Microsoft Teams for delivery + Q&A | **Telegram bot** — commands, scheduled broadcasts, plain-text follow-up |
-| Email footer with source index links | Footer with optional S3 workbook links only |
-| Scheduler independent of chat platform | Job queue inside Telegram `Application` |
-| Automated eval suite (§3.5) | Not built |
-| `manifest.json` Teams app wired to runtime | Scaffold exists; not connected to live pipeline |
-
-**Telegram today:** The running app uses `python-telegram-bot` for `/scan`, `/subscribe`, scheduled biweekly posts to subscribed chats, and follow-up Q&A via plain-text messages. That is a development and operations convenience, not the long-term delivery model.
-
-Use [PROJECT_SYSTEM_OVERVIEW.md](PROJECT_SYSTEM_OVERVIEW.md) and [README.md](README.md) for day-to-day operation of the code as it exists now.
+**Ideal state:** Exports become **artifacts of** the database — generated from DB queries, uploaded with stable URLs in email footers. Spreadsheets supplement the DB; they do not replace it.
